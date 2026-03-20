@@ -71,7 +71,7 @@ func TestNewClient(t *testing.T) {
 
 func TestFirefoxHeaders(t *testing.T) {
 	req, _ := http.NewRequest("GET", "https://example.com", nil)
-	applyFirefoxHeaders(req, "text/html", "en-US,en;q=0.5")
+	applyFirefoxHeaders(req, "text/html", "en-US,en;q=0.9")
 
 	tests := []struct {
 		header string
@@ -79,18 +79,22 @@ func TestFirefoxHeaders(t *testing.T) {
 	}{
 		{"User-Agent", Firefox148UserAgent},
 		{"Accept", "text/html"},
-		{"Accept-Language", "en-US,en;q=0.5"},
+		{"Accept-Language", "en-US,en;q=0.9"},
 		{"Accept-Encoding", "gzip, deflate, br, zstd"},
 		{"Sec-Fetch-Dest", "document"},
 		{"Sec-Fetch-Mode", "navigate"},
 		{"Sec-Fetch-Site", "none"},
 		{"Sec-Fetch-User", "?1"},
-		{"DNT", "1"},
-		{"Sec-GPC", "1"},
 		{"Priority", "u=0, i"},
 		{"TE", "trailers"},
 		{"Upgrade-Insecure-Requests", "1"},
-		{"Connection", "keep-alive"},
+	}
+
+	// Verify Firefox 148 does NOT send these headers
+	for _, h := range []string{"DNT", "Sec-GPC", "Connection"} {
+		if got := req.Header.Get(h); got != "" {
+			t.Errorf("Header %s should NOT be set, got %q", h, got)
+		}
 	}
 
 	for _, tt := range tests {
@@ -120,9 +124,9 @@ func TestFirefox148Spec(t *testing.T) {
 		t.Fatal("Firefox148Spec() returned nil")
 	}
 
-	// Verify cipher suite count (3 TLS1.3 + 10 TLS1.2 = 13)
-	if len(spec.CipherSuites) != 13 {
-		t.Errorf("CipherSuites count = %d, want 13", len(spec.CipherSuites))
+	// Verify cipher suite count (3 TLS1.3 + 10 ECDHE + 4 RSA = 17)
+	if len(spec.CipherSuites) != 17 {
+		t.Errorf("CipherSuites count = %d, want 17", len(spec.CipherSuites))
 	}
 
 	// Verify first cipher is AES-128-GCM-SHA256 (Firefox default)
@@ -208,18 +212,22 @@ func TestHeaderOrder(t *testing.T) {
 	h := make(http.Header)
 	h.Set("Accept", "text/html")
 	h.Set("User-Agent", "test")
-	h.Set("Host", "example.com")
 	h.Set("Custom-Header", "value")
 
 	ordered := OrderHeaders(h)
-	if len(ordered) != 4 {
-		t.Fatalf("OrderHeaders returned %d headers, want 4", len(ordered))
+	if len(ordered) != 3 {
+		t.Fatalf("OrderHeaders returned %d headers, want 3", len(ordered))
 	}
-	if ordered[0].Key != "Host" {
-		t.Errorf("First header = %q, want 'Host'", ordered[0].Key)
+	// Firefox 148 header order: User-Agent first, then Accept
+	if ordered[0].Key != "User-Agent" {
+		t.Errorf("First header = %q, want 'User-Agent'", ordered[0].Key)
 	}
-	if ordered[1].Key != "User-Agent" {
-		t.Errorf("Second header = %q, want 'User-Agent'", ordered[1].Key)
+	if ordered[1].Key != "Accept" {
+		t.Errorf("Second header = %q, want 'Accept'", ordered[1].Key)
+	}
+	// Custom headers come after known Firefox headers
+	if ordered[2].Key != "Custom-Header" {
+		t.Errorf("Third header = %q, want 'Custom-Header'", ordered[2].Key)
 	}
 }
 
@@ -558,7 +566,7 @@ func BenchmarkFirefoxHeaders(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		req, _ := http.NewRequest("GET", "https://example.com", nil)
-		applyFirefoxHeaders(req, "text/html", "en-US,en;q=0.5")
+		applyFirefoxHeaders(req, "text/html", "en-US,en;q=0.9")
 	}
 }
 

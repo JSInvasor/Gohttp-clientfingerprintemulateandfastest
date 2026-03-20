@@ -7,10 +7,31 @@ import (
 // Firefox 148 User-Agent (Windows 10 x64)
 const Firefox148UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0"
 
-// firefox148HeaderOrder defines the exact header order Firefox 148 sends.
-// This order is critical for HTTP/2 Akamai fingerprint and header-order detection.
+// firefox148HeaderOrder defines the exact header order Firefox 148 sends
+// in an HTTP/2 HEADERS frame (verified from tls.peet.ws capture).
+//
+// Real Firefox 148 header order:
+//
+//	:method, :path, :authority, :scheme (pseudo-headers)
+//	user-agent
+//	accept
+//	accept-language
+//	accept-encoding
+//	[content-type]    (only on POST/PUT)
+//	[content-length]  (only on POST/PUT)
+//	[origin]          (only on POST/cross-origin)
+//	[referer]         (only if referrer exists)
+//	[cookie]          (only if cookies exist)
+//	upgrade-insecure-requests
+//	sec-fetch-dest
+//	sec-fetch-mode
+//	sec-fetch-site
+//	sec-fetch-user
+//	priority
+//	te
+//
+// NOTE: Firefox 148 does NOT send DNT, Sec-GPC, or Connection headers.
 var firefox148HeaderOrder = []string{
-	"Host",
 	"User-Agent",
 	"Accept",
 	"Accept-Language",
@@ -18,9 +39,6 @@ var firefox148HeaderOrder = []string{
 	"Content-Type",
 	"Content-Length",
 	"Origin",
-	"DNT",
-	"Sec-GPC",
-	"Connection",
 	"Referer",
 	"Cookie",
 	"Upgrade-Insecure-Requests",
@@ -34,12 +52,26 @@ var firefox148HeaderOrder = []string{
 	"Cache-Control",
 }
 
-// applyFirefoxHeaders sets default Firefox 148 headers on the request.
+// applyFirefoxHeaders sets exact Firefox 148 default headers on the request.
 // Only sets headers that are not already present, preserving user overrides.
+//
+// Verified against real Firefox 148 HTTP/2 HEADERS frame:
+//
+//	user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) ...
+//	accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+//	accept-language: en-US,en;q=0.9
+//	accept-encoding: gzip, deflate, br, zstd
+//	upgrade-insecure-requests: 1
+//	sec-fetch-dest: document
+//	sec-fetch-mode: navigate
+//	sec-fetch-site: none
+//	sec-fetch-user: ?1
+//	priority: u=0, i
+//	te: trailers
 func applyFirefoxHeaders(req *http.Request, accept, lang string) {
 	h := req.Header
 	if h == nil {
-		h = make(http.Header, 14)
+		h = make(http.Header, 12)
 		req.Header = h
 	}
 
@@ -47,8 +79,6 @@ func applyFirefoxHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "Accept", accept)
 	setIfEmpty(h, "Accept-Language", lang)
 	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br, zstd")
-	setIfEmpty(h, "DNT", "1")
-	setIfEmpty(h, "Sec-GPC", "1")
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
@@ -57,9 +87,10 @@ func applyFirefoxHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "Priority", "u=0, i")
 	setIfEmpty(h, "TE", "trailers")
 
-	if req.URL != nil && req.URL.Scheme == "https" {
-		setIfEmpty(h, "Connection", "keep-alive")
-	}
+	// NOTE: Firefox 148 does NOT send these headers:
+	// - DNT (removed in modern Firefox)
+	// - Sec-GPC (not sent by default)
+	// - Connection (not sent in HTTP/2)
 }
 
 func setIfEmpty(h http.Header, key, value string) {
@@ -72,7 +103,6 @@ func setIfEmpty(h http.Header, key, value string) {
 func OrderHeaders(h http.Header) []HeaderKV {
 	result := make([]HeaderKV, 0, len(h))
 
-	// Add headers in Firefox order first
 	for _, key := range firefox148HeaderOrder {
 		if values, ok := h[key]; ok {
 			for _, v := range values {
@@ -81,7 +111,6 @@ func OrderHeaders(h http.Header) []HeaderKV {
 		}
 	}
 
-	// Add any remaining headers not in the predefined order
 	seen := make(map[string]bool, len(firefox148HeaderOrder))
 	for _, k := range firefox148HeaderOrder {
 		seen[k] = true
