@@ -185,6 +185,11 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 			req.Header.Set("User-Agent", c.config.userAgent)
 		}
 
+		// Apply default Referer if set
+		if c.config.referer != "" {
+			setIfEmpty(req.Header, "Referer", c.config.referer)
+		}
+
 		// Apply custom headers (override defaults)
 		for k, v := range headers {
 			req.Header.Set(k, v)
@@ -236,6 +241,9 @@ func (c *Client) DoHTTPRequest(req *http.Request) (*Response, error) {
 
 	if c.config.userAgent != "" {
 		req.Header.Set("User-Agent", c.config.userAgent)
+	}
+	if c.config.referer != "" {
+		setIfEmpty(req.Header, "Referer", c.config.referer)
 	}
 
 	resp, err := c.httpClient.Do(req)

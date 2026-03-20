@@ -19,6 +19,7 @@ type clientConfig struct {
 	acceptLanguage   string
 	accept           string
 	userAgent        string // custom override, empty = use browser default
+	referer          string // default Referer header, empty = don't send
 	maxResponseBody  int64  // max response body size in bytes, 0 = unlimited
 	retryCount       int    // number of retries, 0 = no retry
 	retryBaseDelay   time.Duration // base delay for exponential backoff
@@ -190,6 +191,13 @@ func WithReadBufferSize(n int) Option {
 func WithUserAgent(ua string) Option {
 	return func(c *clientConfig) {
 		c.userAgent = ua
+	}
+}
+
+// WithReferer sets a default Referer header on all requests.
+func WithReferer(referer string) Option {
+	return func(c *clientConfig) {
+		c.referer = referer
 	}
 }
 
