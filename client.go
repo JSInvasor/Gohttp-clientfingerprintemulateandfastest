@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Client is a high-performance HTTP client with browser fingerprint emulation.
@@ -27,8 +28,6 @@ type Client struct {
 	transport  *Transport
 	config     clientConfig
 	jar        http.CookieJar
-
-	reqPool sync.Pool
 }
 
 // NewClient creates a new Client with the given options.
@@ -56,14 +55,6 @@ func NewClient(opts ...Option) (*Client, error) {
 		transport: transport,
 		config:    cfg,
 		jar:       jar,
-	}
-
-	c.reqPool = sync.Pool{
-		New: func() interface{} {
-			return &http.Request{
-				Header: make(http.Header, 12),
-			}
-		},
 	}
 
 	redirectPolicy := func(req *http.Request, via []*http.Request) error {
@@ -114,14 +105,38 @@ func (c *Client) Put(rawURL string, body []byte, headers map[string]string) (*Re
 	return c.Do("PUT", rawURL, body, headers)
 }
 
+// Patch performs an HTTP PATCH request.
+func (c *Client) Patch(rawURL string, body []byte, headers map[string]string) (*Response, error) {
+	return c.Do("PATCH", rawURL, body, headers)
+}
+
+// PatchJSON performs an HTTP PATCH request with JSON content type.
+func (c *Client) PatchJSON(rawURL string, body []byte) (*Response, error) {
+	return c.Do("PATCH", rawURL, body, map[string]string{
+		"Content-Type": "application/json",
+	})
+}
+
 // Delete performs an HTTP DELETE request.
 func (c *Client) Delete(rawURL string) (*Response, error) {
 	return c.Do("DELETE", rawURL, nil, nil)
 }
 
+// DeleteWithBody performs an HTTP DELETE request with a body.
+func (c *Client) DeleteWithBody(rawURL string, body []byte, headers map[string]string) (*Response, error) {
+	return c.Do("DELETE", rawURL, body, headers)
+}
+
 // Head performs an HTTP HEAD request.
 func (c *Client) Head(rawURL string) (*Response, error) {
 	return c.Do("HEAD", rawURL, nil, nil)
+}
+
+// PostForm performs an HTTP POST with URL-encoded form data.
+func (c *Client) PostForm(rawURL string, data url.Values) (*Response, error) {
+	return c.Do("POST", rawURL, []byte(data.Encode()), map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+	})
 }
 
 // Do performs an HTTP request with the given method, URL, body, and headers.
@@ -130,48 +145,105 @@ func (c *Client) Do(method, rawURL string, body []byte, headers map[string]strin
 }
 
 // DoWithContext performs an HTTP request with context.
+// If retry is configured, automatically retries on network errors and specified status codes.
 func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body []byte, headers map[string]string) (*Response, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
 
-	var bodyReader io.Reader
-	if body != nil {
-		bodyReader = bytes.NewReader(body)
+	maxAttempts := 1 + c.config.retryCount
+	var lastErr error
+	var lastResp *Response
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: baseDelay * 2^(attempt-1)
+			delay := c.config.retryBaseDelay * (1 << (attempt - 1))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		var bodyReader io.Reader
+		if body != nil {
+			bodyReader = bytes.NewReader(body)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, method, u.String(), bodyReader)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+
+		// Apply browser default headers
+		applyFirefoxHeaders(req, c.config.accept, c.config.acceptLanguage)
+
+		// Apply custom User-Agent if set
+		if c.config.userAgent != "" {
+			req.Header.Set("User-Agent", c.config.userAgent)
+		}
+
+		// Apply custom headers (override defaults)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			// Network error - retry if we have attempts left
+			if attempt < maxAttempts-1 {
+				continue
+			}
+			return nil, lastErr
+		}
+
+		r := &Response{Response: resp, maxBodySize: c.config.maxResponseBody}
+
+		// Check if we should retry on this status code
+		if attempt < maxAttempts-1 && c.shouldRetryStatus(resp.StatusCode) {
+			// Drain and close the body before retrying
+			r.Close()
+			lastResp = nil
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			continue
+		}
+
+		return r, nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, u.String(), bodyReader)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+	if lastResp != nil {
+		return lastResp, nil
 	}
+	return nil, lastErr
+}
 
-	// Apply browser default headers
-	applyFirefoxHeaders(req, c.config.accept, c.config.acceptLanguage)
-
-	// Apply custom headers (override defaults)
-	for k, v := range headers {
-		req.Header.Set(k, v)
+// shouldRetryStatus checks if an HTTP status code should trigger a retry.
+func (c *Client) shouldRetryStatus(statusCode int) bool {
+	for _, code := range c.config.retryStatusCodes {
+		if statusCode == code {
+			return true
+		}
 	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Response{Response: resp}, nil
+	return false
 }
 
 // DoHTTPRequest executes a standard *http.Request with fingerprint headers applied.
 func (c *Client) DoHTTPRequest(req *http.Request) (*Response, error) {
 	applyFirefoxHeaders(req, c.config.accept, c.config.acceptLanguage)
 
+	if c.config.userAgent != "" {
+		req.Header.Set("User-Agent", c.config.userAgent)
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Response{Response: resp}, nil
+	return &Response{Response: resp, maxBodySize: c.config.maxResponseBody}, nil
 }
 
 // PreConnect pre-warms n TLS connections to the given URL.
@@ -193,6 +265,7 @@ func (c *Client) NewPipeline(workers int) *Pipeline {
 // Close releases all resources held by the client.
 func (c *Client) Close() {
 	c.transport.CloseIdleConnections()
+	c.transport.dnscache.Close()
 }
 
 // ClearCookies removes all cookies from the client's cookie jar.

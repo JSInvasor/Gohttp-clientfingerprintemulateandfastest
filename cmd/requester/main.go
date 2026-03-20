@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -23,11 +24,14 @@ func main() {
 	fmt.Println(strings.Repeat("=", 60))
 
 	// Firefox 148 tarayıcı parmak izi ile client oluştur
+	// Retry: 3 deneme, 500ms başlangıç gecikmesi, 429/502/503/504 kodlarında tekrar dene
 	client, err := gofire.Emulate(gofire.Firefox148,
 		gofire.WithTimeout(15*time.Second),
 		gofire.WithMaxIdleConnsPerHost(500),
 		gofire.WithMaxIdleConns(5000),
 		gofire.WithDNSCacheTTL(5*time.Minute),
+		gofire.WithRetry(3, 500*time.Millisecond, 429, 502, 503, 504),
+		gofire.WithMaxResponseBodySize(10*1024*1024), // 10MB limit
 	)
 	if err != nil {
 		log.Fatalf("Client oluşturulamadı: %v", err)
@@ -74,7 +78,6 @@ func main() {
 		fmt.Printf("  Durum Kodu : %d\n", resp.StatusCode())
 		fmt.Printf("  Süre       : %v\n", time.Since(start).Round(time.Millisecond))
 
-		// Yanıtı JSON olarak parse et
 		var result map[string]interface{}
 		if err := resp.JSON(&result); err == nil {
 			if data, ok := result["json"]; ok {
@@ -85,9 +88,55 @@ func main() {
 	}
 
 	// ──────────────────────────────────────────────────────────
-	// 3. Özel header'lar ile Builder Pattern kullanımı
+	// 3. POST Form (URL-encoded)
 	// ──────────────────────────────────────────────────────────
-	fmt.Println("\n[3] Builder Pattern - Özel Header'lar")
+	fmt.Println("\n[3] POST Form (URL-encoded)")
+	fmt.Println(strings.Repeat("-", 40))
+
+	formData := url.Values{
+		"kullanici": {"gofire"},
+		"sifre":     {"gizli123"},
+		"hatirla":   {"true"},
+	}
+
+	start = time.Now()
+	resp, err = client.PostForm(targetURL+"/post", formData)
+	if err != nil {
+		log.Printf("PostForm hatası: %v", err)
+	} else {
+		fmt.Printf("  Durum Kodu : %d\n", resp.StatusCode())
+		fmt.Printf("  Süre       : %v\n", time.Since(start).Round(time.Millisecond))
+
+		var result map[string]interface{}
+		if err := resp.JSON(&result); err == nil {
+			if form, ok := result["form"]; ok {
+				fmt.Printf("  Form Data  : %v\n", form)
+			}
+		}
+		resp.Close()
+	}
+
+	// ──────────────────────────────────────────────────────────
+	// 4. PATCH JSON isteği
+	// ──────────────────────────────────────────────────────────
+	fmt.Println("\n[4] PATCH JSON İsteği")
+	fmt.Println(strings.Repeat("-", 40))
+
+	patchData := []byte(`{"alan": "güncellendi", "versiyon": 2}`)
+	start = time.Now()
+	resp, err = client.PatchJSON(targetURL+"/patch", patchData)
+	if err != nil {
+		log.Printf("PATCH hatası: %v", err)
+	} else {
+		fmt.Printf("  Durum Kodu : %d\n", resp.StatusCode())
+		fmt.Printf("  Süre       : %v\n", time.Since(start).Round(time.Millisecond))
+		resp.Close()
+	}
+
+	// ──────────────────────────────────────────────────────────
+	// 5. Özel header'lar ile Builder Pattern kullanımı
+	// ──────────────────────────────────────────────────────────
+	fmt.Println("\n[5] Builder Pattern - Özel Header'lar")
 	fmt.Println(strings.Repeat("-", 40))
 
 	start = time.Now()
@@ -115,9 +164,9 @@ func main() {
 	}
 
 	// ──────────────────────────────────────────────────────────
-	// 4. PUT isteği
+	// 6. PUT isteği
 	// ──────────────────────────────────────────────────────────
-	fmt.Println("\n[4] PUT İsteği")
+	fmt.Println("\n[6] PUT İsteği")
 	fmt.Println(strings.Repeat("-", 40))
 
 	updateData := []byte(`{"durum": "güncellendi", "id": 42}`)
@@ -134,9 +183,9 @@ func main() {
 	}
 
 	// ──────────────────────────────────────────────────────────
-	// 5. DELETE isteği
+	// 7. DELETE isteği
 	// ──────────────────────────────────────────────────────────
-	fmt.Println("\n[5] DELETE İsteği")
+	fmt.Println("\n[7] DELETE İsteği")
 	fmt.Println(strings.Repeat("-", 40))
 
 	start = time.Now()
@@ -150,18 +199,16 @@ func main() {
 	}
 
 	// ──────────────────────────────────────────────────────────
-	// 6. Cookie yönetimi
+	// 8. Cookie yönetimi
 	// ──────────────────────────────────────────────────────────
-	fmt.Println("\n[6] Cookie Yönetimi")
+	fmt.Println("\n[8] Cookie Yönetimi")
 	fmt.Println(strings.Repeat("-", 40))
 
-	// Cookie set eden endpoint'e istek gönder
 	resp, err = client.Get(targetURL + "/cookies/set?session=abc123&lang=tr")
 	if err != nil {
 		log.Printf("Cookie set hatası: %v", err)
 	} else {
 		resp.Close()
-		// Cookie'leri oku
 		cookies, err := client.GetCookies(targetURL)
 		if err == nil {
 			fmt.Printf("  Kayıtlı cookie sayısı: %d\n", len(cookies))
@@ -172,38 +219,38 @@ func main() {
 	}
 
 	// ──────────────────────────────────────────────────────────
-	// 7. Çoklu istek - Pipeline ile yüksek performans
+	// 9. Pipeline - Yüksek performanslı çoklu istek + Latency istatistikleri
 	// ──────────────────────────────────────────────────────────
-	fmt.Println("\n[7] Pipeline - Yüksek Performanslı Çoklu İstek")
+	fmt.Println("\n[9] Pipeline - Yüksek Performanslı Çoklu İstek")
 	fmt.Println(strings.Repeat("-", 40))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Bağlantıları önceden ısıt
 	fmt.Println("  Bağlantılar ısınıyor...")
 	_ = client.PreConnect(ctx, targetURL+"/get", 5)
 
-	// 100 worker ile pipeline oluştur
 	pipeline := client.NewPipeline(100)
 	defer pipeline.Close()
 
-	// 200 istek gönder
 	fmt.Println("  200 istek gönderiliyor...")
 	result := pipeline.Spray(ctx, "GET", targetURL+"/get", 200)
 
 	fmt.Printf("\n  Sonuçlar:\n")
-	fmt.Printf("    Toplam    : %d istek\n", result.Total)
-	fmt.Printf("    Başarılı  : %d\n", result.Success)
-	fmt.Printf("    Başarısız : %d\n", result.Failed)
-	fmt.Printf("    Süre      : %v\n", result.Duration.Round(time.Millisecond))
-	fmt.Printf("    RPS       : %.0f istek/saniye\n", result.RPS)
-	fmt.Printf("    Bağlantı  : %d aktif\n", client.ActiveConnections())
+	fmt.Printf("    Toplam      : %d istek\n", result.Total)
+	fmt.Printf("    Başarılı    : %d\n", result.Success)
+	fmt.Printf("    Başarısız   : %d\n", result.Failed)
+	fmt.Printf("    Süre        : %v\n", result.Duration.Round(time.Millisecond))
+	fmt.Printf("    RPS         : %.0f istek/saniye\n", result.RPS)
+	fmt.Printf("    Ort. Latency: %v\n", result.AvgLatency.Round(time.Millisecond))
+	fmt.Printf("    Min Latency : %v\n", result.MinLatency.Round(time.Millisecond))
+	fmt.Printf("    Max Latency : %v\n", result.MaxLatency.Round(time.Millisecond))
+	fmt.Printf("    Bağlantı    : %d aktif\n", client.ActiveConnections())
 
 	// ──────────────────────────────────────────────────────────
-	// 8. Context ile zaman aşımı kontrolü
+	// 10. Context ile zaman aşımı kontrolü
 	// ──────────────────────────────────────────────────────────
-	fmt.Println("\n[8] Context ile Zaman Aşımı")
+	fmt.Println("\n[10] Context ile Zaman Aşımı")
 	fmt.Println(strings.Repeat("-", 40))
 
 	shortCtx, shortCancel := context.WithTimeout(context.Background(), 3*time.Second)

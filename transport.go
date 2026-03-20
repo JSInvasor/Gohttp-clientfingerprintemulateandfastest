@@ -12,13 +12,11 @@ import (
 	"time"
 
 	tls "github.com/refraction-networking/utls"
-	"golang.org/x/net/http2"
 )
 
 // Transport is a high-performance HTTP transport with browser TLS fingerprinting.
 type Transport struct {
-	inner   *http.Transport
-	h2Inner *http2.Transport
+	inner *http.Transport
 
 	spec       func() *tls.ClientHelloSpec
 	h2Settings H2Settings
@@ -28,10 +26,6 @@ type Transport struct {
 	skipVerify bool
 	dnscache   *dnsCache
 	connCount  atomic.Int64
-
-	mu       sync.RWMutex
-	h2Conns  map[string]*http2.ClientConn
-	tlsConns map[string][]*tls.UConn
 }
 
 // TransportConfig holds configuration for creating a Transport.
@@ -81,8 +75,6 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		rootCAs:    cfg.RootCAs,
 		skipVerify: cfg.InsecureSkipVerify,
 		dnscache:   newDNSCache(cfg.DNSCacheTTL),
-		h2Conns:    make(map[string]*http2.ClientConn),
-		tlsConns:   make(map[string][]*tls.UConn),
 	}
 
 	// Set browser-specific fingerprint
@@ -287,6 +279,8 @@ type dnsCache struct {
 	mu      sync.RWMutex
 	entries map[string]*dnsCacheEntry
 	ttl     time.Duration
+	inflight sync.Map // singleflight per host to prevent thundering herd
+	stopCh   chan struct{}
 }
 
 type dnsCacheEntry struct {
@@ -296,9 +290,46 @@ type dnsCacheEntry struct {
 }
 
 func newDNSCache(ttl time.Duration) *dnsCache {
-	return &dnsCache{
+	d := &dnsCache{
 		entries: make(map[string]*dnsCacheEntry, 1024),
 		ttl:     ttl,
+		stopCh:  make(chan struct{}),
+	}
+
+	// Background cleanup of expired entries to prevent memory leaks
+	go d.cleanupLoop()
+
+	return d
+}
+
+// cleanupLoop periodically removes expired DNS cache entries.
+func (d *dnsCache) cleanupLoop() {
+	ticker := time.NewTicker(d.ttl * 2)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			d.mu.Lock()
+			for host, entry := range d.entries {
+				if now.After(entry.expiresAt) {
+					delete(d.entries, host)
+				}
+			}
+			d.mu.Unlock()
+		case <-d.stopCh:
+			return
+		}
+	}
+}
+
+// Close stops the background cleanup goroutine.
+func (d *dnsCache) Close() {
+	select {
+	case <-d.stopCh:
+	default:
+		close(d.stopCh)
 	}
 }
 
@@ -318,13 +349,46 @@ func (d *dnsCache) lookup(host string) (string, error) {
 		return entry.ips[idx%uint64(len(entry.ips))], nil
 	}
 
-	// Resolve all IPs
+	// Singleflight: only one goroutine resolves per host at a time
+	type resolveResult struct {
+		ips []string
+		err error
+	}
+
+	resultCh := make(chan resolveResult, 1)
+	actual, loaded := d.inflight.LoadOrStore(host, resultCh)
+
+	if loaded {
+		// Another goroutine is already resolving; wait for its result
+		ch := actual.(chan resolveResult)
+		res := <-ch
+		ch <- res // put it back for other waiters
+		if res.err != nil {
+			return "", res.err
+		}
+		// Use fresh entry from cache (set by the resolving goroutine)
+		d.mu.RLock()
+		entry, ok := d.entries[host]
+		d.mu.RUnlock()
+		if ok {
+			idx := entry.counter.Add(1) - 1
+			return entry.ips[idx%uint64(len(entry.ips))], nil
+		}
+		return res.ips[0], nil
+	}
+
+	// We are the resolving goroutine
 	ips, err := net.LookupHost(host)
 	if err != nil {
+		resultCh <- resolveResult{err: err}
+		d.inflight.Delete(host)
 		return "", err
 	}
 	if len(ips) == 0 {
-		return "", fmt.Errorf("no IPs found for %s", host)
+		err := fmt.Errorf("no IPs found for %s", host)
+		resultCh <- resolveResult{err: err}
+		d.inflight.Delete(host)
+		return "", err
 	}
 
 	newEntry := &dnsCacheEntry{
@@ -335,6 +399,9 @@ func (d *dnsCache) lookup(host string) (string, error) {
 	d.mu.Lock()
 	d.entries[host] = newEntry
 	d.mu.Unlock()
+
+	resultCh <- resolveResult{ips: ips}
+	d.inflight.Delete(host)
 
 	return ips[0], nil
 }

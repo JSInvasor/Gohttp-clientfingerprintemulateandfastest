@@ -12,12 +12,17 @@ type clientConfig struct {
 	transport TransportConfig
 
 	// Client-level settings
-	browser         BrowserProfile
-	followRedirects bool
-	maxRedirects    int
-	timeout         time.Duration
-	acceptLanguage  string
-	accept          string
+	browser          BrowserProfile
+	followRedirects  bool
+	maxRedirects     int
+	timeout          time.Duration
+	acceptLanguage   string
+	accept           string
+	userAgent        string // custom override, empty = use browser default
+	maxResponseBody  int64  // max response body size in bytes, 0 = unlimited
+	retryCount       int    // number of retries, 0 = no retry
+	retryBaseDelay   time.Duration // base delay for exponential backoff
+	retryStatusCodes []int  // HTTP status codes to retry on (e.g. 429, 502, 503, 504)
 }
 
 func defaultClientConfig() clientConfig {
@@ -178,5 +183,33 @@ func WithWriteBufferSize(n int) Option {
 func WithReadBufferSize(n int) Option {
 	return func(c *clientConfig) {
 		c.transport.ReadBufferSize = n
+	}
+}
+
+// WithUserAgent sets a custom User-Agent header, overriding the browser profile default.
+func WithUserAgent(ua string) Option {
+	return func(c *clientConfig) {
+		c.userAgent = ua
+	}
+}
+
+// WithMaxResponseBodySize sets the maximum allowed response body size in bytes.
+// Responses exceeding this limit will return an error. Default: 0 (unlimited).
+func WithMaxResponseBodySize(n int64) Option {
+	return func(c *clientConfig) {
+		c.maxResponseBody = n
+	}
+}
+
+// WithRetry enables automatic retry with exponential backoff.
+// count is the number of retry attempts (e.g. 3 means up to 3 retries after the initial request).
+// baseDelay is the initial delay between retries (doubles each attempt).
+// statusCodes are the HTTP status codes that trigger a retry (e.g. 429, 502, 503, 504).
+// Network errors are always retried regardless of statusCodes.
+func WithRetry(count int, baseDelay time.Duration, statusCodes ...int) Option {
+	return func(c *clientConfig) {
+		c.retryCount = count
+		c.retryBaseDelay = baseDelay
+		c.retryStatusCodes = statusCodes
 	}
 }
