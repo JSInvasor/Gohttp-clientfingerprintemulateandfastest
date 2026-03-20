@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
+	http2 "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/http2"
 	tls "github.com/refraction-networking/utls"
-	"golang.org/x/net/http2"
 )
 
 // Transport is a high-performance HTTP transport with full browser fingerprint emulation.
@@ -146,7 +146,7 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		ExpectContinueTimeout:  1 * time.Second,
 	}
 
-	// HTTP/2 transport with Firefox SETTINGS fingerprint
+	// HTTP/2 transport with FULL Firefox 148 fingerprint
 	// Akamai fingerprint: 1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s
 	if !cfg.ForceHTTP1 {
 		t.h2Transport = &http2.Transport{
@@ -157,12 +157,28 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 			DisableCompression: cfg.DisableCompression,
 			AllowHTTP:          false,
 
-			// Firefox 148 HTTP/2 SETTINGS:
-			// SETTINGS_HEADER_TABLE_SIZE (0x1) = 65536
-			MaxDecoderHeaderTableSize: t.h2Settings.HeaderTableSize,
-			// SETTINGS_MAX_FRAME_SIZE (0x5) = 16384
-			MaxReadFrameSize: t.h2Settings.MaxFrameSize,
-			// SETTINGS_MAX_HEADER_LIST_SIZE = 0 (not sent by Firefox)
+			// These affect Go's internal tracking (must match SETTINGS we send)
+			MaxDecoderHeaderTableSize: t.h2Settings.HeaderTableSize, // 65536
+			MaxReadFrameSize:          t.h2Settings.MaxFrameSize,    // 16384
+
+			// Custom SETTINGS frame: exact Firefox 148 order and values
+			// Sent on wire: HEADER_TABLE_SIZE(1), ENABLE_PUSH(2), INITIAL_WINDOW_SIZE(4), MAX_FRAME_SIZE(5)
+			Settings: []http2.Setting{
+				{ID: http2.SettingHeaderTableSize, Val: t.h2Settings.HeaderTableSize},     // 1:65536
+				{ID: http2.SettingEnablePush, Val: t.h2Settings.EnablePush},                // 2:0
+				{ID: http2.SettingInitialWindowSize, Val: t.h2Settings.InitialWindowSize},  // 4:131072
+				{ID: http2.SettingMaxFrameSize, Val: t.h2Settings.MaxFrameSize},            // 5:16384
+			},
+
+			// Connection-level WINDOW_UPDATE: Firefox 148 sends 12517377
+			ConnectionFlow: t.h2Settings.ConnectionWindowSize,
+
+			// Pseudo-header order: Firefox sends :method, :path, :authority, :scheme (m,p,a,s)
+			PseudoHeaderOrder: Firefox148PseudoHeaderOrder(),
+
+			// Header order: exact Firefox 148 HPACK encoding order
+			HeaderOrder: t.headerOrder,
+
 			StrictMaxConcurrentStreams: false,
 		}
 	}
@@ -172,60 +188,18 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 
 // RoundTrip implements http.RoundTripper with full fingerprint emulation.
 //
-// For HTTPS requests, uses HTTP/2 with Firefox SETTINGS/WINDOW_UPDATE fingerprint.
+// For HTTPS requests, uses HTTP/2 with full Firefox 148 fingerprint:
+//   - SETTINGS frame: exact values and order (1:65536, 2:0, 4:131072, 5:16384)
+//   - WINDOW_UPDATE: 12517377
+//   - Pseudo-header order: :method, :path, :authority, :scheme (m,p,a,s)
+//   - Header order: exact Firefox 148 HPACK encoding order
+//
 // For HTTP requests or ForceHTTP1 mode, uses HTTP/1.1.
-// Header order matches Firefox 148 for both protocols.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Reorder headers to match Firefox 148 header fingerprint
-	t.orderRequestHeaders(req)
-
-	// Route to correct transport based on scheme and H2 support
 	if req.URL.Scheme == "https" && !t.forceH1 && t.h2Transport != nil {
 		return t.h2Transport.RoundTrip(req)
 	}
-
 	return t.h1Transport.RoundTrip(req)
-}
-
-// orderRequestHeaders rebuilds the request header map in Firefox 148 order.
-//
-// This is critical because Go's http2 HPACK encoder iterates headers in map order.
-// By rebuilding the map in Firefox order, HPACK encodes them in the correct sequence.
-//
-// Firefox 148 header order:
-//
-//	user-agent, accept, accept-language, accept-encoding,
-//	[content-type], [content-length], [origin], [referer], [cookie],
-//	upgrade-insecure-requests, sec-fetch-dest, sec-fetch-mode,
-//	sec-fetch-site, sec-fetch-user, priority, te
-func (t *Transport) orderRequestHeaders(req *http.Request) {
-	if req.Header == nil || len(t.headerOrder) == 0 {
-		return
-	}
-
-	original := req.Header
-	ordered := make(http.Header, len(original))
-
-	// Add headers in Firefox 148 exact order
-	for _, key := range t.headerOrder {
-		canonicalKey := http.CanonicalHeaderKey(key)
-		if vals, ok := original[canonicalKey]; ok {
-			ordered[canonicalKey] = vals
-		}
-	}
-
-	// Add any custom headers not in Firefox order (appended at end)
-	seen := make(map[string]bool, len(t.headerOrder))
-	for _, key := range t.headerOrder {
-		seen[http.CanonicalHeaderKey(key)] = true
-	}
-	for key, vals := range original {
-		if !seen[key] {
-			ordered[key] = vals
-		}
-	}
-
-	req.Header = ordered
 }
 
 // dialWithDNSCache returns a DialContext function with DNS caching and round-robin.
@@ -253,16 +227,8 @@ func (t *Transport) dialTLSForH1() func(ctx context.Context, network, addr strin
 }
 
 // dialTLSForH2 creates uTLS connections for HTTP/2 (ALPN: h2, http/1.1).
-// The connection is wrapped with h2Conn to inject Firefox WINDOW_UPDATE on the connection.
 func (t *Transport) dialTLSForH2(ctx context.Context, network, addr string) (net.Conn, error) {
-	conn, err := t.dialTLS(ctx, network, addr, []string{"h2", "http/1.1"})
-	if err != nil {
-		return nil, err
-	}
-
-	// Wrap connection to inject Firefox HTTP/2 WINDOW_UPDATE frame
-	// This makes the connection-level window size match Firefox 148
-	return newH2Conn(conn, t.h2Settings), nil
+	return t.dialTLS(ctx, network, addr, []string{"h2", "http/1.1"})
 }
 
 // dialTLS performs TLS handshake using uTLS with exact Firefox 148 ClientHello.
@@ -423,135 +389,6 @@ func (t *Transport) dialViaProxy(ctx context.Context, network, targetAddr string
 
 	return proxyConn, nil
 }
-
-// h2Conn wraps a TLS connection to replace Go's default HTTP/2 WINDOW_UPDATE
-// with the Firefox 148 value.
-//
-// Go's http2.Transport sends: preface + SETTINGS + WINDOW_UPDATE(0, 1<<30)
-// Firefox 148 sends:          preface + SETTINGS + WINDOW_UPDATE(0, 12517377)
-//
-// This wrapper intercepts the first write (which contains the entire connection
-// preface + SETTINGS + WINDOW_UPDATE as a single flush) and replaces the
-// WINDOW_UPDATE increment value with the Firefox value.
-//
-// Akamai HTTP/2 fingerprint format: SETTINGS|WINDOW_UPDATE|PRIORITY|pseudo-headers
-// Firefox 148: 1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s
-type h2Conn struct {
-	net.Conn
-	settings H2Settings
-	once     sync.Once
-}
-
-func newH2Conn(conn net.Conn, settings H2Settings) *h2Conn {
-	return &h2Conn{
-		Conn:     conn,
-		settings: settings,
-	}
-}
-
-// Write intercepts the first write to rebuild SETTINGS + WINDOW_UPDATE with Firefox 148 fingerprint.
-//
-// The first write from http2.Transport contains:
-//   - Connection preface: "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (24 bytes)
-//   - SETTINGS frame: 9-byte header + N*6 bytes of settings
-//   - WINDOW_UPDATE frame: 9-byte header + 4-byte increment
-//
-// Go's http2.Transport sends extra settings (MAX_CONCURRENT_STREAMS, MAX_HEADER_LIST_SIZE)
-// and wrong setting order. We rebuild the SETTINGS frame to match Firefox 148 exactly:
-//
-//	Firefox 148 SETTINGS order: HEADER_TABLE_SIZE(1), ENABLE_PUSH(2), INITIAL_WINDOW_SIZE(4), MAX_FRAME_SIZE(5)
-//
-// We also replace the WINDOW_UPDATE increment from Go's 1<<30 to Firefox's 12517377.
-func (c *h2Conn) Write(b []byte) (int, error) {
-	var modified []byte
-
-	c.once.Do(func() {
-		if len(b) >= len(http2ClientPreface) &&
-			string(b[:len(http2ClientPreface)]) == http2ClientPreface {
-
-			// Parse Go's SETTINGS frame to get INITIAL_WINDOW_SIZE value
-			// (we must keep Go's value to avoid flow control mismatch)
-			goInitWindowSize := uint32(0)
-			pos := len(http2ClientPreface)
-			for pos+9 <= len(b) {
-				frameLen := int(b[pos])<<16 | int(b[pos+1])<<8 | int(b[pos+2])
-				frameType := b[pos+3]
-
-				if frameType == 0x04 { // SETTINGS frame
-					payload := b[pos+9 : pos+9+frameLen]
-					for i := 0; i+5 < len(payload); i += 6 {
-						id := uint16(payload[i])<<8 | uint16(payload[i+1])
-						val := uint32(payload[i+2])<<24 | uint32(payload[i+3])<<16 |
-							uint32(payload[i+4])<<8 | uint32(payload[i+5])
-						if id == 4 { // SETTINGS_INITIAL_WINDOW_SIZE
-							goInitWindowSize = val
-						}
-					}
-				}
-
-				pos += 9 + frameLen
-			}
-
-			// Use Go's INITIAL_WINDOW_SIZE to keep flow control in sync
-			initWindowSize := goInitWindowSize
-			if initWindowSize == 0 {
-				initWindowSize = 4 << 20 // Go default: 4MB
-			}
-
-			// Build Firefox 148 connection preface:
-			// Preface + SETTINGS(1:65536, 2:0, 4:IWS, 5:16384) + WINDOW_UPDATE(0, 12517377)
-			type h2Setting struct {
-				id  uint16
-				val uint32
-			}
-
-			firefoxSettings := []h2Setting{
-				{1, c.settings.HeaderTableSize},  // HEADER_TABLE_SIZE = 65536
-				{2, c.settings.EnablePush},        // ENABLE_PUSH = 0
-				{4, initWindowSize},               // INITIAL_WINDOW_SIZE (Go's value)
-				{5, c.settings.MaxFrameSize},      // MAX_FRAME_SIZE = 16384
-			}
-
-			payloadLen := len(firefoxSettings) * 6 // 4 settings × 6 bytes = 24
-
-			// Allocate: preface(24) + settings_header(9) + settings_payload(24) + window_update(13) = 70 bytes
-			buf := make([]byte, 0, 70)
-
-			// HTTP/2 client connection preface
-			buf = append(buf, []byte(http2ClientPreface)...)
-
-			// SETTINGS frame header: Length(3) + Type(1) + Flags(1) + StreamID(4)
-			buf = append(buf, byte(payloadLen>>16), byte(payloadLen>>8), byte(payloadLen))
-			buf = append(buf, 0x04, 0x00, 0, 0, 0, 0) // Type=SETTINGS, Flags=0, StreamID=0
-
-			// SETTINGS payload: each setting is ID(2) + Value(4) = 6 bytes
-			for _, s := range firefoxSettings {
-				buf = append(buf, byte(s.id>>8), byte(s.id))
-				buf = append(buf, byte(s.val>>24), byte(s.val>>16), byte(s.val>>8), byte(s.val))
-			}
-
-			// WINDOW_UPDATE frame: Length=4, Type=8, Flags=0, StreamID=0, Increment=12517377
-			increment := c.settings.ConnectionWindowSize
-			buf = append(buf, 0, 0, 4)                // Length = 4
-			buf = append(buf, 0x08, 0x00, 0, 0, 0, 0) // Type=WINDOW_UPDATE, Flags=0, StreamID=0
-			buf = append(buf, byte(increment>>24), byte(increment>>16), byte(increment>>8), byte(increment))
-
-			modified = buf
-		}
-	})
-
-	if modified != nil {
-		_, err := c.Conn.Write(modified)
-		if err != nil {
-			return 0, err
-		}
-		return len(b), nil
-	}
-
-	return c.Conn.Write(b)
-}
-
-const http2ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 // PreConnect pre-warms n TLS connections to the given host.
 func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
