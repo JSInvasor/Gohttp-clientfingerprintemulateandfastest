@@ -114,7 +114,7 @@ func parseProxyString(s string) (*url.URL, error) {
 }
 
 // SetProxyRotator configures the client to use rotating proxies.
-// This replaces any previously set proxy.
+// Proxies are applied at the dial level, so they work for both HTTP/1.1 and HTTP/2.
 func (c *Client) SetProxyRotator(pr *ProxyRotator) {
-	c.transport.inner.Proxy = pr.ProxyFunc()
+	c.transport.setProxy(pr.ProxyFunc())
 }

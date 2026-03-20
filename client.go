@@ -46,7 +46,7 @@ func NewClient(opts ...Option) (*Client, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid proxy URL: %w", err)
 		}
-		transport.inner.Proxy = http.ProxyURL(proxyURL)
+		transport.setProxy(http.ProxyURL(proxyURL))
 	}
 
 	jar, _ := cookiejar.New(nil)
