@@ -182,6 +182,7 @@ func TestPseudoHeaderOrder(t *testing.T) {
 
 func TestDNSCache(t *testing.T) {
 	cache := newDNSCache(5 * time.Minute)
+	defer cache.Close()
 
 	// IP passthrough
 	ip, err := cache.lookup("127.0.0.1")

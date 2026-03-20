@@ -4,27 +4,22 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
-	"sync"
 
 	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 )
 
 // Response wraps http.Response with convenience methods and zero-alloc helpers.
 type Response struct {
 	*http.Response
 
-	bodyRead bool
-	bodyData []byte
-	bodyErr  error
-}
-
-var bodyBufPool = sync.Pool{
-	New: func() interface{} {
-		buf := make([]byte, 0, 4096)
-		return &buf
-	},
+	bodyRead     bool
+	bodyData     []byte
+	bodyErr      error
+	maxBodySize  int64 // 0 = unlimited
 }
 
 // StatusCode returns the HTTP status code.
@@ -60,11 +55,28 @@ func (r *Response) Bytes() ([]byte, error) {
 		reader = brotli.NewReader(r.Response.Body)
 	case "deflate":
 		reader = flate.NewReader(r.Response.Body)
+	case "zstd":
+		zr, err := zstd.NewReader(r.Response.Body)
+		if err != nil {
+			r.bodyErr = err
+			return nil, err
+		}
+		defer zr.Close()
+		reader = zr
 	default:
 		reader = r.Response.Body
 	}
 
+	if r.maxBodySize > 0 {
+		reader = io.LimitReader(reader, r.maxBodySize+1)
+	}
+
 	data, err := io.ReadAll(reader)
+	if err == nil && r.maxBodySize > 0 && int64(len(data)) > r.maxBodySize {
+		r.bodyErr = fmt.Errorf("response body exceeds maximum size of %d bytes", r.maxBodySize)
+		r.bodyData = nil
+		return nil, r.bodyErr
+	}
 	r.bodyData = data
 	r.bodyErr = err
 	return data, err

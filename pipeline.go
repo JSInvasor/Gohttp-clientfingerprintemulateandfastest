@@ -107,6 +107,7 @@ func (p *Pipeline) worker() {
 }
 
 // Send submits a request to the pipeline and returns a channel for the result.
+// Respects context cancellation to avoid blocking when the pipeline is full.
 func (p *Pipeline) Send(ctx context.Context, method, url string, body []byte, headers map[string]string) <-chan *PipelineResult {
 	ch := make(chan *PipelineResult, 1)
 
@@ -115,13 +116,19 @@ func (p *Pipeline) Send(ctx context.Context, method, url string, body []byte, he
 		return ch
 	}
 
-	p.jobCh <- &pipelineJob{
+	job := &pipelineJob{
 		ctx:     ctx,
 		method:  method,
 		url:     url,
 		body:    body,
 		headers: headers,
 		result:  ch,
+	}
+
+	select {
+	case p.jobCh <- job:
+	case <-ctx.Done():
+		ch <- &PipelineResult{Err: ctx.Err()}
 	}
 
 	return ch
@@ -135,7 +142,7 @@ func (p *Pipeline) FireAndForget(ctx context.Context, method, url string, body [
 		return
 	}
 
-	p.jobCh <- &pipelineJob{
+	job := &pipelineJob{
 		ctx:     ctx,
 		method:  method,
 		url:     url,
@@ -143,18 +150,27 @@ func (p *Pipeline) FireAndForget(ctx context.Context, method, url string, body [
 		headers: headers,
 		result:  nil, // no result channel
 	}
+
+	select {
+	case p.jobCh <- job:
+	case <-ctx.Done():
+	}
 }
 
 // Spray sends n requests as fast as possible and returns aggregate results.
 // This is designed for maximum throughput testing.
 func (p *Pipeline) Spray(ctx context.Context, method, url string, n int) *SprayResult {
 	sr := &SprayResult{
-		Total:     n,
-		StartTime: time.Now(),
+		Total:      n,
+		StartTime:  time.Now(),
+		MinLatency: time.Duration(1<<63 - 1), // max duration as initial min
 	}
 
 	var wg sync.WaitGroup
 	var okCount, errCount atomic.Int64
+	var totalLatencyNs atomic.Int64
+	var minLatencyNs, maxLatencyNs atomic.Int64
+	minLatencyNs.Store(int64(sr.MinLatency))
 
 	for i := 0; i < n; i++ {
 		select {
@@ -178,6 +194,24 @@ func (p *Pipeline) Spray(ctx context.Context, method, url string, n int) *SprayR
 					result.Response.Close()
 				}
 			}
+			// Track latency for all requests (success and failure)
+			latNs := int64(result.Latency)
+			totalLatencyNs.Add(latNs)
+
+			// Update min latency (CAS loop)
+			for {
+				cur := minLatencyNs.Load()
+				if latNs >= cur || minLatencyNs.CompareAndSwap(cur, latNs) {
+					break
+				}
+			}
+			// Update max latency (CAS loop)
+			for {
+				cur := maxLatencyNs.Load()
+				if latNs <= cur || maxLatencyNs.CompareAndSwap(cur, latNs) {
+					break
+				}
+			}
 		}()
 	}
 
@@ -190,19 +224,30 @@ done:
 	if sr.Duration.Seconds() > 0 {
 		sr.RPS = float64(sr.Success) / sr.Duration.Seconds()
 	}
+	total := sr.Success + sr.Failed
+	if total > 0 {
+		sr.AvgLatency = time.Duration(totalLatencyNs.Load() / int64(total))
+		sr.MinLatency = time.Duration(minLatencyNs.Load())
+		sr.MaxLatency = time.Duration(maxLatencyNs.Load())
+	} else {
+		sr.MinLatency = 0
+	}
 
 	return sr
 }
 
 // SprayResult holds the results of a Spray operation.
 type SprayResult struct {
-	Total     int
-	Success   int
-	Failed    int
-	Duration  time.Duration
-	RPS       float64
-	StartTime time.Time
-	EndTime   time.Time
+	Total      int
+	Success    int
+	Failed     int
+	Duration   time.Duration
+	RPS        float64
+	StartTime  time.Time
+	EndTime    time.Time
+	AvgLatency time.Duration
+	MinLatency time.Duration
+	MaxLatency time.Duration
 }
 
 // Close shuts down the pipeline and waits for all workers to finish.
