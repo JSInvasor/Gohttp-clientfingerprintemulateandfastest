@@ -1,16 +1,12 @@
 // Package gofire provides a high-performance HTTP client with Firefox 148
-// TLS fingerprint emulation. It is designed for maximum throughput (200-300k+ RPS)
-// with accurate browser fingerprinting to bypass TLS/JA3 detection.
+// TLS fingerprint emulation. Designed for 200-300k+ RPS with full
+// JA3/JA4 + HTTP/2 + header fingerprint bypass.
 //
-// Key features:
-//   - Firefox 148 TLS fingerprint (JA3/JA4) via uTLS
-//   - Firefox 148 HTTP/2 fingerprint (SETTINGS, WINDOW_UPDATE)
-//   - Firefox-accurate header ordering
-//   - DNS caching for reduced latency
-//   - Aggressive connection pooling (10k+ idle connections)
-//   - Zero-allocation hot paths via sync.Pool
-//   - Automatic gzip/br/deflate decompression
-//   - TCP socket tuning (TCP_NODELAY, TCP_QUICKACK on Linux)
+// Usage:
+//
+//	client, _ := gofire.Emulate(gofire.Firefox148)
+//	resp, _ := client.Get("https://example.com")
+//	text, _ := resp.Text()
 package gofire
 
 import (
@@ -25,7 +21,7 @@ import (
 	"sync"
 )
 
-// Client is a high-performance HTTP client with Firefox 148 fingerprint emulation.
+// Client is a high-performance HTTP client with browser fingerprint emulation.
 type Client struct {
 	httpClient *http.Client
 	transport  *Transport
@@ -36,14 +32,14 @@ type Client struct {
 }
 
 // NewClient creates a new Client with the given options.
-// Default configuration is optimized for maximum RPS.
+// For the simplest usage, prefer Emulate() instead.
 func NewClient(opts ...Option) (*Client, error) {
 	cfg := defaultClientConfig()
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 
-	transport := newTransport(cfg.transport)
+	transport := newTransport(cfg.transport, cfg.browser)
 
 	// Configure proxy if set
 	if cfg.transport.ProxyURL != "" {
@@ -77,7 +73,6 @@ func NewClient(opts ...Option) (*Client, error) {
 		if len(via) >= cfg.maxRedirects {
 			return fmt.Errorf("stopped after %d redirects", cfg.maxRedirects)
 		}
-		// Copy Firefox headers to redirect request
 		applyFirefoxHeaders(req, cfg.accept, cfg.acceptLanguage)
 		return nil
 	}
@@ -151,7 +146,7 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	// Apply Firefox default headers
+	// Apply browser default headers
 	applyFirefoxHeaders(req, c.config.accept, c.config.acceptLanguage)
 
 	// Apply custom headers (override defaults)
@@ -177,6 +172,22 @@ func (c *Client) DoHTTPRequest(req *http.Request) (*Response, error) {
 	}
 
 	return &Response{Response: resp}, nil
+}
+
+// PreConnect pre-warms n TLS connections to the given URL.
+// Call this before sending requests for lowest latency on first requests.
+func (c *Client) PreConnect(ctx context.Context, rawURL string, n int) error {
+	return c.transport.PreConnect(ctx, rawURL, n)
+}
+
+// NewPipeline creates a new Pipeline with the specified worker count.
+// Use this for maximum RPS throughput.
+//
+//	pipeline := client.NewPipeline(3000)
+//	defer pipeline.Close()
+//	result := pipeline.Spray(ctx, "GET", "https://target.com", 100000)
+func (c *Client) NewPipeline(workers int) *Pipeline {
+	return newPipeline(c, workers)
 }
 
 // Close releases all resources held by the client.
@@ -221,7 +232,6 @@ func (c *Client) GetHTTPClient() *http.Client {
 }
 
 // Flood sends n concurrent requests to the given URL and returns all responses.
-// This is optimized for maximum throughput with worker pool pattern.
 func (c *Client) Flood(ctx context.Context, method, rawURL string, n, concurrency int) ([]*Response, []error) {
 	if concurrency <= 0 {
 		concurrency = 100
@@ -261,7 +271,7 @@ func (c *Client) Flood(ctx context.Context, method, rawURL string, n, concurrenc
 	return responses, errors
 }
 
-// BuildRequest creates an http.Request builder for more complex requests.
+// BuildRequest creates an http.Request builder for complex requests.
 func (c *Client) BuildRequest() *RequestBuilder {
 	return &RequestBuilder{
 		client:  c,
@@ -269,7 +279,7 @@ func (c *Client) BuildRequest() *RequestBuilder {
 	}
 }
 
-// RequestBuilder provides a fluent API for building complex HTTP requests.
+// RequestBuilder provides a fluent API for building HTTP requests.
 type RequestBuilder struct {
 	client  *Client
 	method  string

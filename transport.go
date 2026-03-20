@@ -15,17 +15,19 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// Transport is a high-performance HTTP transport with Firefox 148 TLS fingerprinting.
-// It wraps http.Transport with uTLS for TLS fingerprint emulation.
+// Transport is a high-performance HTTP transport with browser TLS fingerprinting.
 type Transport struct {
-	inner     *http.Transport
-	h2Inner   *http2.Transport
-	spec      func() *tls.ClientHelloSpec
-	proxyURL  string
-	forceH1   bool
-	rootCAs   *x509.CertPool
-	dnscache  *dnsCache
-	connCount atomic.Int64
+	inner   *http.Transport
+	h2Inner *http2.Transport
+
+	spec       func() *tls.ClientHelloSpec
+	h2Settings H2Settings
+	proxyURL   string
+	forceH1    bool
+	rootCAs    *x509.CertPool
+	skipVerify bool
+	dnscache   *dnsCache
+	connCount  atomic.Int64
 
 	mu       sync.RWMutex
 	h2Conns  map[string]*http2.ClientConn
@@ -34,19 +36,22 @@ type Transport struct {
 
 // TransportConfig holds configuration for creating a Transport.
 type TransportConfig struct {
-	MaxIdleConns        int
-	MaxIdleConnsPerHost int
-	MaxConnsPerHost     int
-	IdleConnTimeout     time.Duration
-	TLSHandshakeTimeout time.Duration
-	DisableKeepAlives   bool
-	DisableCompression  bool
-	ForceHTTP1          bool
-	ProxyURL            string
-	RootCAs             *x509.CertPool
-	DNSCacheTTL         time.Duration
-	DialTimeout         time.Duration
+	MaxIdleConns          int
+	MaxIdleConnsPerHost   int
+	MaxConnsPerHost       int
+	IdleConnTimeout       time.Duration
+	TLSHandshakeTimeout  time.Duration
+	DisableKeepAlives     bool
+	DisableCompression    bool
+	ForceHTTP1            bool
+	ProxyURL              string
+	RootCAs               *x509.CertPool
+	InsecureSkipVerify    bool
+	DNSCacheTTL           time.Duration
+	DialTimeout           time.Duration
 	ResponseHeaderTimeout time.Duration
+	WriteBufferSize       int
+	ReadBufferSize        int
 }
 
 func defaultTransportConfig() TransportConfig {
@@ -59,22 +64,35 @@ func defaultTransportConfig() TransportConfig {
 		DisableKeepAlives:     false,
 		DisableCompression:    true, // avoid CPU overhead for max RPS
 		ForceHTTP1:            false,
+		InsecureSkipVerify:    false,
 		DNSCacheTTL:           5 * time.Minute,
 		DialTimeout:           10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
+		WriteBufferSize:       64 * 1024,
+		ReadBufferSize:        64 * 1024,
 	}
 }
 
 // newTransport creates a new Transport with the given configuration.
-func newTransport(cfg TransportConfig) *Transport {
+func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 	t := &Transport{
-		spec:     Firefox148Spec,
-		proxyURL: cfg.ProxyURL,
-		forceH1:  cfg.ForceHTTP1,
-		rootCAs:  cfg.RootCAs,
-		dnscache: newDNSCache(cfg.DNSCacheTTL),
-		h2Conns:  make(map[string]*http2.ClientConn),
-		tlsConns: make(map[string][]*tls.UConn),
+		proxyURL:   cfg.ProxyURL,
+		forceH1:    cfg.ForceHTTP1,
+		rootCAs:    cfg.RootCAs,
+		skipVerify: cfg.InsecureSkipVerify,
+		dnscache:   newDNSCache(cfg.DNSCacheTTL),
+		h2Conns:    make(map[string]*http2.ClientConn),
+		tlsConns:   make(map[string][]*tls.UConn),
+	}
+
+	// Set browser-specific fingerprint
+	switch browser {
+	case Firefox148:
+		t.spec = Firefox148Spec
+		t.h2Settings = Firefox148H2Settings()
+	default:
+		t.spec = Firefox148Spec
+		t.h2Settings = Firefox148H2Settings()
 	}
 
 	dialer := &net.Dialer{
@@ -89,26 +107,37 @@ func newTransport(cfg TransportConfig) *Transport {
 		},
 	}
 
+	wbs := cfg.WriteBufferSize
+	if wbs <= 0 {
+		wbs = 64 * 1024
+	}
+	rbs := cfg.ReadBufferSize
+	if rbs <= 0 {
+		rbs = 64 * 1024
+	}
+
 	t.inner = &http.Transport{
-		DialContext:           t.dialWithDNSCache(dialer),
-		DialTLSContext:        t.dialTLS(dialer),
-		MaxIdleConns:          cfg.MaxIdleConns,
-		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
-		MaxConnsPerHost:       cfg.MaxConnsPerHost,
-		IdleConnTimeout:       cfg.IdleConnTimeout,
-		TLSHandshakeTimeout:  cfg.TLSHandshakeTimeout,
-		DisableKeepAlives:     cfg.DisableKeepAlives,
-		DisableCompression:    cfg.DisableCompression,
-		ForceAttemptHTTP2:     !cfg.ForceHTTP1,
-		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
-		WriteBufferSize:       64 * 1024,
-		ReadBufferSize:        64 * 1024,
+		DialContext:            t.dialWithDNSCache(dialer),
+		DialTLSContext:         t.dialTLS(dialer),
+		MaxIdleConns:           cfg.MaxIdleConns,
+		MaxIdleConnsPerHost:    cfg.MaxIdleConnsPerHost,
+		MaxConnsPerHost:        cfg.MaxConnsPerHost,
+		IdleConnTimeout:        cfg.IdleConnTimeout,
+		TLSHandshakeTimeout:   cfg.TLSHandshakeTimeout,
+		DisableKeepAlives:      cfg.DisableKeepAlives,
+		DisableCompression:     cfg.DisableCompression,
+		ForceAttemptHTTP2:      !cfg.ForceHTTP1,
+		ResponseHeaderTimeout:  cfg.ResponseHeaderTimeout,
+		WriteBufferSize:        wbs,
+		ReadBufferSize:         rbs,
+		ExpectContinueTimeout:  1 * time.Second,
 	}
 
 	return t
 }
 
-// dialWithDNSCache returns a DialContext function that uses DNS caching.
+// dialWithDNSCache returns a DialContext function that uses DNS caching
+// with round-robin IP selection for load distribution.
 func (t *Transport) dialWithDNSCache(dialer *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
@@ -125,7 +154,7 @@ func (t *Transport) dialWithDNSCache(dialer *net.Dialer) func(ctx context.Contex
 	}
 }
 
-// dialTLS creates a TLS connection using uTLS with Firefox 148 fingerprint.
+// dialTLS creates a TLS connection using uTLS with browser fingerprint.
 func (t *Transport) dialTLS(dialer *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
@@ -150,10 +179,10 @@ func (t *Transport) dialTLS(dialer *net.Dialer) func(ctx context.Context, networ
 			return nil, fmt.Errorf("dial tcp: %w", err)
 		}
 
-		// Configure TLS
+		// Configure uTLS
 		tlsConfig := &tls.Config{
 			ServerName:         host,
-			InsecureSkipVerify: false,
+			InsecureSkipVerify: t.skipVerify,
 			RootCAs:            t.rootCAs,
 			NextProtos:         []string{"h2", "http/1.1"},
 		}
@@ -162,7 +191,7 @@ func (t *Transport) dialTLS(dialer *net.Dialer) func(ctx context.Context, networ
 			tlsConfig.NextProtos = []string{"http/1.1"}
 		}
 
-		// Create uTLS connection with Firefox 148 spec
+		// Create uTLS connection with browser spec
 		uconn := tls.UClient(rawConn, tlsConfig, tls.HelloCustom)
 		if err := uconn.ApplyPreset(t.spec()); err != nil {
 			rawConn.Close()
@@ -193,6 +222,51 @@ func (t *Transport) dialTLS(dialer *net.Dialer) func(ctx context.Context, networ
 	}
 }
 
+// PreConnect pre-warms n TLS connections to the given host.
+// This eliminates TLS handshake latency from the first n requests.
+func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
+	if n <= 0 {
+		n = 10
+	}
+
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []error
+	)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Make a HEAD request to establish the connection
+			req, err := http.NewRequestWithContext(ctx, "HEAD", host, nil)
+			if err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+				return
+			}
+			applyFirefoxHeaders(req, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "en-US,en;q=0.5")
+			resp, err := t.inner.RoundTrip(req)
+			if err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+
+	wg.Wait()
+
+	if len(errs) > 0 {
+		return fmt.Errorf("preconnect: %d/%d connections failed, first error: %w", len(errs), n, errs[0])
+	}
+	return nil
+}
+
 // RoundTrip executes a single HTTP transaction.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.inner.RoundTrip(req)
@@ -208,21 +282,22 @@ func (t *Transport) ActiveConnections() int64 {
 	return t.connCount.Load()
 }
 
-// dnsCache provides a simple thread-safe DNS cache.
+// dnsCache provides a thread-safe DNS cache with round-robin IP selection.
 type dnsCache struct {
 	mu      sync.RWMutex
-	entries map[string]dnsCacheEntry
+	entries map[string]*dnsCacheEntry
 	ttl     time.Duration
 }
 
 type dnsCacheEntry struct {
-	ip        string
+	ips       []string
 	expiresAt time.Time
+	counter   atomic.Uint64
 }
 
 func newDNSCache(ttl time.Duration) *dnsCache {
 	return &dnsCache{
-		entries: make(map[string]dnsCacheEntry, 1024),
+		entries: make(map[string]*dnsCacheEntry, 1024),
 		ttl:     ttl,
 	}
 }
@@ -238,10 +313,12 @@ func (d *dnsCache) lookup(host string) (string, error) {
 	d.mu.RUnlock()
 
 	if ok && time.Now().Before(entry.expiresAt) {
-		return entry.ip, nil
+		// Round-robin IP selection
+		idx := entry.counter.Add(1) - 1
+		return entry.ips[idx%uint64(len(entry.ips))], nil
 	}
 
-	// Resolve
+	// Resolve all IPs
 	ips, err := net.LookupHost(host)
 	if err != nil {
 		return "", err
@@ -250,15 +327,21 @@ func (d *dnsCache) lookup(host string) (string, error) {
 		return "", fmt.Errorf("no IPs found for %s", host)
 	}
 
-	ip := ips[0]
-
-	d.mu.Lock()
-	d.entries[host] = dnsCacheEntry{
-		ip:        ip,
+	newEntry := &dnsCacheEntry{
+		ips:       ips,
 		expiresAt: time.Now().Add(d.ttl),
 	}
+
+	d.mu.Lock()
+	d.entries[host] = newEntry
 	d.mu.Unlock()
 
-	return ip, nil
+	return ips[0], nil
 }
 
+// Refresh forces a DNS re-lookup for the given host.
+func (d *dnsCache) Refresh(host string) {
+	d.mu.Lock()
+	delete(d.entries, host)
+	d.mu.Unlock()
+}

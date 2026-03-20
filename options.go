@@ -12,6 +12,7 @@ type clientConfig struct {
 	transport TransportConfig
 
 	// Client-level settings
+	browser         BrowserProfile
 	followRedirects bool
 	maxRedirects    int
 	timeout         time.Duration
@@ -22,6 +23,7 @@ type clientConfig struct {
 func defaultClientConfig() clientConfig {
 	return clientConfig{
 		transport:       defaultTransportConfig(),
+		browser:         Firefox148,
 		followRedirects: true,
 		maxRedirects:    10,
 		timeout:         30 * time.Second,
@@ -67,7 +69,7 @@ func WithMaxConnsPerHost(n int) Option {
 }
 
 // WithDisableKeepAlives disables HTTP keep-alive connections.
-// NOT recommended for high RPS - only use if needed.
+// NOT recommended for high RPS.
 func WithDisableKeepAlives() Option {
 	return func(c *clientConfig) {
 		c.transport.DisableKeepAlives = true
@@ -130,7 +132,7 @@ func WithAcceptLanguage(lang string) Option {
 	}
 }
 
-// WithAccept sets the Accept header. Default: Firefox's default accept.
+// WithAccept sets the Accept header.
 func WithAccept(accept string) Option {
 	return func(c *clientConfig) {
 		c.accept = accept
@@ -144,8 +146,12 @@ func WithRootCAs(pool *x509.CertPool) Option {
 	}
 }
 
-// WithInsecureSkipVerify is intentionally NOT provided.
-// Disabling TLS verification is a security risk. If you need custom CAs, use WithRootCAs.
+// WithInsecureSkipVerify disables TLS certificate verification.
+func WithInsecureSkipVerify() Option {
+	return func(c *clientConfig) {
+		c.transport.InsecureSkipVerify = true
+	}
+}
 
 // WithResponseHeaderTimeout sets the timeout for reading response headers. Default: 30s.
 func WithResponseHeaderTimeout(d time.Duration) Option {
@@ -154,9 +160,23 @@ func WithResponseHeaderTimeout(d time.Duration) Option {
 	}
 }
 
-// WithDisableCompression enables response decompression (disabled by default for speed).
+// WithEnableCompression enables response decompression (disabled by default for speed).
 func WithEnableCompression() Option {
 	return func(c *clientConfig) {
 		c.transport.DisableCompression = false
+	}
+}
+
+// WithWriteBufferSize sets the write buffer size per connection. Default: 64KB.
+func WithWriteBufferSize(n int) Option {
+	return func(c *clientConfig) {
+		c.transport.WriteBufferSize = n
+	}
+}
+
+// WithReadBufferSize sets the read buffer size per connection. Default: 64KB.
+func WithReadBufferSize(n int) Option {
+	return func(c *clientConfig) {
+		c.transport.ReadBufferSize = n
 	}
 }

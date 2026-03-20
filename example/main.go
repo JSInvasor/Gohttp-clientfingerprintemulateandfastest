@@ -4,19 +4,19 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
 )
 
 func main() {
-	// Create client with default settings (optimized for max RPS)
-	client, err := gofire.NewClient(
+	// ============================================================
+	// 1. Create client with Firefox 148 emulation
+	// ============================================================
+	client, err := gofire.Emulate(gofire.Firefox148,
 		gofire.WithTimeout(15*time.Second),
-		gofire.WithMaxIdleConnsPerHost(1000),
-		gofire.WithMaxIdleConns(10000),
+		gofire.WithMaxIdleConnsPerHost(2000),
+		gofire.WithMaxIdleConns(20000),
 		gofire.WithDNSCacheTTL(10*time.Minute),
 	)
 	if err != nil {
@@ -24,25 +24,31 @@ func main() {
 	}
 	defer client.Close()
 
-	// Simple GET
+	// ============================================================
+	// 2. Simple GET request
+	// ============================================================
 	fmt.Println("=== Simple GET ===")
 	resp, err := client.Get("https://httpbin.org/get")
 	if err != nil {
 		log.Fatal(err)
 	}
 	text, _ := resp.Text()
-	fmt.Printf("Status: %d\nBody length: %d\n\n", resp.StatusCode(), len(text))
+	fmt.Printf("Status: %d | Body: %d bytes\n\n", resp.StatusCode(), len(text))
 
-	// POST JSON
+	// ============================================================
+	// 3. POST JSON
+	// ============================================================
 	fmt.Println("=== POST JSON ===")
-	resp, err = client.PostJSON("https://httpbin.org/post", []byte(`{"test": true}`))
+	resp, err = client.PostJSON("https://httpbin.org/post", []byte(`{"test":true}`))
 	if err != nil {
 		log.Fatal(err)
 	}
 	text, _ = resp.Text()
-	fmt.Printf("Status: %d\nBody length: %d\n\n", resp.StatusCode(), len(text))
+	fmt.Printf("Status: %d | Body: %d bytes\n\n", resp.StatusCode(), len(text))
 
-	// Builder pattern
+	// ============================================================
+	// 4. Builder pattern
+	// ============================================================
 	fmt.Println("=== Builder Pattern ===")
 	resp, err = client.BuildRequest().
 		Method("GET").
@@ -53,55 +59,30 @@ func main() {
 		log.Fatal(err)
 	}
 	text, _ = resp.Text()
-	fmt.Printf("Status: %d\nHeaders response:\n%s\n\n", resp.StatusCode(), text)
+	fmt.Printf("Status: %d\nHeaders:\n%s\n\n", resp.StatusCode(), text)
 
-	// High-throughput benchmark
-	fmt.Println("=== Throughput Test ===")
-	benchmarkRPS(client, "https://httpbin.org/get", 500, 100)
-}
-
-func benchmarkRPS(client *gofire.Client, url string, total, concurrency int) {
-	var (
-		success atomic.Int64
-		fail    atomic.Int64
-		wg      sync.WaitGroup
-	)
-
-	sem := make(chan struct{}, concurrency)
-	start := time.Now()
+	// ============================================================
+	// 5. Pipeline for maximum RPS
+	// ============================================================
+	fmt.Println("=== Pipeline Spray (max RPS) ===")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	for i := 0; i < total; i++ {
-		wg.Add(1)
-		sem <- struct{}{}
+	// Pre-warm connections
+	_ = client.PreConnect(ctx, "https://httpbin.org/get", 10)
 
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
+	// Create pipeline with 200 workers
+	pipeline := client.NewPipeline(200)
+	defer pipeline.Close()
 
-			resp, err := client.GetWithContext(ctx, url)
-			if err != nil {
-				fail.Add(1)
-				return
-			}
-			resp.Close()
-			success.Add(1)
-		}()
-	}
+	// Spray 500 requests
+	result := pipeline.Spray(ctx, "GET", "https://httpbin.org/get", 500)
 
-	wg.Wait()
-	elapsed := time.Since(start)
-
-	s := success.Load()
-	f := fail.Load()
-	rps := float64(s) / elapsed.Seconds()
-
-	fmt.Printf("Total:      %d requests\n", total)
-	fmt.Printf("Success:    %d\n", s)
-	fmt.Printf("Failed:     %d\n", f)
-	fmt.Printf("Duration:   %v\n", elapsed.Round(time.Millisecond))
-	fmt.Printf("RPS:        %.0f req/s\n", rps)
-	fmt.Printf("Conns used: %d\n", client.ActiveConnections())
+	fmt.Printf("Total:    %d requests\n", result.Total)
+	fmt.Printf("Success:  %d\n", result.Success)
+	fmt.Printf("Failed:   %d\n", result.Failed)
+	fmt.Printf("Duration: %v\n", result.Duration.Round(time.Millisecond))
+	fmt.Printf("RPS:      %.0f req/s\n", result.RPS)
+	fmt.Printf("Conns:    %d\n", client.ActiveConnections())
 }

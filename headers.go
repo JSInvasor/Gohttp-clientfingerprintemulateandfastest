@@ -2,14 +2,13 @@ package gofire
 
 import (
 	"net/http"
-	"sync"
 )
 
-// Firefox 148 default User-Agent
+// Firefox 148 User-Agent (Windows 10 x64)
 const Firefox148UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0"
 
-// headerOrder defines the exact header order Firefox 148 sends.
-// Maintaining correct header order is critical for fingerprint matching.
+// firefox148HeaderOrder defines the exact header order Firefox 148 sends.
+// This order is critical for HTTP/2 Akamai fingerprint and header-order detection.
 var firefox148HeaderOrder = []string{
 	"Host",
 	"User-Agent",
@@ -35,19 +34,12 @@ var firefox148HeaderOrder = []string{
 	"Cache-Control",
 }
 
-var defaultHeadersPool = sync.Pool{
-	New: func() interface{} {
-		h := make(http.Header, 12)
-		return &h
-	},
-}
-
 // applyFirefoxHeaders sets default Firefox 148 headers on the request.
 // Only sets headers that are not already present, preserving user overrides.
 func applyFirefoxHeaders(req *http.Request, accept, lang string) {
 	h := req.Header
 	if h == nil {
-		h = make(http.Header, 10)
+		h = make(http.Header, 14)
 		req.Header = h
 	}
 
@@ -55,15 +47,15 @@ func applyFirefoxHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "Accept", accept)
 	setIfEmpty(h, "Accept-Language", lang)
 	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br, zstd")
+	setIfEmpty(h, "DNT", "1")
+	setIfEmpty(h, "Sec-GPC", "1")
+	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
 	setIfEmpty(h, "Sec-Fetch-Site", "none")
 	setIfEmpty(h, "Sec-Fetch-User", "?1")
-	setIfEmpty(h, "DNT", "1")
-	setIfEmpty(h, "Sec-GPC", "1")
 	setIfEmpty(h, "Priority", "u=0, i")
 	setIfEmpty(h, "TE", "trailers")
-	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 
 	if req.URL != nil && req.URL.Scheme == "https" {
 		setIfEmpty(h, "Connection", "keep-alive")
@@ -76,8 +68,7 @@ func setIfEmpty(h http.Header, key, value string) {
 	}
 }
 
-// OrderHeaders returns a new header map with headers sorted in Firefox 148 order.
-// This is used internally to ensure correct header ordering in HTTP/1.1 requests.
+// OrderHeaders returns headers sorted in Firefox 148 order.
 func OrderHeaders(h http.Header) []HeaderKV {
 	result := make([]HeaderKV, 0, len(h))
 

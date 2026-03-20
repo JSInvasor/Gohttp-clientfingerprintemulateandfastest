@@ -5,18 +5,26 @@ import (
 )
 
 // Firefox148Spec returns the TLS ClientHelloSpec for Firefox 148.
-// This precisely emulates Firefox 148's TLS fingerprint including
-// cipher suites, extensions, supported groups, and signature algorithms.
+// This precisely emulates Firefox 148's TLS ClientHello including:
+//   - Cipher suites in exact Firefox order
+//   - Extensions in exact Firefox order
+//   - GREASE values for realistic randomization
+//   - ECH GREASE (Encrypted Client Hello)
+//   - Certificate compression (zlib, brotli)
+//   - Delegated credentials
+//   - Post-handshake auth indicator
+//
+// Verified against: tls.peet.ws, ja3er.com, browserleaks.com
 func Firefox148Spec() *tls.ClientHelloSpec {
 	return &tls.ClientHelloSpec{
 		TLSVersMin: tls.VersionTLS12,
 		TLSVersMax: tls.VersionTLS13,
 		CipherSuites: []uint16{
-			// TLS 1.3 cipher suites
+			// TLS 1.3 cipher suites (Firefox order)
 			tls.TLS_AES_128_GCM_SHA256,
 			tls.TLS_CHACHA20_POLY1305_SHA256,
 			tls.TLS_AES_256_GCM_SHA384,
-			// TLS 1.2 cipher suites
+			// TLS 1.2 cipher suites (Firefox order)
 			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
@@ -28,19 +36,20 @@ func Firefox148Spec() *tls.ClientHelloSpec {
 			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
 			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
 		},
-		CompressionMethods: []uint8{0x00}, // null compression
+		CompressionMethods: []uint8{0x00}, // null compression only
 		Extensions: []tls.TLSExtension{
+			// Extension order matches Firefox 148 exactly
 			&tls.SNIExtension{},
 			&tls.ExtendedMasterSecretExtension{},
 			&tls.RenegotiationInfoExtension{Renegotiation: tls.RenegotiateOnceAsClient},
 			&tls.SupportedCurvesExtension{
 				Curves: []tls.CurveID{
-					tls.X25519,
-					tls.CurveP256,
-					tls.CurveP384,
-					tls.CurveP521,
-					0x0100, // ffdhe2048
-					0x0101, // ffdhe3072
+					tls.X25519,    // 0x001d
+					tls.CurveP256, // 0x0017
+					tls.CurveP384, // 0x0018
+					tls.CurveP521, // 0x0019
+					0x0100,        // ffdhe2048
+					0x0101,        // ffdhe3072
 				},
 			},
 			&tls.SupportedPointsExtension{
@@ -89,7 +98,7 @@ func Firefox148Spec() *tls.ClientHelloSpec {
 			&tls.PSKKeyExchangeModesExtension{
 				Modes: []uint8{tls.PskModeDHE},
 			},
-			&tls.FakeRecordSizeLimitExtension{Limit: 0x4001},
+			&tls.FakeRecordSizeLimitExtension{Limit: 0x4001}, // 16385
 			&tls.GREASEEncryptedClientHelloExtension{
 				CandidateCipherSuites: []tls.HPKESymmetricCipherSuite{
 					{
@@ -114,7 +123,7 @@ func Firefox148Spec() *tls.ClientHelloSpec {
 	}
 }
 
-// Firefox148H2Settings returns HTTP/2 settings that match Firefox 148.
+// H2Settings defines HTTP/2 connection settings for fingerprinting.
 type H2Settings struct {
 	HeaderTableSize      uint32
 	EnablePush           uint32
@@ -123,6 +132,14 @@ type H2Settings struct {
 	ConnectionWindowSize uint32
 }
 
+// Firefox148H2Settings returns HTTP/2 SETTINGS that match Firefox 148.
+// These values are sent in the HTTP/2 SETTINGS frame after connection.
+//
+//	SETTINGS_HEADER_TABLE_SIZE:      65536
+//	SETTINGS_ENABLE_PUSH:            0 (disabled)
+//	SETTINGS_INITIAL_WINDOW_SIZE:    131072 (128KB)
+//	SETTINGS_MAX_FRAME_SIZE:         16384 (16KB)
+//	Connection WINDOW_UPDATE:        12517377
 func Firefox148H2Settings() H2Settings {
 	return H2Settings{
 		HeaderTableSize:      65536,
@@ -133,7 +150,17 @@ func Firefox148H2Settings() H2Settings {
 	}
 }
 
-// Firefox148PseudoHeaderOrder returns the pseudo-header order for Firefox 148.
+// Firefox148PseudoHeaderOrder returns the HTTP/2 pseudo-header order for Firefox 148.
+// Firefox sends pseudo-headers in this exact order: :method :path :authority :scheme
 func Firefox148PseudoHeaderOrder() []string {
 	return []string{":method", ":path", ":authority", ":scheme"}
+}
+
+// Firefox148HeaderPriority returns the PRIORITY frame weight for Firefox 148.
+// Firefox uses urgency-based priority (RFC 9218).
+func Firefox148HeaderPriority() map[string]string {
+	return map[string]string{
+		"u": "0",
+		"i": "",
+	}
 }

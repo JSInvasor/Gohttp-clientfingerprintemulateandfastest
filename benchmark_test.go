@@ -9,10 +9,10 @@ import (
 	"time"
 )
 
-func TestNewClient(t *testing.T) {
-	client, err := NewClient()
+func TestEmulate(t *testing.T) {
+	client, err := Emulate(Firefox148)
 	if err != nil {
-		t.Fatalf("NewClient() error: %v", err)
+		t.Fatalf("Emulate(Firefox148) error: %v", err)
 	}
 	defer client.Close()
 
@@ -22,19 +22,21 @@ func TestNewClient(t *testing.T) {
 	if client.transport == nil {
 		t.Fatal("transport is nil")
 	}
+	if client.config.browser != Firefox148 {
+		t.Errorf("browser = %v, want Firefox148", client.config.browser)
+	}
 }
 
-func TestClientOptions(t *testing.T) {
-	client, err := NewClient(
+func TestEmulateWithOptions(t *testing.T) {
+	client, err := Emulate(Firefox148,
 		WithTimeout(5*time.Second),
 		WithMaxIdleConnsPerHost(500),
-		WithMaxIdleConns(5000),
-		WithDisableRedirects(),
+		WithInsecureSkipVerify(),
 		WithForceHTTP1(),
 		WithAcceptLanguage("tr-TR,tr;q=0.9"),
 	)
 	if err != nil {
-		t.Fatalf("NewClient() error: %v", err)
+		t.Fatalf("Emulate() error: %v", err)
 	}
 	defer client.Close()
 
@@ -44,11 +46,26 @@ func TestClientOptions(t *testing.T) {
 	if client.config.transport.MaxIdleConnsPerHost != 500 {
 		t.Errorf("MaxIdleConnsPerHost = %d, want 500", client.config.transport.MaxIdleConnsPerHost)
 	}
-	if client.config.followRedirects != false {
-		t.Error("followRedirects should be false")
+	if !client.config.transport.InsecureSkipVerify {
+		t.Error("InsecureSkipVerify should be true")
 	}
-	if client.config.transport.ForceHTTP1 != true {
+	if !client.config.transport.ForceHTTP1 {
 		t.Error("ForceHTTP1 should be true")
+	}
+	if client.config.acceptLanguage != "tr-TR,tr;q=0.9" {
+		t.Errorf("acceptLanguage = %q, want tr-TR", client.config.acceptLanguage)
+	}
+}
+
+func TestNewClient(t *testing.T) {
+	client, err := NewClient()
+	if err != nil {
+		t.Fatalf("NewClient() error: %v", err)
+	}
+	defer client.Close()
+
+	if client.httpClient == nil {
+		t.Fatal("httpClient is nil")
 	}
 }
 
@@ -66,8 +83,14 @@ func TestFirefoxHeaders(t *testing.T) {
 		{"Accept-Encoding", "gzip, deflate, br, zstd"},
 		{"Sec-Fetch-Dest", "document"},
 		{"Sec-Fetch-Mode", "navigate"},
+		{"Sec-Fetch-Site", "none"},
+		{"Sec-Fetch-User", "?1"},
 		{"DNT", "1"},
 		{"Sec-GPC", "1"},
+		{"Priority", "u=0, i"},
+		{"TE", "trailers"},
+		{"Upgrade-Insecure-Requests", "1"},
+		{"Connection", "keep-alive"},
 	}
 
 	for _, tt := range tests {
@@ -80,10 +103,14 @@ func TestFirefoxHeaders(t *testing.T) {
 func TestFirefoxHeadersNoOverride(t *testing.T) {
 	req, _ := http.NewRequest("GET", "https://example.com", nil)
 	req.Header.Set("User-Agent", "custom-agent")
+	req.Header.Set("Accept", "application/json")
 	applyFirefoxHeaders(req, "text/html", "en-US")
 
 	if got := req.Header.Get("User-Agent"); got != "custom-agent" {
-		t.Errorf("User-Agent was overridden: got %q, want %q", got, "custom-agent")
+		t.Errorf("User-Agent was overridden: got %q", got)
+	}
+	if got := req.Header.Get("Accept"); got != "application/json" {
+		t.Errorf("Accept was overridden: got %q", got)
 	}
 }
 
@@ -92,14 +119,28 @@ func TestFirefox148Spec(t *testing.T) {
 	if spec == nil {
 		t.Fatal("Firefox148Spec() returned nil")
 	}
-	if len(spec.CipherSuites) == 0 {
-		t.Error("CipherSuites is empty")
+
+	// Verify cipher suite count (3 TLS1.3 + 10 TLS1.2 = 13)
+	if len(spec.CipherSuites) != 13 {
+		t.Errorf("CipherSuites count = %d, want 13", len(spec.CipherSuites))
 	}
-	if len(spec.Extensions) == 0 {
-		t.Error("Extensions is empty")
+
+	// Verify first cipher is AES-128-GCM-SHA256 (Firefox default)
+	if spec.CipherSuites[0] != 0x1301 {
+		t.Errorf("First cipher = 0x%04x, want 0x1301 (TLS_AES_128_GCM_SHA256)", spec.CipherSuites[0])
 	}
+
+	// Verify TLS versions
 	if spec.TLSVersMax != 0x0304 { // TLS 1.3
 		t.Errorf("TLSVersMax = 0x%04x, want 0x0304", spec.TLSVersMax)
+	}
+	if spec.TLSVersMin != 0x0303 { // TLS 1.2
+		t.Errorf("TLSVersMin = 0x%04x, want 0x0303", spec.TLSVersMin)
+	}
+
+	// Verify extension count (Firefox 148 sends 17 extensions)
+	if len(spec.Extensions) < 15 {
+		t.Errorf("Extensions count = %d, want >= 15", len(spec.Extensions))
 	}
 }
 
@@ -113,6 +154,25 @@ func TestH2Settings(t *testing.T) {
 	}
 	if s.InitialWindowSize != 131072 {
 		t.Errorf("InitialWindowSize = %d, want 131072", s.InitialWindowSize)
+	}
+	if s.MaxFrameSize != 16384 {
+		t.Errorf("MaxFrameSize = %d, want 16384", s.MaxFrameSize)
+	}
+	if s.ConnectionWindowSize != 12517377 {
+		t.Errorf("ConnectionWindowSize = %d, want 12517377", s.ConnectionWindowSize)
+	}
+}
+
+func TestPseudoHeaderOrder(t *testing.T) {
+	order := Firefox148PseudoHeaderOrder()
+	expected := []string{":method", ":path", ":authority", ":scheme"}
+	if len(order) != len(expected) {
+		t.Fatalf("PseudoHeaderOrder length = %d, want %d", len(order), len(expected))
+	}
+	for i, v := range expected {
+		if order[i] != v {
+			t.Errorf("PseudoHeaderOrder[%d] = %q, want %q", i, order[i], v)
+		}
 	}
 }
 
@@ -155,14 +215,17 @@ func TestHeaderOrder(t *testing.T) {
 	if len(ordered) != 4 {
 		t.Fatalf("OrderHeaders returned %d headers, want 4", len(ordered))
 	}
-
-	// Host should come first in Firefox order
 	if ordered[0].Key != "Host" {
 		t.Errorf("First header = %q, want 'Host'", ordered[0].Key)
 	}
-	// User-Agent second
 	if ordered[1].Key != "User-Agent" {
 		t.Errorf("Second header = %q, want 'User-Agent'", ordered[1].Key)
+	}
+}
+
+func TestBrowserProfile(t *testing.T) {
+	if Firefox148.String() != "Firefox/148.0" {
+		t.Errorf("Firefox148.String() = %q, want 'Firefox/148.0'", Firefox148.String())
 	}
 }
 
@@ -173,7 +236,7 @@ func TestRequestBuilder(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(WithForceHTTP1(), WithTimeout(5*time.Second))
+	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(5*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +273,7 @@ func TestResponseJSON(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(WithForceHTTP1())
+	client, err := Emulate(Firefox148, WithForceHTTP1())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,81 +297,6 @@ func TestResponseJSON(t *testing.T) {
 	}
 }
 
-// BenchmarkGet benchmarks HTTP GET requests through the fingerprinted client.
-func BenchmarkGet(b *testing.B) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		w.Write([]byte("OK"))
-	}))
-	defer server.Close()
-
-	client, err := NewClient(WithForceHTTP1(), WithTimeout(10*time.Second))
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer client.Close()
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			resp, err := client.Get(server.URL)
-			if err != nil {
-				b.Fatal(err)
-			}
-			resp.Close()
-		}
-	})
-}
-
-// BenchmarkGetConcurrent measures throughput with high concurrency.
-func BenchmarkGetConcurrent(b *testing.B) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		w.Write([]byte("OK"))
-	}))
-	defer server.Close()
-
-	client, err := NewClient(
-		WithForceHTTP1(),
-		WithTimeout(10*time.Second),
-		WithMaxIdleConnsPerHost(1000),
-	)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer client.Close()
-
-	b.ResetTimer()
-	b.SetParallelism(100) // 100 goroutines per GOMAXPROCS
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			resp, err := client.Get(server.URL)
-			if err != nil {
-				b.Fatal(err)
-			}
-			resp.Close()
-		}
-	})
-}
-
-// BenchmarkFirefoxHeaders benchmarks header application.
-func BenchmarkFirefoxHeaders(b *testing.B) {
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		req, _ := http.NewRequest("GET", "https://example.com", nil)
-		applyFirefoxHeaders(req, "text/html", "en-US,en;q=0.5")
-	}
-}
-
-// BenchmarkFirefox148Spec benchmarks TLS spec creation.
-func BenchmarkFirefox148Spec(b *testing.B) {
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_ = Firefox148Spec()
-	}
-}
-
-// TestFlood tests the Flood method for concurrent requests.
 func TestFlood(t *testing.T) {
 	var count atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -317,7 +305,7 @@ func TestFlood(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(WithForceHTTP1(), WithTimeout(10*time.Second))
+	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(10*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,4 +329,242 @@ func TestFlood(t *testing.T) {
 		t.Error("no successful responses")
 	}
 	t.Logf("Flood: %d/%d successful", successCount, n)
+}
+
+func TestPipeline(t *testing.T) {
+	var count atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count.Add(1)
+		w.WriteHeader(200)
+		w.Write([]byte("OK"))
+	}))
+	defer server.Close()
+
+	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	pipeline := client.NewPipeline(50)
+	defer pipeline.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Send 200 requests through pipeline
+	results := make([]<-chan *PipelineResult, 200)
+	for i := 0; i < 200; i++ {
+		results[i] = pipeline.Send(ctx, "GET", server.URL, nil, nil)
+	}
+
+	// Collect results
+	successCount := 0
+	for _, ch := range results {
+		result := <-ch
+		if result.Err == nil {
+			successCount++
+			if result.Response != nil {
+				result.Response.Close()
+			}
+		}
+	}
+
+	if successCount == 0 {
+		t.Error("no successful pipeline responses")
+	}
+	t.Logf("Pipeline: %d/200 successful, stats: sent=%d ok=%d err=%d",
+		successCount,
+		pipeline.Stats.TotalSent.Load(),
+		pipeline.Stats.TotalOK.Load(),
+		pipeline.Stats.TotalErr.Load(),
+	)
+}
+
+func TestPipelineSpray(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	pipeline := client.NewPipeline(100)
+	defer pipeline.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result := pipeline.Spray(ctx, "GET", server.URL, 500)
+	t.Logf("Spray: %d/%d success, %.0f RPS, %v duration",
+		result.Success, result.Total, result.RPS, result.Duration.Round(time.Millisecond))
+
+	if result.Success == 0 {
+		t.Error("no successful spray responses")
+	}
+}
+
+func TestPipelineFireAndForget(t *testing.T) {
+	var count atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count.Add(1)
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	pipeline := client.NewPipeline(50)
+	ctx := context.Background()
+
+	for i := 0; i < 100; i++ {
+		pipeline.FireAndForget(ctx, "GET", server.URL, nil, nil)
+	}
+
+	pipeline.Close() // waits for all workers
+
+	if count.Load() == 0 {
+		t.Error("no requests completed in fire-and-forget mode")
+	}
+	t.Logf("FireAndForget: %d/100 completed", count.Load())
+}
+
+func TestPreConnect(t *testing.T) {
+	var connCount atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connCount.Add(1)
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	err = client.PreConnect(ctx, server.URL, 5)
+	if err != nil {
+		t.Fatalf("PreConnect error: %v", err)
+	}
+
+	if connCount.Load() == 0 {
+		t.Error("PreConnect made no connections")
+	}
+	t.Logf("PreConnect: %d connections warmed", connCount.Load())
+}
+
+// Benchmarks
+
+func BenchmarkGet(b *testing.B) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("OK"))
+	}))
+	defer server.Close()
+
+	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(10*time.Second))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			resp, err := client.Get(server.URL)
+			if err != nil {
+				b.Fatal(err)
+			}
+			resp.Close()
+		}
+	})
+}
+
+func BenchmarkGetConcurrent(b *testing.B) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("OK"))
+	}))
+	defer server.Close()
+
+	client, err := Emulate(Firefox148,
+		WithForceHTTP1(),
+		WithTimeout(10*time.Second),
+		WithMaxIdleConnsPerHost(1000),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
+
+	b.ResetTimer()
+	b.SetParallelism(100)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			resp, err := client.Get(server.URL)
+			if err != nil {
+				b.Fatal(err)
+			}
+			resp.Close()
+		}
+	})
+}
+
+func BenchmarkPipeline(b *testing.B) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("OK"))
+	}))
+	defer server.Close()
+
+	client, err := Emulate(Firefox148,
+		WithForceHTTP1(),
+		WithTimeout(10*time.Second),
+		WithMaxIdleConnsPerHost(1000),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
+
+	pipeline := client.NewPipeline(500)
+	defer pipeline.Close()
+
+	ctx := context.Background()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			ch := pipeline.Send(ctx, "GET", server.URL, nil, nil)
+			result := <-ch
+			if result.Response != nil {
+				result.Response.Close()
+			}
+		}
+	})
+}
+
+func BenchmarkFirefoxHeaders(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		req, _ := http.NewRequest("GET", "https://example.com", nil)
+		applyFirefoxHeaders(req, "text/html", "en-US,en;q=0.5")
+	}
+}
+
+func BenchmarkFirefox148Spec(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = Firefox148Spec()
+	}
 }
