@@ -908,6 +908,13 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 	var initialSettings []Setting
 	if len(t.Settings) > 0 {
 		initialSettings = t.Settings
+		// Sync internal flow control with custom INITIAL_WINDOW_SIZE
+		// to prevent deadlocks on large responses.
+		for _, s := range t.Settings {
+			if s.ID == SettingInitialWindowSize {
+				cc.initialStreamRecvWindowSize = int32(s.Val)
+			}
+		}
 	} else {
 		initialSettings = []Setting{
 			{ID: SettingEnablePush, Val: 0},
@@ -931,7 +938,8 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 	cc.bw.Write(clientPreface)
 	cc.fr.WriteSettings(initialSettings...)
 	cc.fr.WriteWindowUpdate(0, connFlow)
-	cc.inflow.init(conf.MaxUploadBufferPerConnection + initialWindowSize)
+	// Connection-level inflow: use custom connFlow if provided, otherwise default
+	cc.inflow.init(int32(connFlow) + int32(initialWindowSize))
 	cc.bw.Flush()
 	if cc.werr != nil {
 		cc.Close()
