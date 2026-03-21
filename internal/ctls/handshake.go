@@ -401,8 +401,9 @@ func (hs *handshakeState) processServerKeyShare(data []byte) ([]byte, error) {
 			return nil, fmt.Errorf("x25519 ecdh (kyber combo): %w", err)
 		}
 
-		// Combine: kyber_shared || x25519_shared
-		combined := append(kyberShared, x25519Shared...)
+		// Combine: x25519_shared || kyber_shared (per draft-ietf-tls-hybrid-design:
+		// concatenate in the same order as the group name "X25519MLKEM768")
+		combined := append(x25519Shared, kyberShared...)
 		return combined, nil
 
 	default:
