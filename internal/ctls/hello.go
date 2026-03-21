@@ -151,6 +151,13 @@ func buildExtensions(serverName string, alpn []string, km *keyMaterial) ([]byte,
 	// 0x001B - compress_certificate: zlib, brotli, zstd
 	out = appendExt(out, extCompressCertificate, buildCompressCertificate())
 
+	// 0xFE0D - ECH GREASE
+	echGrease, err := buildECHGrease()
+	if err != nil {
+		return nil, err
+	}
+	out = appendExt(out, extECH, echGrease)
+
 	return out, nil
 }
 
