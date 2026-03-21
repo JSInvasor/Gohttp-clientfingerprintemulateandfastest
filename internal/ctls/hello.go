@@ -2,38 +2,27 @@ package ctls
 
 import (
 	"crypto/ecdh"
+	"crypto/mlkem"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-
-	// kyber768 has the same public key size (1184 bytes) and ciphertext size (1088 bytes)
-	// as ML-KEM-768, making it a drop-in for TLS fingerprint purposes.
-	// Most servers fall back to X25519 key exchange.
-	kyber "github.com/cloudflare/circl/kem/kyber/kyber768"
 )
-
-// kyber768PubKeySize is the public key size for Kyber768 / ML-KEM-768.
-// Both have identical sizes: 1184 bytes public key, 1088 bytes ciphertext.
-const kyber768PubKeySize = 1184
 
 // keyMaterial holds generated key pairs for the ClientHello key_share.
 type keyMaterial struct {
-	kyberPub   []byte           // Kyber768 / ML-KEM-768 compatible public key (1184 bytes)
-	kyberPriv  kyber.PrivateKey // for potential decapsulation
+	mlkemPub   []byte                    // ML-KEM-768 encapsulation key (1184 bytes)
+	mlkemPriv  *mlkem.DecapsulationKey768 // for decapsulation
 	x25519Priv *ecdh.PrivateKey
 }
 
-// generateKeyMaterial generates key pairs for X25519MLKEM768 (using Kyber768) and X25519.
+// generateKeyMaterial generates key pairs for X25519MLKEM768 and X25519.
 func generateKeyMaterial() (*keyMaterial, error) {
-	// Generate Kyber768 key pair (same sizes as ML-KEM-768)
-	pub, priv, err := kyber.GenerateKeyPair(rand.Reader)
+	// Generate ML-KEM-768 key pair (FIPS 203)
+	dk, err := mlkem.GenerateKey768()
 	if err != nil {
-		return nil, fmt.Errorf("generate kyber768 key: %w", err)
+		return nil, fmt.Errorf("generate mlkem768 key: %w", err)
 	}
-	pubBytes, err := pub.MarshalBinary()
-	if err != nil {
-		return nil, fmt.Errorf("marshal kyber768 pub: %w", err)
-	}
+	ekBytes := dk.EncapsulationKey().Bytes()
 
 	// Generate X25519 key pair
 	privX25519, err := ecdh.X25519().GenerateKey(rand.Reader)
@@ -42,8 +31,8 @@ func generateKeyMaterial() (*keyMaterial, error) {
 	}
 
 	return &keyMaterial{
-		kyberPub:   pubBytes,
-		kyberPriv:  *priv,
+		mlkemPub:   ekBytes,
+		mlkemPriv:  dk,
 		x25519Priv: privX25519,
 	}, nil
 }
@@ -236,10 +225,10 @@ func buildKeyShare(km *keyMaterial) ([]byte, error) {
 	// key_share extension data:
 	// client_shares length (2) + [ (group(2) + key_exchange_length(2) + key_exchange) ... ]
 
-	// X25519MLKEM768 key share: kyber768_pub (1184 bytes) || x25519_pub (32 bytes) = 1216 bytes
+	// X25519MLKEM768 key share: mlkem768_ek (1184 bytes) || x25519_pub (32 bytes) = 1216 bytes
 	x25519PubBytes := km.x25519Priv.PublicKey().Bytes()
-	mlkemShare := make([]byte, 0, len(km.kyberPub)+32)
-	mlkemShare = append(mlkemShare, km.kyberPub...)
+	mlkemShare := make([]byte, 0, len(km.mlkemPub)+32)
+	mlkemShare = append(mlkemShare, km.mlkemPub...)
 	mlkemShare = append(mlkemShare, x25519PubBytes...)
 
 	// X25519 key share

@@ -9,8 +9,6 @@ import (
 	"hash"
 	"net"
 	"time"
-
-	kyber "github.com/cloudflare/circl/kem/kyber/kyber768"
 )
 
 // handshakeState manages the TLS 1.3 handshake.
@@ -376,34 +374,34 @@ func (hs *handshakeState) processServerKeyShare(data []byte) ([]byte, error) {
 		return shared, nil
 
 	case groupX25519MLKEM768:
-		// X25519MLKEM768: server sends Kyber768 ciphertext (1088 bytes) || X25519 public key (32 bytes)
-		// Kyber768 ciphertext size matches ML-KEM-768 ciphertext size.
-		const kyberCTSize = 1088
-		if len(keyData) < kyberCTSize+32 {
+		// X25519MLKEM768: server sends ML-KEM-768 ciphertext (1088 bytes) || X25519 public key (32 bytes)
+		const mlkemCTSize = 1088
+		if len(keyData) < mlkemCTSize+32 {
 			return nil, fmt.Errorf("x25519mlkem768 key data too short: %d", len(keyData))
 		}
 
-		kyberCT := keyData[:kyberCTSize]
-		serverX25519Bytes := keyData[kyberCTSize:]
+		mlkemCT := keyData[:mlkemCTSize]
+		serverX25519Bytes := keyData[mlkemCTSize:]
 
-		// Kyber768 decapsulation
-		kyberShared := make([]byte, 32)
-		hs.km.kyberPriv.DecapsulateTo(kyberShared, kyberCT)
-		_ = kyber.Scheme() // ensure import is used
+		// ML-KEM-768 decapsulation (FIPS 203)
+		mlkemShared, err := hs.km.mlkemPriv.Decapsulate(mlkemCT)
+		if err != nil {
+			return nil, fmt.Errorf("mlkem768 decapsulate: %w", err)
+		}
 
 		// X25519 ECDH
 		serverX25519Pub, err := ecdh.X25519().NewPublicKey(serverX25519Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("parse server x25519 (kyber combo): %w", err)
+			return nil, fmt.Errorf("parse server x25519 (mlkem combo): %w", err)
 		}
 		x25519Shared, err := hs.km.x25519Priv.ECDH(serverX25519Pub)
 		if err != nil {
-			return nil, fmt.Errorf("x25519 ecdh (kyber combo): %w", err)
+			return nil, fmt.Errorf("x25519 ecdh (mlkem combo): %w", err)
 		}
 
-		// Combine: x25519_shared || kyber_shared (per draft-ietf-tls-hybrid-design:
-		// concatenate in the same order as the group name "X25519MLKEM768")
-		combined := append(x25519Shared, kyberShared...)
+		// Combine: mlkem_shared || x25519_shared
+		// Per draft-kwiatkowski-tls-ecdhe-mlkem: shared_secret = concat(ss_M, ss_E)
+		combined := append(mlkemShared, x25519Shared...)
 		return combined, nil
 
 	default:
