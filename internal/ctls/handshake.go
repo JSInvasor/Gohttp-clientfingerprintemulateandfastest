@@ -2,13 +2,17 @@ package ctls
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/ecdh"
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"hash"
+	"io"
 	"net"
 	"time"
+
+	"github.com/andybalholm/brotli"
 )
 
 // handshakeState manages the TLS 1.3 handshake.
@@ -152,6 +156,16 @@ func (hs *handshakeState) run() (*Conn, error) {
 				certs, err := parseCertificate(msg[4:msgLen+4])
 				if err != nil {
 					return nil, fmt.Errorf("parse certificate: %w", err)
+				}
+				serverCerts = certs
+
+			case handshakeTypeCompressedCertificate:
+				// RFC 8879: CompressedCertificate goes into transcript as-is
+				hs.transcript.Write(msg)
+				// Decompress and parse as Certificate
+				certs, err := parseCompressedCertificate(msg[4 : 4+msgLen])
+				if err != nil {
+					return nil, fmt.Errorf("parse compressed certificate: %w", err)
 				}
 				serverCerts = certs
 
@@ -482,5 +496,45 @@ func verifyCertificate(certs []*x509.Certificate, serverName string, rootCAs *x5
 
 	_, err := leaf.Verify(opts)
 	return err
+}
+
+// parseCompressedCertificate decompresses a CompressedCertificate message (RFC 8879)
+// and parses the inner Certificate message.
+func parseCompressedCertificate(data []byte) ([]*x509.Certificate, error) {
+	if len(data) < 6 {
+		return nil, fmt.Errorf("compressed certificate too short")
+	}
+
+	algorithm := binary.BigEndian.Uint16(data[0:2])
+	uncompressedLen := int(data[2])<<16 | int(data[3])<<8 | int(data[4])
+	compressedLen := int(data[5])<<16 | int(data[6])<<8 | int(data[7])
+	compressed := data[8 : 8+compressedLen]
+
+	var decompressed []byte
+	var err error
+
+	switch algorithm {
+	case certCompressionBrotli:
+		decompressed, err = io.ReadAll(brotli.NewReader(bytes.NewReader(compressed)))
+	case certCompressionZlib:
+		r, zerr := zlib.NewReader(bytes.NewReader(compressed))
+		if zerr != nil {
+			return nil, fmt.Errorf("zlib init: %w", zerr)
+		}
+		decompressed, err = io.ReadAll(r)
+		r.Close()
+	default:
+		return nil, fmt.Errorf("unsupported compression algorithm: %d", algorithm)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("decompress certificate: %w", err)
+	}
+
+	if len(decompressed) != uncompressedLen {
+		return nil, fmt.Errorf("decompressed size mismatch: got %d, want %d", len(decompressed), uncompressedLen)
+	}
+
+	return parseCertificate(decompressed)
 }
 

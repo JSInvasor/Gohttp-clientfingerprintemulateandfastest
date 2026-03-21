@@ -15,7 +15,8 @@ const (
 	handshakeTypeEncryptedExtensions = 8
 	handshakeTypeCertificate         = 11
 	handshakeTypeCertificateVerify   = 15
-	handshakeTypeFinished            = 20
+	handshakeTypeFinished                = 20
+	handshakeTypeCompressedCertificate   = 25
 )
 
 // TLS versions
