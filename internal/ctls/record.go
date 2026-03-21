@@ -15,11 +15,20 @@ type tlsRecord struct {
 }
 
 // writeRawRecord writes a plaintext TLS record to the connection.
-// Uses version 0x0301 (TLS 1.0) for compatibility, as Firefox does.
+// Uses 0x0301 for the initial ClientHello (Firefox compat), 0x0303 for all other records.
+// AEAD additional_data is always computed with 0x0303, so non-ClientHello records must
+// also carry 0x0303 on the wire to avoid bad_record_mac on the server side.
 func writeRawRecord(conn net.Conn, typ uint8, data []byte) error {
 	buf := make([]byte, 5+len(data))
 	buf[0] = typ
-	binary.BigEndian.PutUint16(buf[1:], versionTLS10) // 0x0301 compat header
+	// Encrypted records (ApplicationData) must use 0x0303 to match the
+	// additional_data used in AEAD encryption. The initial ClientHello
+	// (Handshake type) can use 0x0301 for Firefox fingerprint accuracy.
+	version := uint16(versionTLS12) // 0x0303
+	if typ == recordTypeHandshake {
+		version = versionTLS10 // 0x0301 for ClientHello
+	}
+	binary.BigEndian.PutUint16(buf[1:], version)
 	binary.BigEndian.PutUint16(buf[3:], uint16(len(data)))
 	copy(buf[5:], data)
 	_, err := conn.Write(buf)
