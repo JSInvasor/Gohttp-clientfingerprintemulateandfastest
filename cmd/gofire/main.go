@@ -16,7 +16,7 @@ import (
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
 )
 
-const version = "2.0.0"
+const version = "2.1.0"
 
 const banner = `
    ██████╗  ██████╗ ███████╗██╗██████╗ ███████╗
@@ -42,17 +42,22 @@ const (
 func usage() {
 	fmt.Printf("%s%s%s", colorCyan, banner, colorReset)
 	fmt.Printf("  %sGofire[v%s]%s | Custom TLS 1.3 Firefox 148 Fingerprint\n\n", colorBold, version, colorReset)
-	fmt.Printf("  %sUsage:%s  gofire <url> <duration_seconds> <threads>\n", colorYellow, colorReset)
-	fmt.Printf("  %sExample:%s ./gofire https://example.com 60 64\n\n", colorYellow, colorReset)
+	fmt.Printf("  %sUsage:%s  gofire <url> <duration_seconds> <threads> [streams_per_thread]\n", colorYellow, colorReset)
+	fmt.Printf("  %sExample:%s ./gofire https://example.com 60 64 32\n\n", colorYellow, colorReset)
 	fmt.Printf("  %sArguments:%s\n\n", colorGreen, colorReset)
-	fmt.Printf("    %s<url>%s              | Target URL (http:// or https://)\n", colorCyan, colorReset)
-	fmt.Printf("    %s<duration_seconds>%s | How long to run in seconds\n", colorCyan, colorReset)
-	fmt.Printf("    %s<threads>%s          | Number of concurrent workers\n\n", colorCyan, colorReset)
+	fmt.Printf("    %s<url>%s                 | Target URL (http:// or https://)\n", colorCyan, colorReset)
+	fmt.Printf("    %s<duration_seconds>%s    | How long to run in seconds\n", colorCyan, colorReset)
+	fmt.Printf("    %s<threads>%s             | Number of concurrent workers (connections)\n", colorCyan, colorReset)
+	fmt.Printf("    %s[streams_per_thread]%s  | HTTP/2 concurrent streams per worker (default: 32)\n\n", colorCyan, colorReset)
+	fmt.Printf("  %sFormula:%s threads × streams = eşzamanlı istek sayısı\n", colorGreen, colorReset)
+	fmt.Printf("    64 × 32  = 2048 eşzamanlı → 50ms latency = ~40,000 RPS\n")
+	fmt.Printf("    128 × 50 = 6400 eşzamanlı → 50ms latency = ~128,000 RPS\n\n")
 	fmt.Printf("  %sFeatures:%s\n", colorGreen, colorReset)
 	fmt.Printf("    • Custom TLS 1.3 implementation (no uTLS)\n")
 	fmt.Printf("    • Firefox 148 exact ClientHello fingerprint (JA3/JA4)\n")
 	fmt.Printf("    • X25519MLKEM768 post-quantum key share\n")
 	fmt.Printf("    • HTTP/2 Akamai fingerprint: 1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s\n")
+	fmt.Printf("    • HTTP/2 stream multiplexing per worker\n")
 	fmt.Printf("    • Connection pre-warming + keep-alive pool\n\n")
 }
 
@@ -72,26 +77,37 @@ func main() {
 		fatal("geçersiz thread sayısı: %s (pozitif tam sayı olmalı)", os.Args[3])
 	}
 
+	streams := 32 // default streams per worker
+	if len(os.Args) >= 5 {
+		streams, err = strconv.Atoi(os.Args[4])
+		if err != nil || streams <= 0 {
+			fatal("geçersiz stream sayısı: %s (pozitif tam sayı olmalı)", os.Args[4])
+		}
+	}
+
 	// Ensure URL has scheme
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
 		rawURL = "https://" + rawURL
 	}
 
-	run(rawURL, durSec, threads)
+	run(rawURL, durSec, threads, streams)
 }
 
-func run(targetURL string, durSec, threads int) {
+func run(targetURL string, durSec, threads, streams int) {
 	fmt.Printf("%s%s%s", colorCyan, banner, colorReset)
 	fmt.Printf("  %sGofire[v%s]%s | Custom TLS 1.3 | Firefox 148\n\n", colorBold, version, colorReset)
 
-	// Build client with aggressively tuned pool for maximum RPS
-	idlePerHost := threads * 8
-	if idlePerHost < 64 {
-		idlePerHost = 64
+	// Total concurrency = threads × streams
+	totalConcurrent := threads * streams
+
+	// Pool must be >= total concurrent requests
+	idlePerHost := totalConcurrent
+	if idlePerHost < 256 {
+		idlePerHost = 256
 	}
-	totalIdle := threads * 16
-	if totalIdle < 256 {
-		totalIdle = 256
+	totalIdle := totalConcurrent * 2
+	if totalIdle < 512 {
+		totalIdle = 512
 	}
 
 	client, err := gofire.Emulate(gofire.Firefox148,
@@ -111,22 +127,23 @@ func run(targetURL string, durSec, threads int) {
 	}
 	defer client.Close()
 
-	fmt.Printf("  %s[Target]%s   %s\n", colorYellow, colorReset, targetURL)
-	fmt.Printf("  %s[Süre]%s     %ds\n", colorYellow, colorReset, durSec)
-	fmt.Printf("  %s[Threads]%s  %d\n", colorYellow, colorReset, threads)
-	fmt.Printf("  %s[Pool]%s     %d idle/host | %d total\n", colorYellow, colorReset, idlePerHost, totalIdle)
+	fmt.Printf("  %s[Target]%s      %s\n", colorYellow, colorReset, targetURL)
+	fmt.Printf("  %s[Süre]%s        %ds\n", colorYellow, colorReset, durSec)
+	fmt.Printf("  %s[Threads]%s     %d\n", colorYellow, colorReset, threads)
+	fmt.Printf("  %s[Streams]%s     %d per worker\n", colorYellow, colorReset, streams)
+	fmt.Printf("  %s[Eşzamanlı]%s   %d istek\n", colorYellow, colorReset, totalConcurrent)
+	fmt.Printf("  %s[Pool]%s        %d idle/host | %d total\n", colorYellow, colorReset, idlePerHost, totalIdle)
 
-	fmt.Printf("\n  %s[*]%s Bağlantılar ısıtılıyor (%d)...\n", colorCyan, colorReset, threads/2+1)
+	fmt.Printf("\n  %s[*]%s Bağlantılar ısıtılıyor...\n", colorCyan, colorReset)
 	warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	warmCount := threads/2 + 1
-	if warmCount > 32 {
-		warmCount = 32
+	warmCount := threads
+	if warmCount > 64 {
+		warmCount = 64
 	}
-	// Best-effort pre-warm, ignore errors
 	client.PreConnect(warmCtx, targetURL, warmCount) //nolint
 	warmCancel()
 
-	// Setup context with duration and signal handling
+	// Setup context
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(durSec)*time.Second)
 	defer cancel()
 
@@ -147,41 +164,60 @@ func run(targetURL string, durSec, threads int) {
 	)
 
 	startTime := time.Now()
+	fmt.Printf("  %s[*]%s Başlıyor... (%d eşzamanlı istek)\n\n", colorCyan, colorReset, totalConcurrent)
 
-	fmt.Printf("  %s[*]%s Başlıyor...\n\n", colorCyan, colorReset)
-
-	// Worker goroutines: no ticker, fire as fast as possible
+	// Worker goroutines with per-worker semaphore for HTTP/2 stream multiplexing
 	var wg sync.WaitGroup
 	for i := 0; i < threads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
+			// Semaphore: allows `streams` concurrent in-flight requests per worker
+			sem := make(chan struct{}, streams)
+
+			var innerWg sync.WaitGroup
 			for {
 				select {
 				case <-ctx.Done():
+					// Wait for all in-flight requests in this worker to finish
+					innerWg.Wait()
 					return
 				default:
+				}
+
+				// Acquire semaphore slot (block if at max streams)
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					innerWg.Wait()
+					return
 				}
 
 				reqURL := buildURL(targetURL)
 				totalSent.Add(1)
 
-				resp, err := client.GetWithContext(ctx, reqURL)
-				if err != nil {
-					totalFailed.Add(1)
-					continue
-				}
+				innerWg.Add(1)
+				go func(url string) {
+					defer func() {
+						<-sem // Release semaphore slot
+						innerWg.Done()
+					}()
 
-				totalSuccess.Add(1)
-				sc := resp.StatusCode()
+					resp, err := client.GetWithContext(ctx, url)
+					if err != nil {
+						totalFailed.Add(1)
+						return
+					}
 
-				// Track status codes
-				val, _ := statusCodes.LoadOrStore(sc, &atomic.Int64{})
-				val.(*atomic.Int64).Add(1)
+					totalSuccess.Add(1)
+					sc := resp.StatusCode()
 
-				// Drain response body and close (resp.Close already drains)
-				resp.Close()
+					val, _ := statusCodes.LoadOrStore(sc, &atomic.Int64{})
+					val.(*atomic.Int64).Add(1)
+
+					resp.Close()
+				}(reqURL)
 			}
 		}()
 	}
@@ -190,7 +226,6 @@ func run(targetURL string, durSec, threads int) {
 	go func() {
 		statsTicker := time.NewTicker(1 * time.Second)
 		defer statsTicker.Stop()
-
 		lastSent := int64(0)
 
 		for {
@@ -222,7 +257,6 @@ func run(targetURL string, durSec, threads int) {
 		}
 	}()
 
-	// Wait for all workers to finish
 	wg.Wait()
 	endTime := time.Now()
 
@@ -247,9 +281,9 @@ func run(targetURL string, durSec, threads int) {
 	fmt.Printf("    Başarısız         : %s%d%s\n", colorRed, fail, colorReset)
 	fmt.Printf("    Süre              : %s%v%s\n", colorYellow, totalDuration.Round(time.Millisecond), colorReset)
 	fmt.Printf("    Ortalama RPS      : %s%.0f%s req/s\n", colorCyan, avgRPS, colorReset)
+	fmt.Printf("    Eşzamanlı İstek   : %s%d%s (%d threads × %d streams)\n", colorGray, totalConcurrent, colorReset, threads, streams)
 	fmt.Printf("    Aktif Bağlantı    : %s%d%s\n", colorGray, client.ActiveConnections(), colorReset)
 
-	// Print status code breakdown
 	hasStatusCodes := false
 	statusCodes.Range(func(_, _ interface{}) bool {
 		hasStatusCodes = true
