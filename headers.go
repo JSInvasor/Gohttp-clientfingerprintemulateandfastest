@@ -30,7 +30,7 @@ const Firefox148UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0)
 //	priority
 //	te
 //
-// NOTE: Firefox 148 does NOT send DNT, Sec-GPC, or Connection headers.
+// NOTE: Firefox 148 does NOT send DNT, Sec-GPC, Connection, Pragma, or Cache-Control headers.
 var firefox148HeaderOrder = []string{
 	"User-Agent",
 	"Accept",
@@ -48,8 +48,6 @@ var firefox148HeaderOrder = []string{
 	"Sec-Fetch-User",
 	"Priority",
 	"TE",
-	"Pragma",
-	"Cache-Control",
 }
 
 // applyFirefoxHeaders sets exact Firefox 148 default headers on the request.
@@ -77,7 +75,7 @@ func applyFirefoxHeaders(req *http.Request, accept, lang string) {
 
 	setIfEmpty(h, "User-Agent", Firefox148UserAgent)
 	setIfEmpty(h, "Accept", accept)
-	setIfEmpty(h, "Accept-Language", lang)
+	setIfEmpty(h, "Accept-Language", lang) // Firefox 148: en-US,en;q=0.5
 	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br, zstd")
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")

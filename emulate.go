@@ -48,7 +48,7 @@ func withBrowserProfile(profile BrowserProfile) Option {
 		switch profile {
 		case Firefox148:
 			c.browser = profile
-			c.acceptLanguage = "en-US,en;q=0.9"
+			c.acceptLanguage = "en-US,en;q=0.5" // Firefox 148 actual value
 			c.accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 			c.transport.DisableCompression = true
 		}
