@@ -15,24 +15,24 @@ import (
 	"syscall"
 	"time"
 
+	ctls "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/ctls"
 	http2 "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/http2"
-	tls "github.com/refraction-networking/utls"
 )
 
 // Transport is a high-performance HTTP transport with full browser fingerprint emulation.
 //
-// It emulates both TLS (JA3/JA4) and HTTP/2 (Akamai) fingerprints:
+// It emulates both TLS (JA3/JA4) and HTTP/2 (Akamai) fingerprints using a custom
+// TLS 1.3 implementation (internal/ctls) - no uTLS dependency:
 //
-//   - TLS: uTLS with exact Firefox 148 ClientHello spec
+//   - TLS: custom Firefox 148 ClientHello built at the byte level
 //   - HTTP/2 SETTINGS: HEADER_TABLE_SIZE, ENABLE_PUSH, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE
 //   - HTTP/2 WINDOW_UPDATE: Connection-level window increment matching Firefox
 //   - HTTP/2 Header Order: Exact Firefox 148 header order via HPACK
 //   - HTTP/2 Pseudo-header Order: :method, :path, :authority, :scheme (m,p,a,s)
 type Transport struct {
-	h1Transport *http.Transport    // HTTP/1.1 fallback
-	h2Transport *http2.Transport   // HTTP/2 with Firefox settings
+	h1Transport *http.Transport  // HTTP/1.1 fallback
+	h2Transport *http2.Transport // HTTP/2 with Firefox settings
 
-	spec        func() *tls.ClientHelloSpec
 	h2Settings  H2Settings
 	headerOrder []string
 	forceH1     bool
@@ -53,7 +53,7 @@ type TransportConfig struct {
 	MaxIdleConnsPerHost   int
 	MaxConnsPerHost       int
 	IdleConnTimeout       time.Duration
-	TLSHandshakeTimeout  time.Duration
+	TLSHandshakeTimeout   time.Duration
 	DisableKeepAlives     bool
 	DisableCompression    bool
 	ForceHTTP1            bool
@@ -73,7 +73,7 @@ func defaultTransportConfig() TransportConfig {
 		MaxIdleConnsPerHost:   1000,
 		MaxConnsPerHost:       0,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:  10 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
 		DisableKeepAlives:     false,
 		DisableCompression:    true,
 		ForceHTTP1:            false,
@@ -98,11 +98,9 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 	// Set browser-specific fingerprint
 	switch browser {
 	case Firefox148:
-		t.spec = Firefox148Spec
 		t.h2Settings = Firefox148H2Settings()
 		t.headerOrder = firefox148HeaderOrder
 	default:
-		t.spec = Firefox148Spec
 		t.h2Settings = Firefox148H2Settings()
 		t.headerOrder = firefox148HeaderOrder
 	}
@@ -130,27 +128,27 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 
 	// HTTP/1.1 transport (for plain HTTP or ForceHTTP1 mode)
 	t.h1Transport = &http.Transport{
-		DialContext:            t.dialWithDNSCache(),
-		DialTLSContext:         t.dialTLSForH1(),
-		MaxIdleConns:           cfg.MaxIdleConns,
-		MaxIdleConnsPerHost:    cfg.MaxIdleConnsPerHost,
-		MaxConnsPerHost:        cfg.MaxConnsPerHost,
-		IdleConnTimeout:        cfg.IdleConnTimeout,
+		DialContext:           t.dialWithDNSCache(),
+		DialTLSContext:        t.dialTLSForH1(),
+		MaxIdleConns:          cfg.MaxIdleConns,
+		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
+		MaxConnsPerHost:       cfg.MaxConnsPerHost,
+		IdleConnTimeout:       cfg.IdleConnTimeout,
 		TLSHandshakeTimeout:   cfg.TLSHandshakeTimeout,
-		DisableKeepAlives:      cfg.DisableKeepAlives,
-		DisableCompression:     cfg.DisableCompression,
-		ForceAttemptHTTP2:      false, // We handle HTTP/2 ourselves
-		ResponseHeaderTimeout:  cfg.ResponseHeaderTimeout,
-		WriteBufferSize:        wbs,
-		ReadBufferSize:         rbs,
-		ExpectContinueTimeout:  1 * time.Second,
+		DisableKeepAlives:     cfg.DisableKeepAlives,
+		DisableCompression:    cfg.DisableCompression,
+		ForceAttemptHTTP2:     false, // We handle HTTP/2 ourselves
+		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
+		WriteBufferSize:       wbs,
+		ReadBufferSize:        rbs,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 
 	// HTTP/2 transport with FULL Firefox 148 fingerprint
 	// Akamai fingerprint: 1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s
 	if !cfg.ForceHTTP1 {
 		t.h2Transport = &http2.Transport{
-			// Use our uTLS dialer for TLS connections with Firefox fingerprint
+			// Use our custom ctls dialer for TLS connections with Firefox fingerprint
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *cryptotls.Config) (net.Conn, error) {
 				return t.dialTLSForH2(ctx, network, addr)
 			},
@@ -162,12 +160,11 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 			MaxReadFrameSize:          t.h2Settings.MaxFrameSize,    // 16384
 
 			// Custom SETTINGS frame: exact Firefox 148 order and values
-			// Sent on wire: HEADER_TABLE_SIZE(1), ENABLE_PUSH(2), INITIAL_WINDOW_SIZE(4), MAX_FRAME_SIZE(5)
 			Settings: []http2.Setting{
-				{ID: http2.SettingHeaderTableSize, Val: t.h2Settings.HeaderTableSize},     // 1:65536
-				{ID: http2.SettingEnablePush, Val: t.h2Settings.EnablePush},                // 2:0
-				{ID: http2.SettingInitialWindowSize, Val: t.h2Settings.InitialWindowSize},  // 4:131072
-				{ID: http2.SettingMaxFrameSize, Val: t.h2Settings.MaxFrameSize},            // 5:16384
+				{ID: http2.SettingHeaderTableSize, Val: t.h2Settings.HeaderTableSize},    // 1:65536
+				{ID: http2.SettingEnablePush, Val: t.h2Settings.EnablePush},               // 2:0
+				{ID: http2.SettingInitialWindowSize, Val: t.h2Settings.InitialWindowSize}, // 4:131072
+				{ID: http2.SettingMaxFrameSize, Val: t.h2Settings.MaxFrameSize},           // 5:16384
 			},
 
 			// Connection-level WINDOW_UPDATE: Firefox 148 sends 12517377
@@ -187,14 +184,6 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 }
 
 // RoundTrip implements http.RoundTripper with full fingerprint emulation.
-//
-// For HTTPS requests, uses HTTP/2 with full Firefox 148 fingerprint:
-//   - SETTINGS frame: exact values and order (1:65536, 2:0, 4:131072, 5:16384)
-//   - WINDOW_UPDATE: 12517377
-//   - Pseudo-header order: :method, :path, :authority, :scheme (m,p,a,s)
-//   - Header order: exact Firefox 148 HPACK encoding order
-//
-// For HTTP requests or ForceHTTP1 mode, uses HTTP/1.1.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme == "https" && !t.forceH1 && t.h2Transport != nil {
 		return t.h2Transport.RoundTrip(req)
@@ -219,19 +208,19 @@ func (t *Transport) dialWithDNSCache() func(ctx context.Context, network, addr s
 	}
 }
 
-// dialTLSForH1 creates uTLS connections for HTTP/1.1 (ALPN: http/1.1 only).
+// dialTLSForH1 creates ctls connections for HTTP/1.1 (ALPN: http/1.1 only).
 func (t *Transport) dialTLSForH1() func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return t.dialTLS(ctx, network, addr, []string{"http/1.1"})
 	}
 }
 
-// dialTLSForH2 creates uTLS connections for HTTP/2 (ALPN: h2, http/1.1).
+// dialTLSForH2 creates ctls connections for HTTP/2 (ALPN: h2, http/1.1).
 func (t *Transport) dialTLSForH2(ctx context.Context, network, addr string) (net.Conn, error) {
 	return t.dialTLS(ctx, network, addr, []string{"h2", "http/1.1"})
 }
 
-// dialTLS performs TLS handshake using uTLS with exact Firefox 148 ClientHello.
+// dialTLS performs TLS handshake using our custom ctls package with exact Firefox 148 ClientHello.
 // If a proxy is configured, it tunnels through the proxy via CONNECT before TLS.
 //
 // This produces the correct JA3/JA4 fingerprint:
@@ -251,45 +240,18 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 		return nil, err
 	}
 
-	// Configure uTLS with exact Firefox 148 spec
-	tlsConfig := &tls.Config{
-		ServerName:         host,
-		InsecureSkipVerify: t.skipVerify,
-		RootCAs:            t.rootCAs,
-		NextProtos:         alpn,
-	}
-
-	uconn := tls.UClient(rawConn, tlsConfig, tls.HelloCustom)
-	if err := uconn.ApplyPreset(t.spec()); err != nil {
-		rawConn.Close()
-		return nil, fmt.Errorf("apply tls preset: %w", err)
-	}
-
-	// TLS handshake with context deadline
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := uconn.SetDeadline(deadline); err != nil {
-			rawConn.Close()
-			return nil, fmt.Errorf("set deadline: %w", err)
-		}
-	}
-
-	if err := uconn.HandshakeContext(ctx); err != nil {
+	// Perform custom TLS 1.3 handshake with Firefox 148 fingerprint
+	tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs)
+	if err != nil {
 		rawConn.Close()
 		return nil, fmt.Errorf("tls handshake: %w", err)
 	}
 
-	// Clear deadline after successful handshake
-	if err := uconn.SetDeadline(time.Time{}); err != nil {
-		uconn.Close()
-		return nil, fmt.Errorf("clear deadline: %w", err)
-	}
-
 	t.connCount.Add(1)
-	return uconn, nil
+	return tlsConn, nil
 }
 
 // dialRaw establishes a raw TCP connection, optionally through a proxy.
-// For HTTPS proxy tunneling, it sends a CONNECT request and establishes a tunnel.
 func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (net.Conn, error) {
 	t.proxyMu.RLock()
 	proxyFunc := t.proxyFunc
@@ -413,7 +375,7 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 				mu.Unlock()
 				return
 			}
-			applyFirefoxHeaders(req, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "en-US,en;q=0.9")
+			applyFirefoxHeaders(req, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "en-US,en;q=0.5")
 
 			resp, err := t.RoundTrip(req)
 			if err != nil {

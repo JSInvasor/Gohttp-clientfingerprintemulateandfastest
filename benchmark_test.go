@@ -119,32 +119,28 @@ func TestFirefoxHeadersNoOverride(t *testing.T) {
 }
 
 func TestFirefox148Spec(t *testing.T) {
-	spec := Firefox148Spec()
-	if spec == nil {
-		t.Fatal("Firefox148Spec() returned nil")
+	// Verify H2 settings are correct (Firefox 148 fingerprint)
+	s := Firefox148H2Settings()
+	if s.HeaderTableSize != 65536 {
+		t.Errorf("HeaderTableSize = %d, want 65536", s.HeaderTableSize)
+	}
+	if s.EnablePush != 0 {
+		t.Errorf("EnablePush = %d, want 0", s.EnablePush)
+	}
+	if s.InitialWindowSize != 131072 {
+		t.Errorf("InitialWindowSize = %d, want 131072", s.InitialWindowSize)
+	}
+	if s.MaxFrameSize != 16384 {
+		t.Errorf("MaxFrameSize = %d, want 16384", s.MaxFrameSize)
+	}
+	if s.ConnectionWindowSize != 12517377 {
+		t.Errorf("ConnectionWindowSize = %d, want 12517377", s.ConnectionWindowSize)
 	}
 
-	// Verify cipher suite count (3 TLS1.3 + 10 ECDHE + 4 RSA = 17)
-	if len(spec.CipherSuites) != 17 {
-		t.Errorf("CipherSuites count = %d, want 17", len(spec.CipherSuites))
-	}
-
-	// Verify first cipher is AES-128-GCM-SHA256 (Firefox default)
-	if spec.CipherSuites[0] != 0x1301 {
-		t.Errorf("First cipher = 0x%04x, want 0x1301 (TLS_AES_128_GCM_SHA256)", spec.CipherSuites[0])
-	}
-
-	// Verify TLS versions
-	if spec.TLSVersMax != 0x0304 { // TLS 1.3
-		t.Errorf("TLSVersMax = 0x%04x, want 0x0304", spec.TLSVersMax)
-	}
-	if spec.TLSVersMin != 0x0303 { // TLS 1.2
-		t.Errorf("TLSVersMin = 0x%04x, want 0x0303", spec.TLSVersMin)
-	}
-
-	// Verify extension count (Firefox 148 sends 17 extensions)
-	if len(spec.Extensions) < 15 {
-		t.Errorf("Extensions count = %d, want >= 15", len(spec.Extensions))
+	// Verify pseudo-header order
+	order := Firefox148PseudoHeaderOrder()
+	if len(order) != 4 {
+		t.Errorf("PseudoHeaderOrder len = %d, want 4", len(order))
 	}
 }
 
@@ -571,9 +567,9 @@ func BenchmarkFirefoxHeaders(b *testing.B) {
 	}
 }
 
-func BenchmarkFirefox148Spec(b *testing.B) {
+func BenchmarkFirefox148H2Settings(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = Firefox148Spec()
+		_ = Firefox148H2Settings()
 	}
 }

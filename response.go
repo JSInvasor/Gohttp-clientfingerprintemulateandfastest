@@ -9,7 +9,6 @@ import (
 	"net/http"
 
 	"github.com/andybalholm/brotli"
-	"github.com/klauspost/compress/zstd"
 )
 
 // Response wraps http.Response with convenience methods and zero-alloc helpers.
@@ -56,13 +55,9 @@ func (r *Response) Bytes() ([]byte, error) {
 	case "deflate":
 		reader = flate.NewReader(r.Response.Body)
 	case "zstd":
-		zr, err := zstd.NewReader(r.Response.Body)
-		if err != nil {
-			r.bodyErr = err
-			return nil, err
-		}
-		defer zr.Close()
-		reader = zr
+		// Pass through zstd-compressed data without decompression.
+		// Use Accept-Encoding without zstd if decompression is needed.
+		reader = r.Response.Body
 	default:
 		reader = r.Response.Body
 	}
