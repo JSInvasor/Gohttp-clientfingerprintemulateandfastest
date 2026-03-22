@@ -38,7 +38,7 @@ const (
 	extCompressCertificate  = 0x001B
 	extRecordSizeLimit      = 0x001C
 	extDelegatedCredentials = 0x0022
-	extSessionTicket        = 0x0023 // Not sent by Firefox 148
+	extSessionTicket        = 0x0023 // Sent empty by Firefox 148 on initial connections
 	extKeyShare             = 0x0033
 	extSupportedVersions    = 0x002B
 	extPSKKeyExchangeModes  = 0x002D

@@ -204,6 +204,13 @@ func (hs *handshakeState) run() (*Conn, error) {
 	finishedMsg[3] = byte(len(clientFinishedMAC))
 	copy(finishedMsg[4:], clientFinishedMAC)
 
+	// Send ChangeCipherSpec for TLS 1.3 middlebox compatibility.
+	// Firefox sends CCS after ClientHello when session_id is non-empty (compat mode).
+	// Not sending CCS is a fingerprint leak detectable by anti-bot services.
+	if err := writeRawRecord(hs.conn, recordTypeChangeCipherSpec, []byte{0x01}); err != nil {
+		return nil, fmt.Errorf("send ccs: %w", err)
+	}
+
 	clientHSAEAD, clientHSIV, err := hs.ks.makeTrafficKeys(hs.ks.clientHSTraffic)
 	if err != nil {
 		return nil, fmt.Errorf("client hs keys: %w", err)
@@ -404,6 +411,18 @@ func (hs *handshakeState) processServerKeyShare(data []byte) ([]byte, error) {
 		// Combine: kyber_shared || x25519_shared
 		combined := append(kyberShared, x25519Shared...)
 		return combined, nil
+
+	case groupP256:
+		// P-256 ECDH key exchange
+		serverPub, err := ecdh.P256().NewPublicKey(keyData)
+		if err != nil {
+			return nil, fmt.Errorf("parse server p256 key: %w", err)
+		}
+		shared, err := hs.km.p256Priv.ECDH(serverPub)
+		if err != nil {
+			return nil, fmt.Errorf("p256 ecdh: %w", err)
+		}
+		return shared, nil
 
 	default:
 		return nil, fmt.Errorf("unsupported server key share group: 0x%04x", group)

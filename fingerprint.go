@@ -1,10 +1,17 @@
 package gofire
 
 // Firefox148 TLS fingerprint identifiers (for documentation and verification).
+// Verified against real Firefox 148 via tls.peet.ws on 2026-03-22.
 //
-// JA3:      771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-156-157-47-53,0-23-65281-10-11-16-5-34-18-51-43-13-45-28-27-65037-41,4588-29-23-24-25-256-257,0
-// JA3 Hash: 0e76c7e9d06fa0e211b1827687dd8f43
-// JA4:      t13d1717h2_5b57614c22b0_e6dcd7ae0a9e
+// JA3 (initial connection, no PSK):
+//   771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-156-157-47-53,0-23-65281-10-11-35-16-5-34-18-51-43-13-45-28-27-65037,4588-29-23-24-25-256-257,0
+// JA3 Hash: 6f7889b9fb1a62a9577e685c1fcfa919
+//
+// JA4: t13d1717h2_5b57614c22b0_3cbfd9057e0d
+//
+// NOTE: On session resumption (with PSK), extension 35 is replaced by extension 41,
+// producing different hashes: JA3=0e76c7e9d06fa0e211b1827687dd8f43, JA4=t13d1717h2_5b57614c22b0_e6dcd7ae0a9e.
+// This library does not implement session resumption, so it always uses initial connection fingerprint.
 //
 // The actual TLS ClientHello is built byte-by-byte in internal/ctls/hello.go
 // using Go's standard crypto packages (no uTLS dependency).
@@ -22,6 +29,12 @@ type H2Settings struct {
 //
 // Akamai fingerprint: 1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s
 // Akamai hash: 6ea73faa8fc5aac76bded7bd238f6433
+//
+// HTTP/2 multiplexing: Multiple streams share a single TCP connection.
+// When a connection reaches maxConcurrentStreams (server-controlled, typically 100-256),
+// new connections are created automatically. For example, 2048 concurrent requests
+// with 100 streams/conn = ~21 connections, each multiplexing ~100 streams.
+// Keep-alive PING frames (every 15s idle) detect dead connections.
 func Firefox148H2Settings() H2Settings {
 	return H2Settings{
 		HeaderTableSize:      65536,    // SETTINGS_HEADER_TABLE_SIZE

@@ -2261,11 +2261,22 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 			}
 		}
 
+		// Track whether content-length was emitted in order
+		contentLengthEmitted := false
+
 		// Emit regular headers in custom order if specified
 		if len(cc.t.HeaderOrder) > 0 {
 			// First pass: emit headers in the specified order
 			emitted := make(map[string]bool, len(cc.t.HeaderOrder))
 			for _, orderedKey := range cc.t.HeaderOrder {
+				// Emit content-length in its correct position within the header order
+				if asciiEqualFold(orderedKey, "Content-Length") {
+					if shouldSendReqContentLength(req.Method, contentLength) {
+						f("content-length", strconv.FormatInt(contentLength, 10))
+						contentLengthEmitted = true
+					}
+					continue
+				}
 				for k, vv := range req.Header {
 					if asciiEqualFold(k, orderedKey) && !emitted[k] {
 						emitted[k] = true
@@ -2287,7 +2298,8 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 			}
 		}
 
-		if shouldSendReqContentLength(req.Method, contentLength) {
+		// Fallback: emit content-length if not already emitted in order
+		if !contentLengthEmitted && shouldSendReqContentLength(req.Method, contentLength) {
 			f("content-length", strconv.FormatInt(contentLength, 10))
 		}
 		if addGzipHeader {

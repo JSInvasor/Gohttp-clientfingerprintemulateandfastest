@@ -96,9 +96,14 @@ func (r *Response) JSON(v interface{}) error {
 }
 
 // Close releases the response body.
+// Uses a bounded read (256KB) to drain the body for connection reuse
+// without blocking on unexpectedly large responses.
 func (r *Response) Close() {
 	if r.Response != nil && r.Response.Body != nil && !r.bodyRead {
-		io.Copy(io.Discard, r.Response.Body)
+		// Drain up to 256KB so the connection can be reused.
+		// Larger bodies will cause the connection to be closed instead of pooled,
+		// which is acceptable - avoiding blocking is more important at high RPS.
+		io.CopyN(io.Discard, r.Response.Body, 256*1024) //nolint:errcheck
 		r.Response.Body.Close()
 	}
 }

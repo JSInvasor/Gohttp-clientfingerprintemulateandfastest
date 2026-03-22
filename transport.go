@@ -176,7 +176,24 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 			// Header order: exact Firefox 148 HPACK encoding order
 			HeaderOrder: t.headerOrder,
 
+			// Allow new connections when per-connection stream limit is hit.
+			// With StrictMaxConcurrentStreams=false, the transport creates new TCP
+			// connections instead of blocking when all connections are at max streams.
+			// This is critical for high RPS: if server allows 100 streams/conn,
+			// 2048 concurrent requests use ~21 connections with proper multiplexing.
 			StrictMaxConcurrentStreams: false,
+
+			// Keep-alive via PING frames.
+			// ReadIdleTimeout triggers a PING when no frames are received for this duration.
+			// This detects dead connections killed by NAT/proxy/load balancers silently,
+			// preventing requests from being sent to zombie connections.
+			ReadIdleTimeout: 15 * time.Second,
+
+			// PingTimeout closes the connection if PING response is not received in time.
+			PingTimeout: 5 * time.Second,
+
+			// WriteByteTimeout closes connections stuck on write (network issue).
+			WriteByteTimeout: 30 * time.Second,
 		}
 	}
 
@@ -416,12 +433,12 @@ func (t *Transport) setProxy(f func(*http.Request) (*url.URL, error)) {
 	t.proxyMu.Unlock()
 }
 
-// dnsCache provides a thread-safe DNS cache with round-robin IP selection.
+// dnsCache provides a lock-free DNS cache with round-robin IP selection.
+// Uses sync.Map for the hot read path to eliminate RWMutex contention at high RPS.
 type dnsCache struct {
-	mu       sync.RWMutex
-	entries  map[string]*dnsCacheEntry
+	entries  sync.Map // map[string]*dnsCacheEntry
 	ttl      time.Duration
-	inflight sync.Map
+	inflight sync.Map // dedup concurrent lookups for same host
 	stopCh   chan struct{}
 }
 
@@ -433,9 +450,8 @@ type dnsCacheEntry struct {
 
 func newDNSCache(ttl time.Duration) *dnsCache {
 	d := &dnsCache{
-		entries: make(map[string]*dnsCacheEntry, 1024),
-		ttl:     ttl,
-		stopCh:  make(chan struct{}),
+		ttl:    ttl,
+		stopCh: make(chan struct{}),
 	}
 	go d.cleanupLoop()
 	return d
@@ -449,13 +465,13 @@ func (d *dnsCache) cleanupLoop() {
 		select {
 		case <-ticker.C:
 			now := time.Now()
-			d.mu.Lock()
-			for host, entry := range d.entries {
+			d.entries.Range(func(key, value interface{}) bool {
+				entry := value.(*dnsCacheEntry)
 				if now.After(entry.expiresAt) {
-					delete(d.entries, host)
+					d.entries.Delete(key)
 				}
-			}
-			d.mu.Unlock()
+				return true
+			})
 		case <-d.stopCh:
 			return
 		}
@@ -475,15 +491,16 @@ func (d *dnsCache) lookup(host string) (string, error) {
 		return host, nil
 	}
 
-	d.mu.RLock()
-	entry, ok := d.entries[host]
-	d.mu.RUnlock()
-
-	if ok && time.Now().Before(entry.expiresAt) {
-		idx := entry.counter.Add(1) - 1
-		return entry.ips[idx%uint64(len(entry.ips))], nil
+	// Hot path: lock-free read from sync.Map
+	if val, ok := d.entries.Load(host); ok {
+		entry := val.(*dnsCacheEntry)
+		if time.Now().Before(entry.expiresAt) {
+			idx := entry.counter.Add(1) - 1
+			return entry.ips[idx%uint64(len(entry.ips))], nil
+		}
 	}
 
+	// Cold path: resolve with inflight dedup
 	type resolveResult struct {
 		ips []string
 		err error
@@ -499,10 +516,8 @@ func (d *dnsCache) lookup(host string) (string, error) {
 		if res.err != nil {
 			return "", res.err
 		}
-		d.mu.RLock()
-		entry, ok := d.entries[host]
-		d.mu.RUnlock()
-		if ok {
+		if val, ok := d.entries.Load(host); ok {
+			entry := val.(*dnsCacheEntry)
 			idx := entry.counter.Add(1) - 1
 			return entry.ips[idx%uint64(len(entry.ips))], nil
 		}
@@ -527,9 +542,7 @@ func (d *dnsCache) lookup(host string) (string, error) {
 		expiresAt: time.Now().Add(d.ttl),
 	}
 
-	d.mu.Lock()
-	d.entries[host] = newEntry
-	d.mu.Unlock()
+	d.entries.Store(host, newEntry)
 
 	resultCh <- resolveResult{ips: ips}
 	d.inflight.Delete(host)
@@ -538,7 +551,5 @@ func (d *dnsCache) lookup(host string) (string, error) {
 }
 
 func (d *dnsCache) Refresh(host string) {
-	d.mu.Lock()
-	delete(d.entries, host)
-	d.mu.Unlock()
+	d.entries.Delete(host)
 }
