@@ -392,7 +392,7 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 				mu.Unlock()
 				return
 			}
-			applyFirefoxHeaders(req, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "en-US,en;q=0.5")
+			applyFirefoxHeaders(req, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "en-US,en;q=0.9")
 
 			resp, err := t.RoundTrip(req)
 			if err != nil {

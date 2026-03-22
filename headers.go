@@ -57,7 +57,7 @@ var firefox148HeaderOrder = []string{
 //
 //	user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) ...
 //	accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
-//	accept-language: en-US,en;q=0.5
+//	accept-language: en-US,en;q=0.9
 //	accept-encoding: gzip, deflate, br, zstd
 //	upgrade-insecure-requests: 1
 //	sec-fetch-dest: document
