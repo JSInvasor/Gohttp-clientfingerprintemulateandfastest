@@ -29,6 +29,12 @@ type H2Settings struct {
 //
 // Akamai fingerprint: 1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s
 // Akamai hash: 6ea73faa8fc5aac76bded7bd238f6433
+//
+// HTTP/2 multiplexing: Multiple streams share a single TCP connection.
+// When a connection reaches maxConcurrentStreams (server-controlled, typically 100-256),
+// new connections are created automatically. For example, 2048 concurrent requests
+// with 100 streams/conn = ~21 connections, each multiplexing ~100 streams.
+// Keep-alive PING frames (every 15s idle) detect dead connections.
 func Firefox148H2Settings() H2Settings {
 	return H2Settings{
 		HeaderTableSize:      65536,    // SETTINGS_HEADER_TABLE_SIZE

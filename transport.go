@@ -176,7 +176,24 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 			// Header order: exact Firefox 148 HPACK encoding order
 			HeaderOrder: t.headerOrder,
 
+			// Allow new connections when per-connection stream limit is hit.
+			// With StrictMaxConcurrentStreams=false, the transport creates new TCP
+			// connections instead of blocking when all connections are at max streams.
+			// This is critical for high RPS: if server allows 100 streams/conn,
+			// 2048 concurrent requests use ~21 connections with proper multiplexing.
 			StrictMaxConcurrentStreams: false,
+
+			// Keep-alive via PING frames.
+			// ReadIdleTimeout triggers a PING when no frames are received for this duration.
+			// This detects dead connections killed by NAT/proxy/load balancers silently,
+			// preventing requests from being sent to zombie connections.
+			ReadIdleTimeout: 15 * time.Second,
+
+			// PingTimeout closes the connection if PING response is not received in time.
+			PingTimeout: 5 * time.Second,
+
+			// WriteByteTimeout closes connections stuck on write (network issue).
+			WriteByteTimeout: 30 * time.Second,
 		}
 	}
 
