@@ -6,34 +6,30 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	// kyber768 has the same public key size (1184 bytes) and ciphertext size (1088 bytes)
-	// as ML-KEM-768, making it a drop-in for TLS fingerprint purposes.
-	// Most servers fall back to X25519 key exchange.
-	kyber "github.com/cloudflare/circl/kem/kyber/kyber768"
+	mlkem "github.com/cloudflare/circl/kem/mlkem/mlkem768"
 )
 
-// kyber768PubKeySize is the public key size for Kyber768 / ML-KEM-768.
-// Both have identical sizes: 1184 bytes public key, 1088 bytes ciphertext.
-const kyber768PubKeySize = 1184
+// mlkem768PubKeySize is the public key size for ML-KEM-768 (FIPS 203).
+const mlkem768PubKeySize = 1184
 
 // keyMaterial holds generated key pairs for the ClientHello key_share.
 type keyMaterial struct {
-	kyberPub   []byte           // Kyber768 / ML-KEM-768 compatible public key (1184 bytes)
-	kyberPriv  kyber.PrivateKey // for potential decapsulation
+	mlkemPub   []byte             // ML-KEM-768 public key (1184 bytes)
+	mlkemPriv  *mlkem.PrivateKey  // ML-KEM-768 private key for decapsulation
 	x25519Priv *ecdh.PrivateKey
-	p256Priv   *ecdh.PrivateKey // P-256 key pair (Firefox 148 sends 3 key shares)
+	p256Priv   *ecdh.PrivateKey   // P-256 key pair (Firefox 148 sends 3 key shares)
 }
 
-// generateKeyMaterial generates key pairs for X25519MLKEM768 (using Kyber768), X25519, and P-256.
+// generateKeyMaterial generates key pairs for X25519MLKEM768, X25519, and P-256.
 func generateKeyMaterial() (*keyMaterial, error) {
-	// Generate Kyber768 key pair (same sizes as ML-KEM-768)
-	pub, priv, err := kyber.GenerateKeyPair(rand.Reader)
+	// Generate ML-KEM-768 key pair (FIPS 203)
+	pub, priv, err := mlkem.GenerateKeyPair(rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("generate kyber768 key: %w", err)
+		return nil, fmt.Errorf("generate mlkem768 key: %w", err)
 	}
 	pubBytes, err := pub.MarshalBinary()
 	if err != nil {
-		return nil, fmt.Errorf("marshal kyber768 pub: %w", err)
+		return nil, fmt.Errorf("marshal mlkem768 pub: %w", err)
 	}
 
 	// Generate X25519 key pair
@@ -49,8 +45,8 @@ func generateKeyMaterial() (*keyMaterial, error) {
 	}
 
 	return &keyMaterial{
-		kyberPub:   pubBytes,
-		kyberPriv:  *priv,
+		mlkemPub:   pubBytes,
+		mlkemPriv:  priv,
 		x25519Priv: privX25519,
 		p256Priv:   privP256,
 	}, nil
@@ -255,10 +251,10 @@ func buildKeyShare(km *keyMaterial) ([]byte, error) {
 	// client_shares length (2) + [ (group(2) + key_exchange_length(2) + key_exchange) ... ]
 	// Firefox 148 sends 3 key shares: X25519MLKEM768, X25519, P-256
 
-	// X25519MLKEM768 key share: kyber768_pub (1184 bytes) || x25519_pub (32 bytes) = 1216 bytes
+	// X25519MLKEM768 key share: mlkem768_pub (1184 bytes) || x25519_pub (32 bytes) = 1216 bytes
 	x25519PubBytes := km.x25519Priv.PublicKey().Bytes()
-	mlkemShare := make([]byte, 0, len(km.kyberPub)+32)
-	mlkemShare = append(mlkemShare, km.kyberPub...)
+	mlkemShare := make([]byte, 0, len(km.mlkemPub)+32)
+	mlkemShare = append(mlkemShare, km.mlkemPub...)
 	mlkemShare = append(mlkemShare, x25519PubBytes...)
 
 	// X25519 key share
