@@ -2,14 +2,17 @@ package ctls
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/ecdh"
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"hash"
+	"io"
 	"net"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	mlkem "github.com/cloudflare/circl/kem/mlkem/mlkem768"
 )
 
@@ -151,9 +154,18 @@ func (hs *handshakeState) run() (*Conn, error) {
 			case handshakeTypeCertificate:
 				// Update transcript before parsing
 				hs.transcript.Write(msg)
-				certs, err := parseCertificate(msg[4:msgLen+4])
+				certs, err := parseCertificate(msg[4 : 4+msgLen])
 				if err != nil {
 					return nil, fmt.Errorf("parse certificate: %w", err)
+				}
+				serverCerts = certs
+
+			case handshakeTypeCompressedCertificate:
+				// RFC 8879: CompressedCertificate replaces Certificate in transcript
+				hs.transcript.Write(msg)
+				certs, err := parseCompressedCertificate(msg[4 : 4+msgLen])
+				if err != nil {
+					return nil, fmt.Errorf("parse compressed certificate: %w", err)
 				}
 				serverCerts = certs
 
@@ -501,4 +513,57 @@ func verifyCertificate(certs []*x509.Certificate, serverName string, rootCAs *x5
 	_, err := leaf.Verify(opts)
 	return err
 }
+
+// parseCompressedCertificate decompresses and parses a CompressedCertificate message (RFC 8879).
+// Format: algorithm(2) + uncompressed_length(3) + compressed_data_length(3) + compressed_data
+func parseCompressedCertificate(data []byte) ([]*x509.Certificate, error) {
+	if len(data) < 8 {
+		return nil, fmt.Errorf("compressed certificate too short")
+	}
+
+	algorithm := binary.BigEndian.Uint16(data[0:2])
+	uncompressedLen := int(data[2])<<16 | int(data[3])<<8 | int(data[4])
+	compressedLen := int(data[5])<<16 | int(data[6])<<8 | int(data[7])
+
+	if 8+compressedLen > len(data) {
+		return nil, fmt.Errorf("compressed data truncated")
+	}
+
+	compressed := data[8 : 8+compressedLen]
+
+	var decompressed []byte
+	var err error
+
+	switch algorithm {
+	case certCompressionZlib:
+		decompressed, err = decompressZlib(compressed, uncompressedLen)
+	case certCompressionBrotli:
+		decompressed, err = decompressBrotli(compressed, uncompressedLen)
+	case certCompressionZstd:
+		return nil, fmt.Errorf("zstd certificate decompression not supported")
+	default:
+		return nil, fmt.Errorf("unknown compression algorithm: %d", algorithm)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("decompress (algo=%d): %w", algorithm, err)
+	}
+
+	return parseCertificate(decompressed)
+}
+
+func decompressZlib(data []byte, maxLen int) ([]byte, error) {
+	r, err := zlib.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return io.ReadAll(io.LimitReader(r, int64(maxLen)+1))
+}
+
+func decompressBrotli(data []byte, maxLen int) ([]byte, error) {
+	r := brotli.NewReader(bytes.NewReader(data))
+	return io.ReadAll(io.LimitReader(r, int64(maxLen)+1))
+}
+
 

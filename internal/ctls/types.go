@@ -10,12 +10,13 @@ const (
 
 // TLS handshake message types
 const (
-	handshakeTypeClientHello         = 1
-	handshakeTypeServerHello         = 2
-	handshakeTypeEncryptedExtensions = 8
-	handshakeTypeCertificate         = 11
-	handshakeTypeCertificateVerify   = 15
-	handshakeTypeFinished            = 20
+	handshakeTypeClientHello             = 1
+	handshakeTypeServerHello             = 2
+	handshakeTypeEncryptedExtensions     = 8
+	handshakeTypeCertificate             = 11
+	handshakeTypeCertificateVerify       = 15
+	handshakeTypeFinished                = 20
+	handshakeTypeCompressedCertificate   = 25
 )
 
 // TLS versions
