@@ -186,8 +186,8 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 						// Hata mesajini kaydet (ilk 5 farkli hata)
 						errStr := err.Error()
 						// Kisa tut
-						if len(errStr) > 80 {
-							errStr = errStr[:80]
+						if len(errStr) > 200 {
+							errStr = errStr[:200]
 						}
 						if _, loaded := errCountMap.LoadOrStore(errStr, &atomic.Int64{}); !loaded {
 							errMu.Lock()
