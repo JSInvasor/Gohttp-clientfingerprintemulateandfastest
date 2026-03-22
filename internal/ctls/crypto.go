@@ -62,10 +62,14 @@ func aeadForCipher(suite uint16, key []byte) (cipher.AEAD, error) {
 // keyLenForCipher returns the key length for the given cipher suite.
 func keyLenForCipher(suite uint16) int {
 	switch suite {
+	case cipherTLS_AES_128_GCM_SHA256:
+		return 16
 	case cipherTLS_AES_256_GCM_SHA384:
 		return 32
+	case cipherTLS_CHACHA20_POLY1305_SHA256:
+		return 32
 	default:
-		return 16 // AES-128 and ChaCha20
+		return 16
 	}
 }
 

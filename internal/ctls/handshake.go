@@ -10,7 +10,7 @@ import (
 	"net"
 	"time"
 
-	kyber "github.com/cloudflare/circl/kem/kyber/kyber768"
+	mlkem "github.com/cloudflare/circl/kem/mlkem/mlkem768"
 )
 
 // handshakeState manages the TLS 1.3 handshake.
@@ -383,33 +383,31 @@ func (hs *handshakeState) processServerKeyShare(data []byte) ([]byte, error) {
 		return shared, nil
 
 	case groupX25519MLKEM768:
-		// X25519MLKEM768: server sends Kyber768 ciphertext (1088 bytes) || X25519 public key (32 bytes)
-		// Kyber768 ciphertext size matches ML-KEM-768 ciphertext size.
-		const kyberCTSize = 1088
-		if len(keyData) < kyberCTSize+32 {
+		// X25519MLKEM768: server sends ML-KEM-768 ciphertext (1088 bytes) || X25519 public key (32 bytes)
+		const mlkemCTSize = mlkem.CiphertextSize // 1088 bytes
+		if len(keyData) < mlkemCTSize+32 {
 			return nil, fmt.Errorf("x25519mlkem768 key data too short: %d", len(keyData))
 		}
 
-		kyberCT := keyData[:kyberCTSize]
-		serverX25519Bytes := keyData[kyberCTSize:]
+		mlkemCT := keyData[:mlkemCTSize]
+		serverX25519Bytes := keyData[mlkemCTSize:]
 
-		// Kyber768 decapsulation
-		kyberShared := make([]byte, 32)
-		hs.km.kyberPriv.DecapsulateTo(kyberShared, kyberCT)
-		_ = kyber.Scheme() // ensure import is used
+		// ML-KEM-768 decapsulation (FIPS 203)
+		mlkemShared := make([]byte, mlkem.SharedKeySize)
+		hs.km.mlkemPriv.DecapsulateTo(mlkemShared, mlkemCT)
 
 		// X25519 ECDH
 		serverX25519Pub, err := ecdh.X25519().NewPublicKey(serverX25519Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("parse server x25519 (kyber combo): %w", err)
+			return nil, fmt.Errorf("parse server x25519 (mlkem combo): %w", err)
 		}
 		x25519Shared, err := hs.km.x25519Priv.ECDH(serverX25519Pub)
 		if err != nil {
-			return nil, fmt.Errorf("x25519 ecdh (kyber combo): %w", err)
+			return nil, fmt.Errorf("x25519 ecdh (mlkem combo): %w", err)
 		}
 
-		// Combine: kyber_shared || x25519_shared
-		combined := append(kyberShared, x25519Shared...)
+		// Combine: mlkem_shared || x25519_shared (per draft-ietf-tls-hybrid-design)
+		combined := append(mlkemShared, x25519Shared...)
 		return combined, nil
 
 	case groupP256:
