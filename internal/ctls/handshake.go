@@ -204,6 +204,13 @@ func (hs *handshakeState) run() (*Conn, error) {
 	finishedMsg[3] = byte(len(clientFinishedMAC))
 	copy(finishedMsg[4:], clientFinishedMAC)
 
+	// Send ChangeCipherSpec for TLS 1.3 middlebox compatibility.
+	// Firefox sends CCS after ClientHello when session_id is non-empty (compat mode).
+	// Not sending CCS is a fingerprint leak detectable by anti-bot services.
+	if err := writeRawRecord(hs.conn, recordTypeChangeCipherSpec, []byte{0x01}); err != nil {
+		return nil, fmt.Errorf("send ccs: %w", err)
+	}
+
 	clientHSAEAD, clientHSIV, err := hs.ks.makeTrafficKeys(hs.ks.clientHSTraffic)
 	if err != nil {
 		return nil, fmt.Errorf("client hs keys: %w", err)

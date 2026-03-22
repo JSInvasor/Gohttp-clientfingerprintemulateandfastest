@@ -2,9 +2,14 @@ package gofire
 
 // Firefox148 TLS fingerprint identifiers (for documentation and verification).
 //
-// JA3:      771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-156-157-47-53,0-23-65281-10-11-16-5-34-18-51-43-13-45-28-27-65037-41,4588-29-23-24-25-256-257,0
-// JA3 Hash: 0e76c7e9d06fa0e211b1827687dd8f43
-// JA4:      t13d1717h2_5b57614c22b0_e6dcd7ae0a9e
+// JA3 (initial connection, no PSK):
+//   771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-156-157-47-53,0-23-65281-10-11-16-5-34-18-51-43-13-45-28-27-65037,4588-29-23-24-25-256-257,0
+//
+// NOTE: Extension 41 (pre_shared_key) is only present on session resumption.
+// This library does not implement session tickets/PSK, so extension 41 is not sent.
+// The JA3 hash below reflects the actual ClientHello output (16 extensions, no PSK).
+//
+// JA4: t13d1716h2_5b57614c22b0_e6dcd7ae0a9e
 //
 // The actual TLS ClientHello is built byte-by-byte in internal/ctls/hello.go
 // using Go's standard crypto packages (no uTLS dependency).
