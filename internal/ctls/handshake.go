@@ -412,6 +412,18 @@ func (hs *handshakeState) processServerKeyShare(data []byte) ([]byte, error) {
 		combined := append(kyberShared, x25519Shared...)
 		return combined, nil
 
+	case groupP256:
+		// P-256 ECDH key exchange
+		serverPub, err := ecdh.P256().NewPublicKey(keyData)
+		if err != nil {
+			return nil, fmt.Errorf("parse server p256 key: %w", err)
+		}
+		shared, err := hs.km.p256Priv.ECDH(serverPub)
+		if err != nil {
+			return nil, fmt.Errorf("p256 ecdh: %w", err)
+		}
+		return shared, nil
+
 	default:
 		return nil, fmt.Errorf("unsupported server key share group: 0x%04x", group)
 	}

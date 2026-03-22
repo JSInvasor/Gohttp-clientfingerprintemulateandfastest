@@ -21,9 +21,10 @@ type keyMaterial struct {
 	kyberPub   []byte           // Kyber768 / ML-KEM-768 compatible public key (1184 bytes)
 	kyberPriv  kyber.PrivateKey // for potential decapsulation
 	x25519Priv *ecdh.PrivateKey
+	p256Priv   *ecdh.PrivateKey // P-256 key pair (Firefox 148 sends 3 key shares)
 }
 
-// generateKeyMaterial generates key pairs for X25519MLKEM768 (using Kyber768) and X25519.
+// generateKeyMaterial generates key pairs for X25519MLKEM768 (using Kyber768), X25519, and P-256.
 func generateKeyMaterial() (*keyMaterial, error) {
 	// Generate Kyber768 key pair (same sizes as ML-KEM-768)
 	pub, priv, err := kyber.GenerateKeyPair(rand.Reader)
@@ -41,10 +42,17 @@ func generateKeyMaterial() (*keyMaterial, error) {
 		return nil, fmt.Errorf("generate x25519 key: %w", err)
 	}
 
+	// Generate P-256 key pair (Firefox 148 sends 3 key shares)
+	privP256, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate p256 key: %w", err)
+	}
+
 	return &keyMaterial{
 		kyberPub:   pubBytes,
 		kyberPriv:  *priv,
 		x25519Priv: privX25519,
+		p256Priv:   privP256,
 	}, nil
 }
 
@@ -127,6 +135,9 @@ func buildExtensions(serverName string, alpn []string, km *keyMaterial) ([]byte,
 
 	// 0x000B - ec_point_formats
 	out = appendExt(out, extECPointFormats, []byte{1, 0x00}) // uncompressed only
+
+	// 0x0023 - session_ticket (empty, Firefox 148 always sends this on initial connections)
+	out = appendExt(out, extSessionTicket, nil)
 
 	// 0x0010 - ALPN
 	out = appendExt(out, extALPN, buildALPN(alpn))
@@ -242,6 +253,7 @@ func buildDelegatedCredentials() []byte {
 func buildKeyShare(km *keyMaterial) ([]byte, error) {
 	// key_share extension data:
 	// client_shares length (2) + [ (group(2) + key_exchange_length(2) + key_exchange) ... ]
+	// Firefox 148 sends 3 key shares: X25519MLKEM768, X25519, P-256
 
 	// X25519MLKEM768 key share: kyber768_pub (1184 bytes) || x25519_pub (32 bytes) = 1216 bytes
 	x25519PubBytes := km.x25519Priv.PublicKey().Bytes()
@@ -252,9 +264,13 @@ func buildKeyShare(km *keyMaterial) ([]byte, error) {
 	// X25519 key share
 	x25519Share := x25519PubBytes
 
+	// P-256 key share (uncompressed point: 0x04 || x(32) || y(32) = 65 bytes)
+	p256Share := km.p256Priv.PublicKey().Bytes()
+
 	// Total key shares size
 	sharesLen := 2 + 2 + len(mlkemShare) + // X25519MLKEM768 entry
-		2 + 2 + len(x25519Share) // X25519 entry
+		2 + 2 + len(x25519Share) + // X25519 entry
+		2 + 2 + len(p256Share) // P-256 entry
 
 	data := make([]byte, 2+sharesLen)
 	binary.BigEndian.PutUint16(data[0:], uint16(sharesLen))
@@ -274,6 +290,14 @@ func buildKeyShare(km *keyMaterial) ([]byte, error) {
 	binary.BigEndian.PutUint16(data[offset:], uint16(len(x25519Share)))
 	offset += 2
 	copy(data[offset:], x25519Share)
+	offset += len(x25519Share)
+
+	// P-256 entry
+	binary.BigEndian.PutUint16(data[offset:], groupP256)
+	offset += 2
+	binary.BigEndian.PutUint16(data[offset:], uint16(len(p256Share)))
+	offset += 2
+	copy(data[offset:], p256Share)
 
 	return data, nil
 }

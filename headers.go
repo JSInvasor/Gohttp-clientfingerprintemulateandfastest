@@ -75,7 +75,7 @@ func applyFirefoxHeaders(req *http.Request, accept, lang string) {
 
 	setIfEmpty(h, "User-Agent", Firefox148UserAgent)
 	setIfEmpty(h, "Accept", accept)
-	setIfEmpty(h, "Accept-Language", lang) // Firefox 148: en-US,en;q=0.5
+	setIfEmpty(h, "Accept-Language", lang) // Firefox 148: en-US,en;q=0.9
 	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br, zstd")
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
