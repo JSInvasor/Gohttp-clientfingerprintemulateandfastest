@@ -91,7 +91,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 	// Set up server handshake AEAD
 	serverHSAEAD, serverHSIV, err := hs.ks.makeTrafficKeys(hs.ks.serverHSTraffic)
 	if err != nil {
-		return nil, fmt.Errorf("server hs keys: %w", err)
+		return nil, fmt.Errorf("server hs keys (suite=0x%04x): %w", suite, err)
 	}
 	serverHSER := newEncryptedRecord(serverHSAEAD, serverHSIV)
 
@@ -118,7 +118,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 		// Decrypt
 		plaintext, innerType, err := serverHSER.decrypt(rec.data)
 		if err != nil {
-			return nil, fmt.Errorf("decrypt hs record: %w", err)
+			return nil, fmt.Errorf("decrypt hs record (suite=0x%04x dheLen=%d recLen=%d): %w", hs.suite, len(dhe), len(rec.data), err)
 		}
 
 		if innerType == recordTypeAlert {
