@@ -25,6 +25,8 @@ type PipelineStats struct {
 
 // Pipeline provides maximum throughput request sending with a fixed worker pool.
 // Workers are pre-allocated and reuse connections for minimal overhead.
+//
+// For 100k+ RPS, use 3000-5000 workers with FireAndForget mode.
 type Pipeline struct {
 	client  *Client
 	workers int
@@ -32,6 +34,10 @@ type Pipeline struct {
 	jobCh   chan *pipelineJob
 	Stats   PipelineStats
 	closed  atomic.Bool
+
+	// Object pools to reduce GC pressure at high RPS
+	jobPool    sync.Pool
+	resultPool sync.Pool
 }
 
 type pipelineJob struct {
@@ -45,7 +51,12 @@ type pipelineJob struct {
 
 // newPipeline creates a new Pipeline with the specified number of workers.
 // Workers run continuously, pulling jobs from a shared channel.
-// For max RPS, set workers to 2000-5000 depending on your system.
+//
+// Recommended workers by target RPS:
+//
+//	1000-2000  → 10-50k RPS
+//	3000-5000  → 50-150k RPS
+//	5000-10000 → 150k+ RPS
 func newPipeline(c *Client, workers int) *Pipeline {
 	if workers <= 0 {
 		workers = 1000
@@ -54,7 +65,16 @@ func newPipeline(c *Client, workers int) *Pipeline {
 	p := &Pipeline{
 		client:  c,
 		workers: workers,
-		jobCh:   make(chan *pipelineJob, workers*2),
+		// Large buffer prevents sender blocking under burst load.
+		// At 100k RPS with 5000 workers, each worker processes ~20 req/s,
+		// so 16x buffer gives ~1.6s of burst capacity.
+		jobCh: make(chan *pipelineJob, workers*16),
+		jobPool: sync.Pool{
+			New: func() interface{} { return &pipelineJob{} },
+		},
+		resultPool: sync.Pool{
+			New: func() interface{} { return &PipelineResult{} },
+		},
 	}
 
 	// Launch worker pool
@@ -76,11 +96,7 @@ func (p *Pipeline) worker() {
 
 		resp, err := p.client.DoWithContext(job.ctx, job.method, job.url, job.body, job.headers)
 
-		result := &PipelineResult{
-			Response: resp,
-			Err:      err,
-			Latency:  time.Since(start),
-		}
+		latency := time.Since(start)
 
 		if err != nil {
 			p.Stats.TotalErr.Add(1)
@@ -89,6 +105,11 @@ func (p *Pipeline) worker() {
 		}
 
 		if job.result != nil {
+			result := p.resultPool.Get().(*PipelineResult)
+			result.Response = resp
+			result.Err = err
+			result.Latency = latency
+
 			select {
 			case job.result <- result:
 			default:
@@ -96,6 +117,9 @@ func (p *Pipeline) worker() {
 				if resp != nil {
 					resp.Close()
 				}
+				result.Response = nil
+				result.Err = nil
+				p.resultPool.Put(result)
 			}
 		} else {
 			// No result channel - fire and forget, close response
@@ -103,6 +127,15 @@ func (p *Pipeline) worker() {
 				resp.Close()
 			}
 		}
+
+		// Return job to pool
+		job.ctx = nil
+		job.method = ""
+		job.url = ""
+		job.body = nil
+		job.headers = nil
+		job.result = nil
+		p.jobPool.Put(job)
 	}
 }
 
@@ -116,19 +149,19 @@ func (p *Pipeline) Send(ctx context.Context, method, url string, body []byte, he
 		return ch
 	}
 
-	job := &pipelineJob{
-		ctx:     ctx,
-		method:  method,
-		url:     url,
-		body:    body,
-		headers: headers,
-		result:  ch,
-	}
+	job := p.jobPool.Get().(*pipelineJob)
+	job.ctx = ctx
+	job.method = method
+	job.url = url
+	job.body = body
+	job.headers = headers
+	job.result = ch
 
 	select {
 	case p.jobCh <- job:
 	case <-ctx.Done():
 		ch <- &PipelineResult{Err: ctx.Err()}
+		p.jobPool.Put(job)
 	}
 
 	return ch
@@ -142,80 +175,114 @@ func (p *Pipeline) FireAndForget(ctx context.Context, method, url string, body [
 		return
 	}
 
-	job := &pipelineJob{
-		ctx:     ctx,
-		method:  method,
-		url:     url,
-		body:    body,
-		headers: headers,
-		result:  nil, // no result channel
-	}
+	job := p.jobPool.Get().(*pipelineJob)
+	job.ctx = ctx
+	job.method = method
+	job.url = url
+	job.body = body
+	job.headers = headers
+	job.result = nil
 
 	select {
 	case p.jobCh <- job:
 	case <-ctx.Done():
+		p.jobPool.Put(job)
 	}
 }
 
 // Spray sends n requests as fast as possible and returns aggregate results.
-// This is designed for maximum throughput testing.
+// Uses a fixed collector pool instead of spawning n goroutines to avoid
+// GC pressure at high request counts.
 func (p *Pipeline) Spray(ctx context.Context, method, url string, n int) *SprayResult {
 	sr := &SprayResult{
 		Total:      n,
 		StartTime:  time.Now(),
-		MinLatency: time.Duration(1<<63 - 1), // max duration as initial min
+		MinLatency: time.Duration(1<<63 - 1),
 	}
 
-	var wg sync.WaitGroup
 	var okCount, errCount atomic.Int64
 	var totalLatencyNs atomic.Int64
 	var minLatencyNs, maxLatencyNs atomic.Int64
 	minLatencyNs.Store(int64(sr.MinLatency))
 
+	// Use a bounded collector pool instead of n goroutines.
+	// collectors = min(n, workers) ensures we don't create more collectors than needed.
+	collectors := p.workers
+	if collectors > n {
+		collectors = n
+	}
+
+	// Result channels fed by pipeline workers, consumed by collectors
+	resultChs := make([]<-chan *PipelineResult, 0, n)
+
+	// Submit all jobs
+	submitted := 0
 	for i := 0; i < n; i++ {
 		select {
 		case <-ctx.Done():
 			sr.Total = i
-			goto done
+			goto collect
 		default:
 		}
-
-		wg.Add(1)
-		ch := p.Send(ctx, method, url, nil, nil)
-
-		go func() {
-			defer wg.Done()
-			result := <-ch
-			if result.Err != nil {
-				errCount.Add(1)
-			} else {
-				okCount.Add(1)
-				if result.Response != nil {
-					result.Response.Close()
-				}
-			}
-			// Track latency for all requests (success and failure)
-			latNs := int64(result.Latency)
-			totalLatencyNs.Add(latNs)
-
-			// Update min latency (CAS loop)
-			for {
-				cur := minLatencyNs.Load()
-				if latNs >= cur || minLatencyNs.CompareAndSwap(cur, latNs) {
-					break
-				}
-			}
-			// Update max latency (CAS loop)
-			for {
-				cur := maxLatencyNs.Load()
-				if latNs <= cur || maxLatencyNs.CompareAndSwap(cur, latNs) {
-					break
-				}
-			}
-		}()
+		resultChs = append(resultChs, p.Send(ctx, method, url, nil, nil))
+		submitted++
 	}
 
-done:
+collect:
+	// Collect results using a fixed pool of collector goroutines
+	var wg sync.WaitGroup
+	chunkSize := (submitted + collectors - 1) / collectors
+	if chunkSize < 1 {
+		chunkSize = 1
+	}
+
+	for start := 0; start < submitted; start += chunkSize {
+		end := start + chunkSize
+		if end > submitted {
+			end = submitted
+		}
+		chunk := resultChs[start:end]
+
+		wg.Add(1)
+		go func(channels []<-chan *PipelineResult) {
+			defer wg.Done()
+			for _, ch := range channels {
+				result := <-ch
+				if result.Err != nil {
+					errCount.Add(1)
+				} else {
+					okCount.Add(1)
+					if result.Response != nil {
+						result.Response.Close()
+					}
+				}
+
+				latNs := int64(result.Latency)
+				totalLatencyNs.Add(latNs)
+
+				// Update min latency (CAS loop)
+				for {
+					cur := minLatencyNs.Load()
+					if latNs >= cur || minLatencyNs.CompareAndSwap(cur, latNs) {
+						break
+					}
+				}
+				// Update max latency (CAS loop)
+				for {
+					cur := maxLatencyNs.Load()
+					if latNs <= cur || maxLatencyNs.CompareAndSwap(cur, latNs) {
+						break
+					}
+				}
+
+				// Return result to pool
+				result.Response = nil
+				result.Err = nil
+				p.resultPool.Put(result)
+			}
+		}(chunk)
+	}
+
 	wg.Wait()
 	sr.EndTime = time.Now()
 	sr.Success = int(okCount.Load())
