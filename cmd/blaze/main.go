@@ -90,18 +90,27 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 	}
 	defer client.Close()
 
-	fmt.Printf("hedef:     %s\n", targetURL)
-	fmt.Printf("sure:      %ds\n", durSec)
-	fmt.Printf("thread:    %d\n", threads)
-	fmt.Printf("stream:    %d (per thread)\n", streams)
-	fmt.Printf("eszamanli: %d\n", totalConcurrent)
-	fmt.Printf("method:    %s\n", method)
+	fmt.Printf("hedef: %s | sure: %ds | thread: %d | stream: %d | toplam: %d | method: %s\n",
+		targetURL, durSec, threads, streams, totalConcurrent, method)
 	if proxyURL != "" {
-		fmt.Printf("proxy:     %s\n", proxyURL)
+		fmt.Printf("proxy: %s\n", proxyURL)
+	}
+
+	// Ilk once tek bir test requesti at, hata varsa goster
+	fmt.Print("test istegi gonderiliyor... ")
+	testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	resp, testErr := client.DoWithContext(testCtx, method, targetURL, nil, nil)
+	testCancel()
+	if testErr != nil {
+		fmt.Printf("BASARISIZ: %v\n", testErr)
+		fmt.Println("devam ediliyor ama buyuk ihtimal tum istekler basarisiz olacak")
+	} else {
+		fmt.Printf("OK %d\n", resp.StatusCode())
+		resp.Close()
 	}
 
 	// Pre-warm
-	fmt.Print("baglanti isitiliyor...")
+	fmt.Print("baglanti isitiliyor... ")
 	warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	warmCount := threads
 	if warmCount > 64 {
@@ -109,9 +118,8 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 	}
 	_ = client.PreConnect(warmCtx, targetURL, warmCount)
 	warmCancel()
-	fmt.Printf(" %d baglanti hazir\n", client.ActiveConnections())
+	fmt.Printf("%d baglanti\n", client.ActiveConnections())
 
-	// Context
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(durSec)*time.Second)
 	defer cancel()
 
@@ -128,12 +136,15 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 		totalSuccess atomic.Int64
 		totalFailed  atomic.Int64
 		statusCodes  sync.Map
+		// Son 5 farkli hatayi tut
+		errMu       sync.Mutex
+		recentErrs  []string
+		errCountMap sync.Map
 	)
 
 	startTime := time.Now()
-	fmt.Printf("basliyor... %d eszamanli istek\n\n", totalConcurrent)
+	fmt.Printf("basliyor... %d eszamanli\n\n", totalConcurrent)
 
-	// Worker goroutines - thread x stream model (HTTP/2 multiplexing)
 	var wg sync.WaitGroup
 	for i := 0; i < threads; i++ {
 		wg.Add(1)
@@ -171,6 +182,23 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 					resp, err := client.DoWithContext(ctx, method, u, nil, nil)
 					if err != nil {
 						totalFailed.Add(1)
+
+						// Hata mesajini kaydet (ilk 5 farkli hata)
+						errStr := err.Error()
+						// Kisa tut
+						if len(errStr) > 80 {
+							errStr = errStr[:80]
+						}
+						if _, loaded := errCountMap.LoadOrStore(errStr, &atomic.Int64{}); !loaded {
+							errMu.Lock()
+							if len(recentErrs) < 5 {
+								recentErrs = append(recentErrs, errStr)
+							}
+							errMu.Unlock()
+						}
+						if val, ok := errCountMap.Load(errStr); ok {
+							val.(*atomic.Int64).Add(1)
+						}
 						return
 					}
 
@@ -184,7 +212,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 		}()
 	}
 
-	// Stats printer
+	// Stats
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
@@ -207,20 +235,14 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 					peakRPS = rps
 				}
 
-				avgRPS := int64(0)
-				if elapsed > 0 {
-					avgRPS = int64(float64(sent) / elapsed)
-				}
-
-				fmt.Printf("\rsent:%d ok:%d fail:%d rps:%d avg:%d peak:%d %.0fs/%ds   ",
-					sent, ok, fail, rps, avgRPS, peakRPS, elapsed, int(elapsed)+1)
+				fmt.Printf("\rsent:%d ok:%d fail:%d rps:%d peak:%d %.0fs   ",
+					sent, ok, fail, rps, peakRPS, elapsed)
 			}
 		}
 	}()
 
 	wg.Wait()
 
-	// Final
 	totalDuration := time.Since(startTime)
 	sent := totalSent.Load()
 	ok := totalSuccess.Load()
@@ -243,10 +265,31 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 	fmt.Printf("ort. rps:   %.0f req/s\n", avgRPS)
 	fmt.Printf("baglanti:   %d\n", client.ActiveConnections())
 
+	// Status code dagilimi
+	hasStatus := false
 	statusCodes.Range(func(key, value interface{}) bool {
+		if !hasStatus {
+			fmt.Println("\nstatus kodlari:")
+			hasStatus = true
+		}
 		fmt.Printf("  %d: %d\n", key.(int), value.(*atomic.Int64).Load())
 		return true
 	})
+
+	// Hata mesajlari
+	errMu.Lock()
+	if len(recentErrs) > 0 {
+		fmt.Println("\nhatalar:")
+		for _, e := range recentErrs {
+			count := int64(0)
+			if val, ok := errCountMap.Load(e); ok {
+				count = val.(*atomic.Int64).Load()
+			}
+			fmt.Printf("  [%dx] %s\n", count, e)
+		}
+	}
+	errMu.Unlock()
+
 	fmt.Println()
 }
 
