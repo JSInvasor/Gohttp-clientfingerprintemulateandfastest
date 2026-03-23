@@ -199,6 +199,10 @@ type Transport struct {
 	// Firefox 148 uses 12517377.
 	ConnectionFlow uint32
 
+	// HeaderPriority, if non-zero, includes PRIORITY data in every HEADERS frame.
+	// Firefox 148 sends PRIORITY flag (0x20) with weight=42, depends_on=0, exclusive=false.
+	HeaderPriority PriorityParam
+
 	// t1, if non-nil, is the standard library Transport using
 	// this transport. Its settings are used (but not its
 	// RoundTrip method, etc).
@@ -1870,6 +1874,7 @@ func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize
 				BlockFragment: chunk,
 				EndStream:     endStream,
 				EndHeaders:    endHeaders,
+				Priority:      cc.t.HeaderPriority,
 			})
 			first = false
 		} else {

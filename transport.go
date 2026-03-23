@@ -176,6 +176,12 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 			// Header order: exact Firefox 148 HPACK encoding order
 			HeaderOrder: t.headerOrder,
 
+			// HEADERS frame PRIORITY: Firefox 148 sends Priority flag (0x20)
+			// with weight=42, depends_on=0, exclusive=false
+			HeaderPriority: http2.PriorityParam{
+				Weight: Firefox148PriorityWeight(), // 42
+			},
+
 			// Allow new connections when per-connection stream limit is hit.
 			// With StrictMaxConcurrentStreams=false, the transport creates new TCP
 			// connections instead of blocking when all connections are at max streams.
@@ -392,7 +398,7 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 				mu.Unlock()
 				return
 			}
-			applyFirefoxHeaders(req, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "en-US,en;q=0.5")
+			applyFirefoxHeaders(req, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "en-US,en;q=0.9")
 
 			resp, err := t.RoundTrip(req)
 			if err != nil {
