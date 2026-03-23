@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/signal"
 	"runtime"
@@ -73,7 +74,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 		gofire.WithMaxConnsPerHost(0),
 		gofire.WithDNSCacheTTL(30 * time.Minute),
 		gofire.WithIdleConnTimeout(120 * time.Second),
-		gofire.WithDisableRedirects(),
+		gofire.WithMaxRedirects(3),
 		gofire.WithWriteBufferSize(128 * 1024),
 		gofire.WithReadBufferSize(128 * 1024),
 	}
@@ -168,7 +169,12 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 					return
 				}
 
-				reqURL := targetURL
+				// Cache-bust: her istege farkli query param ekle
+				sep := "?"
+				if strings.Contains(targetURL, "?") {
+					sep = "&"
+				}
+				reqURL := targetURL + sep + "_cb=" + strconv.FormatInt(rand.Int63(), 36)
 				totalSent.Add(1)
 
 				innerWg.Add(1)
