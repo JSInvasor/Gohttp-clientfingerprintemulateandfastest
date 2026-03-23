@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"os"
 	"os/signal"
 	"runtime"
@@ -169,7 +168,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 					return
 				}
 
-				reqURL := cacheBust(targetURL)
+				reqURL := targetURL
 				totalSent.Add(1)
 
 				innerWg.Add(1)
@@ -291,26 +290,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 	errMu.Unlock()
 
 	fmt.Println()
-}
-
-var bustParams = []string{"_", "cb", "nc", "t", "v", "r", "ts", "z"}
-
-func cacheBust(base string) string {
-	sep := "?"
-	if strings.Contains(base, "?") {
-		sep = "&"
-	}
-	return base + sep + bustParams[rand.Intn(len(bustParams))] + "=" + randStr(8)
-}
-
-const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
-
-func randStr(n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = chars[rand.Intn(len(chars))]
-	}
-	return string(b)
 }
 
 func mustInt(s, name string) int {

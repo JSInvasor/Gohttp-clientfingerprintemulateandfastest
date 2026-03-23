@@ -33,7 +33,7 @@ func defaultClientConfig() clientConfig {
 		followRedirects: true,
 		maxRedirects:    10,
 		timeout:         30 * time.Second,
-		acceptLanguage:  "en-US,en;q=0.9",
+		acceptLanguage:  "en-US,en;q=0.5",
 		accept:          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 	}
 }
@@ -131,7 +131,7 @@ func WithDialTimeout(d time.Duration) Option {
 	}
 }
 
-// WithAcceptLanguage sets the Accept-Language header. Default: "en-US,en;q=0.9".
+// WithAcceptLanguage sets the Accept-Language header. Default: "en-US,en;q=0.5".
 func WithAcceptLanguage(lang string) Option {
 	return func(c *clientConfig) {
 		c.acceptLanguage = lang

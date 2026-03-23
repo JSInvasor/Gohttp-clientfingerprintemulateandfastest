@@ -57,7 +57,7 @@ var firefox148HeaderOrder = []string{
 //
 //	user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) ...
 //	accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
-//	accept-language: en-US,en;q=0.9
+//	accept-language: en-US,en;q=0.5
 //	accept-encoding: gzip, deflate, br, zstd
 //	upgrade-insecure-requests: 1
 //	sec-fetch-dest: document
@@ -75,7 +75,7 @@ func applyFirefoxHeaders(req *http.Request, accept, lang string) {
 
 	setIfEmpty(h, "User-Agent", Firefox148UserAgent)
 	setIfEmpty(h, "Accept", accept)
-	setIfEmpty(h, "Accept-Language", lang) // Firefox 148: en-US,en;q=0.9
+	setIfEmpty(h, "Accept-Language", lang) // Firefox 148: en-US,en;q=0.5
 	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br, zstd")
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
