@@ -7,3 +7,4 @@ vendor/
 .vscode/
 blaze
 proxies.txt
+http.txt
