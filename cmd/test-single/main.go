@@ -36,13 +36,20 @@ func main() {
 	// Print response headers
 	fmt.Println("\n=== Response Headers ===")
 	for k, v := range resp.Headers() {
-		fmt.Printf("  %s: %s\n", k, v)
+		for _, val := range v {
+			fmt.Printf("  %s: %s\n", k, val)
+		}
 	}
 
-	// Print body (first 500 chars)
-	text, _ := resp.Text()
-	if len(text) > 500 {
-		text = text[:500] + "..."
+	// Print body
+	text, err := resp.Text()
+	if err != nil {
+		fmt.Printf("\nBody decode error: %v\n", err)
+		fmt.Printf("Content-Encoding: %s\n", resp.GetHeader("Content-Encoding"))
+		return
+	}
+	if len(text) > 1000 {
+		text = text[:1000] + "..."
 	}
 	fmt.Printf("\n=== Body (%d bytes) ===\n%s\n", len(text), text)
 }
