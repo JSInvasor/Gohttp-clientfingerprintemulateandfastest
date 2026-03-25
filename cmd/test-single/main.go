@@ -33,7 +33,6 @@ func main() {
 	fmt.Printf("Status:  %d\n", resp.StatusCode())
 	fmt.Printf("Elapsed: %v\n", elapsed)
 
-	// Print response headers
 	fmt.Println("\n=== Response Headers ===")
 	for k, v := range resp.Headers() {
 		for _, val := range v {
@@ -41,15 +40,7 @@ func main() {
 		}
 	}
 
-	// Print body
-	text, err := resp.Text()
-	if err != nil {
-		fmt.Printf("\nBody decode error: %v\n", err)
-		fmt.Printf("Content-Encoding: %s\n", resp.GetHeader("Content-Encoding"))
-		return
-	}
-	if len(text) > 1000 {
-		text = text[:1000] + "..."
-	}
-	fmt.Printf("\n=== Body (%d bytes) ===\n%s\n", len(text), text)
+	// Don't print body - just show size
+	fmt.Printf("\nContent-Encoding: %s\n", resp.GetHeader("Content-Encoding"))
+	fmt.Printf("Content-Type: %s\n", resp.GetHeader("Content-Type"))
 }
