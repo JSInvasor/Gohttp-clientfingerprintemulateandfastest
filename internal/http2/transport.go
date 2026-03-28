@@ -2307,12 +2307,13 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 		if !contentLengthEmitted && shouldSendReqContentLength(req.Method, contentLength) {
 			f("content-length", strconv.FormatInt(contentLength, 10))
 		}
-		if addGzipHeader {
-			f("accept-encoding", "gzip")
-		}
-		if !didUA {
-			f("user-agent", defaultUserAgent)
-		}
+		// Never inject "accept-encoding: gzip" default. The caller sets the
+		// full browser-matching Accept-Encoding (gzip, deflate, br, zstd).
+		_ = addGzipHeader
+		// Never inject default Go User-Agent. The caller (gofire) always sets
+		// the browser-appropriate User-Agent via applyFirefoxHeaders, so adding
+		// "Go-http-client/2.0" here would be a fingerprint leak.
+		_ = didUA
 	}
 
 	// Do a first pass over the headers counting bytes to ensure
