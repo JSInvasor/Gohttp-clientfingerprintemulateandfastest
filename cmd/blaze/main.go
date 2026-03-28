@@ -135,13 +135,12 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 
 	groups := make([]*clientGroup, len(browsers))
 
-	// Workers per client: matches HTTP/2 stream capacity per connection (~100-256)
-	workersPerClient := streams
+	// Workers per client: threads * streams / total clients
+	// No artificial cap - let the user control concurrency
+	totalClients := clientsPerBrowser * len(browsers)
+	workersPerClient := (threads * streams) / totalClients
 	if workersPerClient < 50 {
 		workersPerClient = 50
-	}
-	if workersPerClient > 256 {
-		workersPerClient = 256
 	}
 
 	for bi, bs := range browsers {
@@ -175,7 +174,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}()
 
-	totalClients := clientsPerBrowser * len(browsers)
 	actualWorkers := workersPerClient * totalClients
 	fmt.Printf("hedef: %s | sure: %ds | worker: %d (%d/client) | method: %s\n",
 		targetURL, durSec, actualWorkers, workersPerClient, method)
