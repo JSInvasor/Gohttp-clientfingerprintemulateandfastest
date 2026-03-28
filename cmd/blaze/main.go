@@ -104,6 +104,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		gofire.WithDNSCacheTTL(30 * time.Minute),
 		gofire.WithIdleConnTimeout(120 * time.Second),
 		gofire.WithMaxRedirects(3),
+		gofire.WithReferer("https://www.google.com/"),
 		gofire.WithWriteBufferSize(128 * 1024),
 		gofire.WithReadBufferSize(128 * 1024),
 	}
