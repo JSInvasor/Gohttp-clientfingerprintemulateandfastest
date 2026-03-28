@@ -96,14 +96,19 @@ func (r *Response) JSON(v interface{}) error {
 }
 
 // Close releases the response body.
-// Uses a bounded read (256KB) to drain the body for connection reuse
-// without blocking on unexpectedly large responses.
+// For HTTP/2: closes immediately without draining (sends RST_STREAM, stream freed instantly).
+// For HTTP/1.1: drains a small amount for connection reuse.
 func (r *Response) Close() {
-	if r.Response != nil && r.Response.Body != nil && !r.bodyRead {
-		// Drain up to 256KB so the connection can be reused.
-		// Larger bodies will cause the connection to be closed instead of pooled,
-		// which is acceptable - avoiding blocking is more important at high RPS.
-		io.CopyN(io.Discard, r.Response.Body, 256*1024) //nolint:errcheck
+	if r.Response == nil || r.Response.Body == nil || r.bodyRead {
+		return
+	}
+	if r.Response.ProtoMajor == 2 {
+		// HTTP/2: just close. Go's h2 transport sends RST_STREAM to free the stream
+		// instantly without reading the body. This is critical for high RPS.
+		r.Response.Body.Close()
+	} else {
+		// HTTP/1.1: drain small amount so TCP connection can be reused
+		io.CopyN(io.Discard, r.Response.Body, 8*1024) //nolint:errcheck
 		r.Response.Body.Close()
 	}
 }
