@@ -156,8 +156,16 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 			if proxyRotator != nil {
 				c.SetProxyRotator(proxyRotator)
 			}
+			// Pre-build request template for FastDo path
+			tmpl, err := c.PrepareRequest(method, targetURL)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "hata: %s template olusturulamadi: %v\n", bs.name, err)
+				os.Exit(1)
+			}
+			p := c.NewPipeline(workersPerClient)
+			p.SetTemplate(tmpl)
 			cg.clients = append(cg.clients, c)
-			cg.pipelines = append(cg.pipelines, c.NewPipeline(workersPerClient))
+			cg.pipelines = append(cg.pipelines, p)
 		}
 		groups[bi] = cg
 	}

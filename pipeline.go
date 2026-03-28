@@ -3,6 +3,7 @@ package gofire
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +41,9 @@ type Pipeline struct {
 	// The callback must be set before sending any requests.
 	// The callback MUST call Response.Close() if Response is non-nil.
 	OnResult func(resp *Response, err error, latency time.Duration)
+
+	// Pre-built request template for FastDo path (set via SetTemplate)
+	template *http.Request
 
 	// Object pools to reduce GC pressure at high RPS
 	jobPool    sync.Pool
@@ -92,6 +96,13 @@ func newPipeline(c *Client, workers int) *Pipeline {
 	return p
 }
 
+// SetTemplate sets a pre-built request template for FastDo path.
+// When set, workers use FastDo (direct transport.RoundTrip) instead of DoWithContext,
+// bypassing cookie jar mutex, redirect handling, URL parsing, and header building.
+func (p *Pipeline) SetTemplate(tmpl *http.Request) {
+	p.template = tmpl
+}
+
 // worker processes jobs from the channel.
 func (p *Pipeline) worker() {
 	defer p.wg.Done()
@@ -100,7 +111,13 @@ func (p *Pipeline) worker() {
 		start := time.Now()
 		p.Stats.TotalSent.Add(1)
 
-		resp, err := p.client.DoWithContext(job.ctx, job.method, job.url, job.body, job.headers)
+		var resp *Response
+		var err error
+		if p.template != nil {
+			resp, err = p.client.FastDo(job.ctx, p.template)
+		} else {
+			resp, err = p.client.DoWithContext(job.ctx, job.method, job.url, job.body, job.headers)
+		}
 
 		latency := time.Since(start)
 

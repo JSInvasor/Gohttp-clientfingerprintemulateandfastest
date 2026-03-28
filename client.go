@@ -254,6 +254,36 @@ func (c *Client) DoHTTPRequest(req *http.Request) (*Response, error) {
 	return &Response{Response: resp, maxBodySize: c.config.maxResponseBody}, nil
 }
 
+// PrepareRequest pre-builds a reusable request template for a given URL.
+// The returned *http.Request has all browser headers pre-set. Clone it with
+// req.Clone(ctx) or use FastDo for maximum throughput.
+func (c *Client) PrepareRequest(method, rawURL string) (*http.Request, error) {
+	req, err := http.NewRequest(method, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage)
+	if c.config.userAgent != "" {
+		req.Header.Set("User-Agent", c.config.userAgent)
+	}
+	if c.config.referer != "" {
+		setIfEmpty(req.Header, "Referer", c.config.referer)
+	}
+	return req, nil
+}
+
+// FastDo sends a request using a pre-built template, bypassing http.Client.Do entirely.
+// Skips: cookie jar (no mutex), redirect handling, retry logic, URL parsing.
+// This is the fastest path for high-RPS workloads while maintaining full fingerprint bypass.
+func (c *Client) FastDo(ctx context.Context, template *http.Request) (*Response, error) {
+	req := template.Clone(ctx)
+	resp, err := c.transport.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	return &Response{Response: resp}, nil
+}
+
 // PreConnect pre-warms n TLS connections to the given URL.
 // Call this before sending requests for lowest latency on first requests.
 func (c *Client) PreConnect(ctx context.Context, rawURL string, n int) error {
