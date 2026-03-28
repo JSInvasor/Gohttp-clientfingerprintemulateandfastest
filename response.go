@@ -96,21 +96,17 @@ func (r *Response) JSON(v interface{}) error {
 }
 
 // Close releases the response body.
-// For HTTP/2: closes immediately without draining (sends RST_STREAM, stream freed instantly).
-// For HTTP/1.1: drains a small amount for connection reuse.
+// Fully drains the body to avoid RST_STREAM on HTTP/2 (which WAFs detect as anomalous).
+// Real browsers always consume the full response, so we must too.
 func (r *Response) Close() {
 	if r.Response == nil || r.Response.Body == nil || r.bodyRead {
 		return
 	}
-	if r.Response.ProtoMajor == 2 {
-		// HTTP/2: just close. Go's h2 transport sends RST_STREAM to free the stream
-		// instantly without reading the body. This is critical for high RPS.
-		r.Response.Body.Close()
-	} else {
-		// HTTP/1.1: drain small amount so TCP connection can be reused
-		io.CopyN(io.Discard, r.Response.Body, 8*1024) //nolint:errcheck
-		r.Response.Body.Close()
-	}
+	// Drain full body (bounded to 2MB to avoid abuse).
+	// This ensures HTTP/2 streams close cleanly with END_STREAM, not RST_STREAM.
+	// WAFs like Cloudflare flag RST_STREAM as non-browser behavior.
+	io.CopyN(io.Discard, r.Response.Body, 2*1024*1024) //nolint:errcheck
+	r.Response.Body.Close()
 }
 
 // Headers returns the response headers.
