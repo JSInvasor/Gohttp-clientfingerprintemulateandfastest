@@ -102,10 +102,10 @@ func (r *Response) Close() {
 	if r.Response == nil || r.Response.Body == nil || r.bodyRead {
 		return
 	}
-	// Drain full body (bounded to 2MB to avoid abuse).
-	// This ensures HTTP/2 streams close cleanly with END_STREAM, not RST_STREAM.
-	// WAFs like Cloudflare flag RST_STREAM as non-browser behavior.
-	io.CopyN(io.Discard, r.Response.Body, 2*1024*1024) //nolint:errcheck
+	// Drain body so HTTP/2 stream closes with END_STREAM (not RST_STREAM).
+	// 256KB is enough for typical HTML responses. Larger responses cause
+	// connection drop which is fine - avoiding RST_STREAM is what matters.
+	io.CopyN(io.Discard, r.Response.Body, 256*1024) //nolint:errcheck
 	r.Response.Body.Close()
 }
 
