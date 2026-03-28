@@ -35,6 +35,12 @@ type Pipeline struct {
 	Stats   PipelineStats
 	closed  atomic.Bool
 
+	// OnResult is called for every completed request (both success and error).
+	// When set, FireAndForget will invoke this callback instead of discarding results.
+	// The callback must be set before sending any requests.
+	// The callback MUST call Response.Close() if Response is non-nil.
+	OnResult func(resp *Response, err error, latency time.Duration)
+
 	// Object pools to reduce GC pressure at high RPS
 	jobPool    sync.Pool
 	resultPool sync.Pool
@@ -121,8 +127,11 @@ func (p *Pipeline) worker() {
 				result.Err = nil
 				p.resultPool.Put(result)
 			}
+		} else if p.OnResult != nil {
+			// Fire and forget with callback
+			p.OnResult(resp, err, latency)
 		} else {
-			// No result channel - fire and forget, close response
+			// No result channel, no callback - discard
 			if resp != nil {
 				resp.Close()
 			}

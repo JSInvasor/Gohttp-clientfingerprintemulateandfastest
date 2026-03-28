@@ -243,13 +243,13 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	startTime := time.Now()
 	fmt.Printf("basliyor... %d worker x %d client (firefox+chrome)\n\n", totalWorkers, totalClients)
 
-	// Result collector
-	collectResult := func(result *gofire.PipelineResult) {
+	// OnResult callback - called by pipeline workers directly, zero channel overhead
+	onResult := func(resp *gofire.Response, err error, latency time.Duration) {
 		totalSent.Add(1)
-		if result.Err != nil {
+		if err != nil {
 			totalFailed.Add(1)
 
-			errStr := result.Err.Error()
+			errStr := err.Error()
 			if len(errStr) > 200 {
 				errStr = errStr[:200]
 			}
@@ -265,16 +265,23 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 			}
 		} else {
 			totalSuccess.Add(1)
-			if result.Response != nil {
-				sc := result.Response.StatusCode()
+			if resp != nil {
+				sc := resp.StatusCode()
 				val, _ := statusCodes.LoadOrStore(sc, &atomic.Int64{})
 				val.(*atomic.Int64).Add(1)
-				result.Response.Close()
+				resp.Close()
 			}
 		}
 	}
 
-	// Feeder function: sends jobs to a pipeline, collects results
+	// Set OnResult callback on all pipelines
+	for _, cg := range groups {
+		for _, p := range cg.pipelines {
+			p.OnResult = onResult
+		}
+	}
+
+	// Feeder: pure FireAndForget - no blocking, no channels, maximum throughput
 	var feedWg sync.WaitGroup
 	feedPipeline := func(pipeline *gofire.Pipeline) {
 		defer feedWg.Done()
@@ -284,24 +291,12 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 				return
 			default:
 			}
-
-			ch := pipeline.Send(ctx, method, targetURL, nil, nil)
-
-			select {
-			case result := <-ch:
-				collectResult(result)
-			case <-ctx.Done():
-				return
-			}
+			pipeline.FireAndForget(ctx, method, targetURL, nil, nil)
 		}
 	}
 
-	// Launch feeders: multiple per pipeline to keep them saturated
-	feedersPerPipeline := runtime.NumCPU() / clientsPerBrowser
-	if feedersPerPipeline < 2 {
-		feedersPerPipeline = 2
-	}
-
+	// Launch feeders: enough to keep the pipeline job channel saturated
+	feedersPerPipeline := 4
 	for _, cg := range groups {
 		for _, p := range cg.pipelines {
 			for i := 0; i < feedersPerPipeline; i++ {
