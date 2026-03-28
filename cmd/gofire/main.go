@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"os"
 	"os/signal"
 	"strconv"
@@ -194,7 +193,7 @@ func run(targetURL string, durSec, threads, streams int) {
 					return
 				}
 
-				reqURL := buildURL(targetURL)
+				reqURL := targetURL
 				totalSent.Add(1)
 
 				innerWg.Add(1)
@@ -306,33 +305,6 @@ func run(targetURL string, durSec, threads, streams int) {
 	}
 
 	fmt.Printf("\n  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n", colorGray, colorReset)
-}
-
-// buildURL generates the request URL with cache bypass.
-func buildURL(base string) string {
-	sep := "?"
-	if strings.Contains(base, "?") {
-		sep = "&"
-	}
-	return base + sep + randomParam() + "=" + randomString(8)
-}
-
-var cacheParams = []string{
-	"_", "cb", "nocache", "t", "v", "ver", "rand", "r", "ts",
-}
-
-func randomParam() string {
-	return cacheParams[rand.Intn(len(cacheParams))]
-}
-
-const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
-
-func randomString(n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = charset[rand.Intn(len(charset))]
-	}
-	return string(b)
 }
 
 func fatal(format string, args ...interface{}) {

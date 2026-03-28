@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Conn is a TLS 1.3 connection with Firefox 148 fingerprint.
+// Conn is a TLS 1.3 connection with browser fingerprint emulation.
 // It implements net.Conn and provides ConnectionState() for HTTP/2 compatibility.
 type Conn struct {
 	net.Conn // underlying TCP connection
@@ -152,23 +152,23 @@ func Dial(ctx context.Context, network, addr string, alpn []string) (*Conn, erro
 	if err != nil {
 		return nil, fmt.Errorf("split host port: %w", err)
 	}
-	return DialWithConfig(ctx, network, addr, host, alpn, false, nil)
+	return DialWithConfig(ctx, network, addr, host, alpn, false, nil, BrowserFirefox148)
 }
 
 // DialWithConfig creates a TLS connection with full configuration.
-func DialWithConfig(ctx context.Context, network, addr, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool) (*Conn, error) {
+func DialWithConfig(ctx context.Context, network, addr, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType) (*Conn, error) {
 	var d net.Dialer
 	rawConn, err := d.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial tcp: %w", err)
 	}
 
-	return WrapConn(ctx, rawConn, serverName, alpn, skipVerify, rootCAs)
+	return WrapConn(ctx, rawConn, serverName, alpn, skipVerify, rootCAs, browser)
 }
 
 // WrapConn performs the TLS 1.3 handshake over an existing net.Conn.
 // This is the main entry point for use with pre-dialed connections (proxies, etc.).
-func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool) (*Conn, error) {
+func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType) (*Conn, error) {
 	// Set deadline from context
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := rawConn.SetDeadline(deadline); err != nil {
@@ -177,8 +177,7 @@ func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []s
 		}
 	}
 
-	// Wrap with buffered reader for efficient reads
-	tlsConn, err := handshake(rawConn, serverName, alpn, skipVerify, rootCAs)
+	tlsConn, err := handshake(rawConn, serverName, alpn, skipVerify, rootCAs, browser)
 	if err != nil {
 		rawConn.Close()
 		return nil, fmt.Errorf("tls handshake: %w", err)

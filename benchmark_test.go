@@ -71,7 +71,7 @@ func TestNewClient(t *testing.T) {
 
 func TestFirefoxHeaders(t *testing.T) {
 	req, _ := http.NewRequest("GET", "https://example.com", nil)
-	applyFirefoxHeaders(req, "text/html", "en-US,en;q=0.9")
+	applyFirefoxHeaders(req, "text/html", "en-US,en;q=0.5")
 
 	tests := []struct {
 		header string
@@ -79,7 +79,7 @@ func TestFirefoxHeaders(t *testing.T) {
 	}{
 		{"User-Agent", Firefox148UserAgent},
 		{"Accept", "text/html"},
-		{"Accept-Language", "en-US,en;q=0.9"},
+		{"Accept-Language", "en-US,en;q=0.5"},
 		{"Accept-Encoding", "gzip, deflate, br, zstd"},
 		{"Sec-Fetch-Dest", "document"},
 		{"Sec-Fetch-Mode", "navigate"},
@@ -563,7 +563,7 @@ func BenchmarkFirefoxHeaders(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		req, _ := http.NewRequest("GET", "https://example.com", nil)
-		applyFirefoxHeaders(req, "text/html", "en-US,en;q=0.9")
+		applyFirefoxHeaders(req, "text/html", "en-US,en;q=0.5")
 	}
 }
 

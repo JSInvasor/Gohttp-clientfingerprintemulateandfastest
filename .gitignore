@@ -5,3 +5,7 @@
 vendor/
 .idea/
 .vscode/
+blaze
+test-single
+proxies.txt
+http.txt

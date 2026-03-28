@@ -64,7 +64,7 @@ func NewClient(opts ...Option) (*Client, error) {
 		if len(via) >= cfg.maxRedirects {
 			return fmt.Errorf("stopped after %d redirects", cfg.maxRedirects)
 		}
-		applyFirefoxHeaders(req, cfg.accept, cfg.acceptLanguage)
+		applyBrowserHeaders(req, cfg.browser, cfg.accept, cfg.acceptLanguage)
 		return nil
 	}
 
@@ -178,7 +178,7 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 		}
 
 		// Apply browser default headers
-		applyFirefoxHeaders(req, c.config.accept, c.config.acceptLanguage)
+		applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage)
 
 		// Apply custom User-Agent if set
 		if c.config.userAgent != "" {
@@ -237,7 +237,7 @@ func (c *Client) shouldRetryStatus(statusCode int) bool {
 
 // DoHTTPRequest executes a standard *http.Request with fingerprint headers applied.
 func (c *Client) DoHTTPRequest(req *http.Request) (*Response, error) {
-	applyFirefoxHeaders(req, c.config.accept, c.config.acceptLanguage)
+	applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage)
 
 	if c.config.userAgent != "" {
 		req.Header.Set("User-Agent", c.config.userAgent)

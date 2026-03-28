@@ -14,12 +14,18 @@ type tlsRecord struct {
 	data []byte
 }
 
-// writeRawRecord writes a plaintext TLS record to the connection.
-// Uses version 0x0301 (TLS 1.0) for compatibility, as Firefox does.
+// writeRawRecord writes a TLS record to the connection.
+// Per RFC 8446: ClientHello uses 0x0301, all other records use 0x0303.
 func writeRawRecord(conn net.Conn, typ uint8, data []byte) error {
 	buf := make([]byte, 5+len(data))
 	buf[0] = typ
-	binary.BigEndian.PutUint16(buf[1:], versionTLS10) // 0x0301 compat header
+	// ClientHello (handshake, first record) uses 0x0301 for compat.
+	// All other records (CCS, encrypted) MUST use 0x0303 per RFC 8446 §5.1.
+	if typ == recordTypeHandshake {
+		binary.BigEndian.PutUint16(buf[1:], versionTLS10) // 0x0301
+	} else {
+		binary.BigEndian.PutUint16(buf[1:], versionTLS12) // 0x0303
+	}
 	binary.BigEndian.PutUint16(buf[3:], uint16(len(data)))
 	copy(buf[5:], data)
 	_, err := conn.Write(buf)
