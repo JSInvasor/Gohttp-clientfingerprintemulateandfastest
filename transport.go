@@ -179,7 +179,7 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 				Weight:    h2p.PriorityWeight,
 				Exclusive: h2p.PriorityExclusive,
 			},
-			StrictMaxConcurrentStreams: false,
+			StrictMaxConcurrentStreams: true,
 			ReadIdleTimeout:           15 * time.Second,
 			PingTimeout:               5 * time.Second,
 			WriteByteTimeout:          30 * time.Second,

@@ -59,17 +59,51 @@ func main() {
 	run(targetURL, durSec, threads, streams, method, proxyArg)
 }
 
+// clientGroup holds multiple clients of the same browser type for connection multiplying.
+type clientGroup struct {
+	name      string
+	clients   []*gofire.Client
+	pipelines []*gofire.Pipeline
+}
+
+func (cg *clientGroup) Close() {
+	for _, p := range cg.pipelines {
+		p.Close()
+	}
+	for _, c := range cg.clients {
+		c.Close()
+	}
+}
+
+func (cg *clientGroup) ActiveConnections() int64 {
+	var total int64
+	for _, c := range cg.clients {
+		total += c.ActiveConnections()
+	}
+	return total
+}
+
 func run(targetURL string, durSec, threads, streams int, method, proxyArg string) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	// Pipeline workers = threads * streams (total concurrency)
 	totalWorkers := threads * streams
 
-	idlePerHost := totalWorkers
+	// Number of client instances per browser type.
+	// Each client gets its own HTTP/2 connection(s), multiplying connection count.
+	// More clients = more connections = more concurrent streams.
+	clientsPerBrowser := runtime.NumCPU()
+	if clientsPerBrowser < 4 {
+		clientsPerBrowser = 4
+	}
+	if clientsPerBrowser > 16 {
+		clientsPerBrowser = 16
+	}
+
+	idlePerHost := totalWorkers / clientsPerBrowser
 	if idlePerHost < 256 {
 		idlePerHost = 256
 	}
-	totalIdle := totalWorkers * 2
+	totalIdle := idlePerHost * 2
 	if totalIdle < 512 {
 		totalIdle = 512
 	}
@@ -103,50 +137,62 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}
 
-	// Create both Firefox and Chrome clients
-	firefoxClient, err := gofire.Emulate(gofire.Firefox148, baseOpts...)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "hata: firefox client olusturulamadi: %v\n", err)
-		os.Exit(1)
+	// Create multiple clients per browser for connection multiplying
+	type browserSpec struct {
+		name    string
+		profile gofire.BrowserProfile
 	}
-	defer firefoxClient.Close()
-
-	chromeClient, err := gofire.Emulate(gofire.Chrome146, baseOpts...)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "hata: chrome client olusturulamadi: %v\n", err)
-		os.Exit(1)
-	}
-	defer chromeClient.Close()
-
-	if proxyRotator != nil {
-		firefoxClient.SetProxyRotator(proxyRotator)
-		chromeClient.SetProxyRotator(proxyRotator)
+	browsers := []browserSpec{
+		{"firefox", gofire.Firefox148},
+		{"chrome", gofire.Chrome146},
 	}
 
-	// Split workers: half Firefox, half Chrome
-	firefoxWorkers := totalWorkers / 2
-	chromeWorkers := totalWorkers - firefoxWorkers
+	groups := make([]*clientGroup, len(browsers))
+	workersPerBrowser := totalWorkers / len(browsers)
 
+	for bi, bs := range browsers {
+		cg := &clientGroup{name: bs.name}
+		workersPerClient := workersPerBrowser / clientsPerBrowser
+		if workersPerClient < 1 {
+			workersPerClient = 1
+		}
+
+		for i := 0; i < clientsPerBrowser; i++ {
+			c, err := gofire.Emulate(bs.profile, baseOpts...)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "hata: %s client[%d] olusturulamadi: %v\n", bs.name, i, err)
+				os.Exit(1)
+			}
+			if proxyRotator != nil {
+				c.SetProxyRotator(proxyRotator)
+			}
+			cg.clients = append(cg.clients, c)
+			cg.pipelines = append(cg.pipelines, c.NewPipeline(workersPerClient))
+		}
+		groups[bi] = cg
+	}
+	defer func() {
+		for _, cg := range groups {
+			cg.Close()
+		}
+	}()
+
+	totalClients := clientsPerBrowser * len(browsers)
 	fmt.Printf("hedef: %s | sure: %ds | worker: %d | method: %s\n",
 		targetURL, durSec, totalWorkers, method)
-	fmt.Printf("browser: firefox=%d worker + chrome=%d worker (pipeline)\n", firefoxWorkers, chromeWorkers)
+	fmt.Printf("browser: %d firefox + %d chrome client (toplam %d h2 baglanti)\n",
+		clientsPerBrowser, clientsPerBrowser, totalClients)
 	if proxyRotator != nil {
 		fmt.Printf("proxy: %d adet (rotate)\n", proxyRotator.Count())
 	} else if proxyArg != "" {
 		fmt.Printf("proxy: %s\n", proxyArg)
 	}
 
-	// Test both browsers
-	for _, tc := range []struct {
-		name   string
-		client *gofire.Client
-	}{
-		{"firefox", firefoxClient},
-		{"chrome", chromeClient},
-	} {
-		fmt.Printf("test [%s]... ", tc.name)
+	// Test one client per browser
+	for _, cg := range groups {
+		fmt.Printf("test [%s]... ", cg.name)
 		testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		resp, testErr := tc.client.DoWithContext(testCtx, method, targetURL, nil, nil)
+		resp, testErr := cg.clients[0].DoWithContext(testCtx, method, targetURL, nil, nil)
 		testCancel()
 		if testErr != nil {
 			fmt.Printf("BASARISIZ: %v\n", testErr)
@@ -156,27 +202,22 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}
 
-	// Pre-warm both
+	// Pre-warm all clients
 	fmt.Print("baglanti isitiliyor... ")
 	warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	warmCount := totalWorkers / 8
-	if warmCount < 4 {
-		warmCount = 4
+	warmPerClient := 4
+	for _, cg := range groups {
+		for _, c := range cg.clients {
+			_ = c.PreConnect(warmCtx, targetURL, warmPerClient)
+		}
 	}
-	if warmCount > 64 {
-		warmCount = 64
-	}
-	_ = firefoxClient.PreConnect(warmCtx, targetURL, warmCount)
-	_ = chromeClient.PreConnect(warmCtx, targetURL, warmCount)
 	warmCancel()
-	fmt.Printf("%d baglanti\n", firefoxClient.ActiveConnections()+chromeClient.ActiveConnections())
 
-	// Create pipelines
-	firefoxPipeline := firefoxClient.NewPipeline(firefoxWorkers)
-	defer firefoxPipeline.Close()
-
-	chromePipeline := chromeClient.NewPipeline(chromeWorkers)
-	defer chromePipeline.Close()
+	var totalConns int64
+	for _, cg := range groups {
+		totalConns += cg.ActiveConnections()
+	}
+	fmt.Printf("%d baglanti\n", totalConns)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(durSec)*time.Second)
 	defer cancel()
@@ -200,14 +241,9 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	)
 
 	startTime := time.Now()
-	fmt.Printf("basliyor... %d pipeline worker (firefox+chrome)\n\n", totalWorkers)
+	fmt.Printf("basliyor... %d worker x %d client (firefox+chrome)\n\n", totalWorkers, totalClients)
 
-	// Feed pipelines continuously from feeder goroutines.
-	// Each feeder sends jobs as fast as the pipeline can consume.
-	// The pipeline's buffered channel provides backpressure.
-	var feedWg sync.WaitGroup
-
-	// Result collector: reads results from pipeline and updates stats
+	// Result collector
 	collectResult := func(result *gofire.PipelineResult) {
 		totalSent.Add(1)
 		if result.Err != nil {
@@ -238,10 +274,10 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}
 
-	// Feeder function: sends jobs to pipeline, collects results
-	feedPipeline := func(pipeline *gofire.Pipeline, name string) {
+	// Feeder function: sends jobs to a pipeline, collects results
+	var feedWg sync.WaitGroup
+	feedPipeline := func(pipeline *gofire.Pipeline) {
 		defer feedWg.Done()
-
 		for {
 			select {
 			case <-ctx.Done():
@@ -251,8 +287,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 
 			ch := pipeline.Send(ctx, method, targetURL, nil, nil)
 
-			// Non-blocking collect in a separate goroutine would add overhead.
-			// Instead collect inline - the pipeline buffer handles backpressure.
 			select {
 			case result := <-ch:
 				collectResult(result)
@@ -262,21 +296,19 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}
 
-	// Launch feeders: multiple feeders per pipeline to keep it saturated.
-	// Each feeder is sequential (send → collect → repeat), so we need
-	// enough feeders to keep the pipeline's buffered channel full.
-	feedersPerPipeline := runtime.NumCPU()
-	if feedersPerPipeline < 4 {
-		feedersPerPipeline = 4
+	// Launch feeders: multiple per pipeline to keep them saturated
+	feedersPerPipeline := runtime.NumCPU() / clientsPerBrowser
+	if feedersPerPipeline < 2 {
+		feedersPerPipeline = 2
 	}
 
-	for i := 0; i < feedersPerPipeline; i++ {
-		feedWg.Add(1)
-		go feedPipeline(firefoxPipeline, "firefox")
-	}
-	for i := 0; i < feedersPerPipeline; i++ {
-		feedWg.Add(1)
-		go feedPipeline(chromePipeline, "chrome")
+	for _, cg := range groups {
+		for _, p := range cg.pipelines {
+			for i := 0; i < feedersPerPipeline; i++ {
+				feedWg.Add(1)
+				go feedPipeline(p)
+			}
+		}
 	}
 
 	// Stats printer
@@ -302,8 +334,13 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 					peakRPS = rps
 				}
 
-				fmt.Printf("\rsent:%d ok:%d fail:%d rps:%d peak:%d %.0fs   ",
-					sent, ok, fail, rps, peakRPS, elapsed)
+				var conns int64
+				for _, cg := range groups {
+					conns += cg.ActiveConnections()
+				}
+
+				fmt.Printf("\rsent:%d ok:%d fail:%d rps:%d peak:%d conn:%d %.0fs   ",
+					sent, ok, fail, rps, peakRPS, conns, elapsed)
 			}
 		}
 	}()
@@ -324,7 +361,10 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		successRate = float64(ok) / float64(sent) * 100
 	}
 
-	totalConns := firefoxClient.ActiveConnections() + chromeClient.ActiveConnections()
+	var finalConns int64
+	for _, cg := range groups {
+		finalConns += cg.ActiveConnections()
+	}
 
 	fmt.Printf("\n\n--- sonuclar ---\n")
 	fmt.Printf("gonderilen: %d\n", sent)
@@ -332,7 +372,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	fmt.Printf("basarisiz:  %d\n", fail)
 	fmt.Printf("sure:       %v\n", totalDuration.Round(time.Millisecond))
 	fmt.Printf("ort. rps:   %.0f req/s\n", avgRPS)
-	fmt.Printf("baglanti:   %d (firefox+chrome)\n", totalConns)
+	fmt.Printf("baglanti:   %d (%d client)\n", finalConns, totalClients)
 
 	hasStatus := false
 	statusCodes.Range(func(key, value interface{}) bool {
