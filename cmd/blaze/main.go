@@ -62,13 +62,14 @@ func main() {
 func run(targetURL string, durSec, threads, streams int, method, proxyArg string) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	totalConcurrent := threads * streams
+	// Pipeline workers = threads * streams (total concurrency)
+	totalWorkers := threads * streams
 
-	idlePerHost := totalConcurrent
+	idlePerHost := totalWorkers
 	if idlePerHost < 256 {
 		idlePerHost = 256
 	}
-	totalIdle := totalConcurrent * 2
+	totalIdle := totalWorkers * 2
 	if totalIdle < 512 {
 		totalIdle = 512
 	}
@@ -117,19 +118,18 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	}
 	defer chromeClient.Close()
 
-	// Apply proxy rotator to both clients
 	if proxyRotator != nil {
 		firefoxClient.SetProxyRotator(proxyRotator)
 		chromeClient.SetProxyRotator(proxyRotator)
 	}
 
-	// Split threads: half Firefox, half Chrome
-	firefoxThreads := threads / 2
-	chromeThreads := threads - firefoxThreads
+	// Split workers: half Firefox, half Chrome
+	firefoxWorkers := totalWorkers / 2
+	chromeWorkers := totalWorkers - firefoxWorkers
 
-	fmt.Printf("hedef: %s | sure: %ds | thread: %d | stream: %d | toplam: %d | method: %s\n",
-		targetURL, durSec, threads, streams, totalConcurrent, method)
-	fmt.Printf("browser: firefox=%d thread + chrome=%d thread\n", firefoxThreads, chromeThreads)
+	fmt.Printf("hedef: %s | sure: %ds | worker: %d | method: %s\n",
+		targetURL, durSec, totalWorkers, method)
+	fmt.Printf("browser: firefox=%d worker + chrome=%d worker (pipeline)\n", firefoxWorkers, chromeWorkers)
 	if proxyRotator != nil {
 		fmt.Printf("proxy: %d adet (rotate)\n", proxyRotator.Count())
 	} else if proxyArg != "" {
@@ -137,12 +137,16 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	}
 
 	// Test both browsers
-	clients := []*gofire.Client{firefoxClient, chromeClient}
-	names := []string{"firefox", "chrome"}
-	for i, c := range clients {
-		fmt.Printf("test [%s]... ", names[i])
+	for _, tc := range []struct {
+		name   string
+		client *gofire.Client
+	}{
+		{"firefox", firefoxClient},
+		{"chrome", chromeClient},
+	} {
+		fmt.Printf("test [%s]... ", tc.name)
 		testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		resp, testErr := c.DoWithContext(testCtx, method, targetURL, nil, nil)
+		resp, testErr := tc.client.DoWithContext(testCtx, method, targetURL, nil, nil)
 		testCancel()
 		if testErr != nil {
 			fmt.Printf("BASARISIZ: %v\n", testErr)
@@ -155,7 +159,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	// Pre-warm both
 	fmt.Print("baglanti isitiliyor... ")
 	warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	warmCount := threads / 4
+	warmCount := totalWorkers / 8
 	if warmCount < 4 {
 		warmCount = 4
 	}
@@ -166,6 +170,13 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	_ = chromeClient.PreConnect(warmCtx, targetURL, warmCount)
 	warmCancel()
 	fmt.Printf("%d baglanti\n", firefoxClient.ActiveConnections()+chromeClient.ActiveConnections())
+
+	// Create pipelines
+	firefoxPipeline := firefoxClient.NewPipeline(firefoxWorkers)
+	defer firefoxPipeline.Close()
+
+	chromePipeline := chromeClient.NewPipeline(chromeWorkers)
+	defer chromePipeline.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(durSec)*time.Second)
 	defer cancel()
@@ -189,79 +200,86 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	)
 
 	startTime := time.Now()
-	fmt.Printf("basliyor... %d eszamanli (firefox+chrome)\n\n", totalConcurrent)
+	fmt.Printf("basliyor... %d pipeline worker (firefox+chrome)\n\n", totalWorkers)
 
-	// Worker launcher - spawns threads for a given client
-	launchWorkers := func(wg *sync.WaitGroup, client *gofire.Client, numThreads int) {
-		for i := 0; i < numThreads; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+	// Feed pipelines continuously from feeder goroutines.
+	// Each feeder sends jobs as fast as the pipeline can consume.
+	// The pipeline's buffered channel provides backpressure.
+	var feedWg sync.WaitGroup
 
-				sem := make(chan struct{}, streams)
-				var innerWg sync.WaitGroup
+	// Result collector: reads results from pipeline and updates stats
+	collectResult := func(result *gofire.PipelineResult) {
+		totalSent.Add(1)
+		if result.Err != nil {
+			totalFailed.Add(1)
 
-				for {
-					select {
-					case <-ctx.Done():
-						innerWg.Wait()
-						return
-					default:
-					}
-
-					select {
-					case sem <- struct{}{}:
-					case <-ctx.Done():
-						innerWg.Wait()
-						return
-					}
-
-					totalSent.Add(1)
-
-					innerWg.Add(1)
-					go func() {
-						defer func() {
-							<-sem
-							innerWg.Done()
-						}()
-
-						resp, err := client.DoWithContext(ctx, method, targetURL, nil, nil)
-						if err != nil {
-							totalFailed.Add(1)
-
-							errStr := err.Error()
-							if len(errStr) > 200 {
-								errStr = errStr[:200]
-							}
-							if _, loaded := errCountMap.LoadOrStore(errStr, &atomic.Int64{}); !loaded {
-								errMu.Lock()
-								if len(recentErrs) < 5 {
-									recentErrs = append(recentErrs, errStr)
-								}
-								errMu.Unlock()
-							}
-							if val, ok := errCountMap.Load(errStr); ok {
-								val.(*atomic.Int64).Add(1)
-							}
-							return
-						}
-
-						totalSuccess.Add(1)
-						sc := resp.StatusCode()
-						val, _ := statusCodes.LoadOrStore(sc, &atomic.Int64{})
-						val.(*atomic.Int64).Add(1)
-						resp.Close()
-					}()
+			errStr := result.Err.Error()
+			if len(errStr) > 200 {
+				errStr = errStr[:200]
+			}
+			if _, loaded := errCountMap.LoadOrStore(errStr, &atomic.Int64{}); !loaded {
+				errMu.Lock()
+				if len(recentErrs) < 5 {
+					recentErrs = append(recentErrs, errStr)
 				}
-			}()
+				errMu.Unlock()
+			}
+			if val, ok := errCountMap.Load(errStr); ok {
+				val.(*atomic.Int64).Add(1)
+			}
+		} else {
+			totalSuccess.Add(1)
+			if result.Response != nil {
+				sc := result.Response.StatusCode()
+				val, _ := statusCodes.LoadOrStore(sc, &atomic.Int64{})
+				val.(*atomic.Int64).Add(1)
+				result.Response.Close()
+			}
 		}
 	}
 
-	var wg sync.WaitGroup
-	launchWorkers(&wg, firefoxClient, firefoxThreads)
-	launchWorkers(&wg, chromeClient, chromeThreads)
+	// Feeder function: sends jobs to pipeline, collects results
+	feedPipeline := func(pipeline *gofire.Pipeline, name string) {
+		defer feedWg.Done()
 
-	// Stats
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			ch := pipeline.Send(ctx, method, targetURL, nil, nil)
+
+			// Non-blocking collect in a separate goroutine would add overhead.
+			// Instead collect inline - the pipeline buffer handles backpressure.
+			select {
+			case result := <-ch:
+				collectResult(result)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+
+	// Launch feeders: multiple feeders per pipeline to keep it saturated.
+	// Each feeder is sequential (send → collect → repeat), so we need
+	// enough feeders to keep the pipeline's buffered channel full.
+	feedersPerPipeline := runtime.NumCPU()
+	if feedersPerPipeline < 4 {
+		feedersPerPipeline = 4
+	}
+
+	for i := 0; i < feedersPerPipeline; i++ {
+		feedWg.Add(1)
+		go feedPipeline(firefoxPipeline, "firefox")
+	}
+	for i := 0; i < feedersPerPipeline; i++ {
+		feedWg.Add(1)
+		go feedPipeline(chromePipeline, "chrome")
+	}
+
+	// Stats printer
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
@@ -290,7 +308,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}()
 
-	wg.Wait()
+	feedWg.Wait()
 
 	totalDuration := time.Since(startTime)
 	sent := totalSent.Load()
@@ -316,7 +334,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	fmt.Printf("ort. rps:   %.0f req/s\n", avgRPS)
 	fmt.Printf("baglanti:   %d (firefox+chrome)\n", totalConns)
 
-	// Status code dagilimi
 	hasStatus := false
 	statusCodes.Range(func(key, value interface{}) bool {
 		if !hasStatus {
@@ -327,7 +344,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		return true
 	})
 
-	// Hata mesajlari
 	errMu.Lock()
 	if len(recentErrs) > 0 {
 		fmt.Println("\nhatalar:")
