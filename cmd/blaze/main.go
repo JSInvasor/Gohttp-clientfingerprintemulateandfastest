@@ -242,7 +242,8 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	startTime := time.Now()
 	fmt.Printf("basliyor... %d worker x %d client (firefox+chrome)\n\n", actualWorkers, totalClients)
 
-	// OnResult callback - called by pipeline workers directly, zero channel overhead
+	// OnResult callback - called by pipeline workers directly.
+	// Do NOT call resp.Close() here - pipeline drains bodies asynchronously.
 	onResult := func(resp *gofire.Response, err error, latency time.Duration) {
 		totalSent.Add(1)
 		if err != nil {
@@ -268,7 +269,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 				sc := resp.StatusCode()
 				val, _ := statusCodes.LoadOrStore(sc, &atomic.Int64{})
 				val.(*atomic.Int64).Add(1)
-				resp.Close()
+				// Body drain handled by pipeline's async drain pool
 			}
 		}
 	}
