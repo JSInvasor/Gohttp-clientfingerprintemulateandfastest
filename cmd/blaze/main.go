@@ -86,27 +86,19 @@ func (cg *clientGroup) ActiveConnections() int64 {
 func run(targetURL string, durSec, threads, streams int, method, proxyArg string) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	totalWorkers := threads * streams
-
 	// Number of client instances per browser type.
-	// Each client gets its own HTTP/2 connection(s), multiplying connection count.
-	// More clients = more connections = more concurrent streams.
-	clientsPerBrowser := runtime.NumCPU()
+	// Each client gets its own HTTP/2 connection, multiplying concurrent streams.
+	// Cloudflare allows ~100-256 streams per connection, so more clients = more throughput.
+	clientsPerBrowser := threads / 2
 	if clientsPerBrowser < 4 {
 		clientsPerBrowser = 4
 	}
-	if clientsPerBrowser > 16 {
-		clientsPerBrowser = 16
+	if clientsPerBrowser > 32 {
+		clientsPerBrowser = 32
 	}
 
-	idlePerHost := totalWorkers / clientsPerBrowser
-	if idlePerHost < 256 {
-		idlePerHost = 256
-	}
-	totalIdle := idlePerHost * 2
-	if totalIdle < 512 {
-		totalIdle = 512
-	}
+	idlePerHost := 256
+	totalIdle := 1024
 
 	baseOpts := []gofire.Option{
 		gofire.WithTimeout(10 * time.Second),
@@ -148,14 +140,18 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	}
 
 	groups := make([]*clientGroup, len(browsers))
-	workersPerBrowser := totalWorkers / len(browsers)
+
+	// Workers per client: matches HTTP/2 stream capacity per connection (~100-256)
+	workersPerClient := streams
+	if workersPerClient < 50 {
+		workersPerClient = 50
+	}
+	if workersPerClient > 256 {
+		workersPerClient = 256
+	}
 
 	for bi, bs := range browsers {
 		cg := &clientGroup{name: bs.name}
-		workersPerClient := workersPerBrowser / clientsPerBrowser
-		if workersPerClient < 1 {
-			workersPerClient = 1
-		}
 
 		for i := 0; i < clientsPerBrowser; i++ {
 			c, err := gofire.Emulate(bs.profile, baseOpts...)
@@ -178,8 +174,9 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	}()
 
 	totalClients := clientsPerBrowser * len(browsers)
-	fmt.Printf("hedef: %s | sure: %ds | worker: %d | method: %s\n",
-		targetURL, durSec, totalWorkers, method)
+	actualWorkers := workersPerClient * totalClients
+	fmt.Printf("hedef: %s | sure: %ds | worker: %d (%d/client) | method: %s\n",
+		targetURL, durSec, actualWorkers, workersPerClient, method)
 	fmt.Printf("browser: %d firefox + %d chrome client (toplam %d h2 baglanti)\n",
 		clientsPerBrowser, clientsPerBrowser, totalClients)
 	if proxyRotator != nil {
@@ -241,7 +238,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	)
 
 	startTime := time.Now()
-	fmt.Printf("basliyor... %d worker x %d client (firefox+chrome)\n\n", totalWorkers, totalClients)
+	fmt.Printf("basliyor... %d worker x %d client (firefox+chrome)\n\n", actualWorkers, totalClients)
 
 	// OnResult callback - called by pipeline workers directly, zero channel overhead
 	onResult := func(resp *gofire.Response, err error, latency time.Duration) {
