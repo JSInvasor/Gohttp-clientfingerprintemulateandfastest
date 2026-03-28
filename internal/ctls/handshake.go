@@ -23,6 +23,7 @@ type handshakeState struct {
 	alpn       []string
 	skipVerify bool
 	rootCAs    *x509.CertPool
+	browser    BrowserType
 
 	km             *keyMaterial
 	suite          uint16
@@ -34,7 +35,7 @@ type handshakeState struct {
 }
 
 // handshake performs the full TLS 1.3 handshake and returns a *Conn.
-func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool) (*Conn, error) {
+func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType) (*Conn, error) {
 	km, err := generateKeyMaterial()
 	if err != nil {
 		return nil, fmt.Errorf("generate keys: %w", err)
@@ -47,14 +48,22 @@ func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool,
 		skipVerify: skipVerify,
 		rootCAs:    rootCAs,
 		km:         km,
+		browser:    browser,
 	}
 
 	return hs.run()
 }
 
 func (hs *handshakeState) run() (*Conn, error) {
-	// Send ClientHello
-	chMsg, err := buildClientHello(hs.serverName, hs.alpn, hs.km)
+	// Send ClientHello (browser-specific)
+	var chMsg []byte
+	var err error
+	switch hs.browser {
+	case BrowserChrome146:
+		chMsg, err = buildChromeClientHello(hs.serverName, hs.alpn, hs.km)
+	default:
+		chMsg, err = buildClientHello(hs.serverName, hs.alpn, hs.km)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("build client hello: %w", err)
 	}

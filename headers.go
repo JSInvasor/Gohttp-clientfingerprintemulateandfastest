@@ -97,6 +97,16 @@ func setIfEmpty(h http.Header, key, value string) {
 	}
 }
 
+// applyBrowserHeaders applies headers based on the browser profile.
+func applyBrowserHeaders(req *http.Request, browser BrowserProfile, accept, lang string) {
+	switch browser {
+	case Chrome146:
+		applyChromeHeaders(req, accept, lang)
+	default:
+		applyFirefoxHeaders(req, accept, lang)
+	}
+}
+
 // OrderHeaders returns headers sorted in Firefox 148 order.
 func OrderHeaders(h http.Header) []HeaderKV {
 	result := make([]HeaderKV, 0, len(h))
@@ -128,4 +138,86 @@ func OrderHeaders(h http.Header) []HeaderKV {
 type HeaderKV struct {
 	Key   string
 	Value string
+}
+
+// ========== Chrome 146 Headers ==========
+
+// Chrome 146 User-Agent (Windows 10 x64)
+const Chrome146UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+
+// chrome146HeaderOrder defines the exact header order Chrome 146 sends
+// in an HTTP/2 HEADERS frame (verified from tls.peet.ws capture).
+//
+// Real Chrome 146 header order:
+//
+//	:method, :authority, :scheme, :path (pseudo-headers)
+//	sec-ch-ua
+//	sec-ch-ua-mobile
+//	sec-ch-ua-platform
+//	upgrade-insecure-requests
+//	user-agent
+//	accept
+//	[content-type]    (only on POST/PUT)
+//	[content-length]  (only on POST/PUT)
+//	[origin]          (only on POST/cross-origin)
+//	[referer]         (only if referrer exists)
+//	[cookie]          (only if cookies exist)
+//	sec-fetch-site
+//	sec-fetch-mode
+//	sec-fetch-user
+//	sec-fetch-dest
+//	accept-encoding
+//	accept-language
+//	priority
+//
+// NOTE: Chrome does NOT send TE, DNT, or Sec-GPC headers.
+var chrome146HeaderOrder = []string{
+	"Sec-Ch-Ua",
+	"Sec-Ch-Ua-Mobile",
+	"Sec-Ch-Ua-Platform",
+	"Upgrade-Insecure-Requests",
+	"User-Agent",
+	"Accept",
+	"Content-Type",
+	"Content-Length",
+	"Origin",
+	"Referer",
+	"Cookie",
+	"Sec-Fetch-Site",
+	"Sec-Fetch-Mode",
+	"Sec-Fetch-User",
+	"Sec-Fetch-Dest",
+	"Accept-Encoding",
+	"Accept-Language",
+	"Priority",
+}
+
+// applyChromeHeaders sets exact Chrome 146 default headers on the request.
+func applyChromeHeaders(req *http.Request, accept, lang string) {
+	h := req.Header
+	if h == nil {
+		h = make(http.Header, 16)
+		req.Header = h
+	}
+
+	// Chrome-specific Client Hints (not present in Firefox)
+	setIfEmpty(h, "Sec-Ch-Ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`)
+	setIfEmpty(h, "Sec-Ch-Ua-Mobile", "?0")
+	setIfEmpty(h, "Sec-Ch-Ua-Platform", `"Windows"`)
+	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
+	setIfEmpty(h, "User-Agent", Chrome146UserAgent)
+	setIfEmpty(h, "Accept", accept)
+	setIfEmpty(h, "Sec-Fetch-Site", "none")
+	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
+	setIfEmpty(h, "Sec-Fetch-User", "?1")
+	setIfEmpty(h, "Sec-Fetch-Dest", "document")
+	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br, zstd")
+	setIfEmpty(h, "Accept-Language", lang)
+	setIfEmpty(h, "Priority", "u=0, i")
+
+	// NOTE: Chrome does NOT send these headers:
+	// - TE (Firefox sends TE: trailers)
+	// - DNT
+	// - Sec-GPC
+	// - Connection (not in HTTP/2)
 }

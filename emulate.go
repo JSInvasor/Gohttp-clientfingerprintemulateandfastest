@@ -10,6 +10,8 @@ type BrowserProfile int
 const (
 	// Firefox148 emulates Firefox 148 with full TLS/HTTP2/header fingerprint.
 	Firefox148 BrowserProfile = iota
+	// Chrome146 emulates Chrome 146 with full TLS/HTTP2/header fingerprint.
+	Chrome146
 )
 
 // String returns the browser profile name.
@@ -17,6 +19,8 @@ func (b BrowserProfile) String() string {
 	switch b {
 	case Firefox148:
 		return "Firefox/148.0"
+	case Chrome146:
+		return "Chrome/146.0"
 	default:
 		return "Unknown"
 	}
@@ -28,13 +32,13 @@ func (b BrowserProfile) String() string {
 // Usage:
 //
 //	client, err := gofire.Emulate(gofire.Firefox148)
-//	client, err := gofire.Emulate(gofire.Firefox148, gofire.WithProxy("socks5://..."))
+//	client, err := gofire.Emulate(gofire.Chrome146)
+//	client, err := gofire.Emulate(gofire.Chrome146, gofire.WithProxy("socks5://..."))
 func Emulate(profile BrowserProfile, opts ...Option) (*Client, error) {
 	switch profile {
-	case Firefox148:
-		// Prepend the browser profile option so user opts can override
+	case Firefox148, Chrome146:
 		allOpts := make([]Option, 0, len(opts)+1)
-		allOpts = append(allOpts, withBrowserProfile(Firefox148))
+		allOpts = append(allOpts, withBrowserProfile(profile))
 		allOpts = append(allOpts, opts...)
 		return NewClient(allOpts...)
 	default:
@@ -45,12 +49,16 @@ func Emulate(profile BrowserProfile, opts ...Option) (*Client, error) {
 // withBrowserProfile applies all settings for a specific browser profile.
 func withBrowserProfile(profile BrowserProfile) Option {
 	return func(c *clientConfig) {
+		c.browser = profile
+		c.transport.DisableCompression = true
+
 		switch profile {
 		case Firefox148:
-			c.browser = profile
 			c.acceptLanguage = "en-US,en;q=0.5"
 			c.accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-			c.transport.DisableCompression = true
+		case Chrome146:
+			c.acceptLanguage = "en-US,en;q=0.9"
+			c.accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
 		}
 	}
 }

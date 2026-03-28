@@ -31,13 +31,14 @@ import (
 //   - HTTP/2 Pseudo-header Order: :method, :path, :authority, :scheme (m,p,a,s)
 type Transport struct {
 	h1Transport *http.Transport  // HTTP/1.1 fallback
-	h2Transport *http2.Transport // HTTP/2 with Firefox settings
+	h2Transport *http2.Transport // HTTP/2 with browser settings
 
 	h2Settings  H2Settings
 	headerOrder []string
 	forceH1     bool
 	rootCAs     *x509.CertPool
 	skipVerify  bool
+	browser     BrowserProfile
 	dnscache    *dnsCache
 	connCount   atomic.Int64
 	dialer      *net.Dialer
@@ -93,13 +94,14 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		rootCAs:    cfg.RootCAs,
 		skipVerify: cfg.InsecureSkipVerify,
 		dnscache:   newDNSCache(cfg.DNSCacheTTL),
+		browser:    browser,
 	}
 
 	// Set browser-specific fingerprint
 	switch browser {
-	case Firefox148:
-		t.h2Settings = Firefox148H2Settings()
-		t.headerOrder = firefox148HeaderOrder
+	case Chrome146:
+		t.h2Settings = Chrome146H2Settings()
+		t.headerOrder = chrome146HeaderOrder
 	default:
 		t.h2Settings = Firefox148H2Settings()
 		t.headerOrder = firefox148HeaderOrder
@@ -144,62 +146,43 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	// HTTP/2 transport with FULL Firefox 148 fingerprint
-	// Akamai fingerprint: 1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s
+	// HTTP/2 transport with browser-specific fingerprint
 	if !cfg.ForceHTTP1 {
+		// Get browser-specific H2 profile
+		var h2p H2Profile
+		switch browser {
+		case Chrome146:
+			h2p = Chrome146H2Profile()
+		default:
+			h2p = Firefox148H2Profile()
+		}
+
+		// MaxReadFrameSize: use MaxFrameSize if set, otherwise use default 16384
+		maxReadFrame := t.h2Settings.MaxFrameSize
+		if maxReadFrame == 0 {
+			maxReadFrame = 16384
+		}
+
 		t.h2Transport = &http2.Transport{
-			// Use our custom ctls dialer for TLS connections with Firefox fingerprint
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *cryptotls.Config) (net.Conn, error) {
 				return t.dialTLSForH2(ctx, network, addr)
 			},
-			DisableCompression: cfg.DisableCompression,
-			AllowHTTP:          false,
-
-			// These affect Go's internal tracking (must match SETTINGS we send)
-			MaxDecoderHeaderTableSize: t.h2Settings.HeaderTableSize, // 65536
-			MaxReadFrameSize:          t.h2Settings.MaxFrameSize,    // 16384
-
-			// Custom SETTINGS frame: exact Firefox 148 order and values
-			Settings: []http2.Setting{
-				{ID: http2.SettingHeaderTableSize, Val: t.h2Settings.HeaderTableSize},    // 1:65536
-				{ID: http2.SettingEnablePush, Val: t.h2Settings.EnablePush},               // 2:0
-				{ID: http2.SettingInitialWindowSize, Val: t.h2Settings.InitialWindowSize}, // 4:131072
-				{ID: http2.SettingMaxFrameSize, Val: t.h2Settings.MaxFrameSize},           // 5:16384
-			},
-
-			// Connection-level WINDOW_UPDATE: Firefox 148 sends 12517377
-			ConnectionFlow: t.h2Settings.ConnectionWindowSize,
-
-			// Pseudo-header order: Firefox sends :method, :path, :authority, :scheme (m,p,a,s)
-			PseudoHeaderOrder: Firefox148PseudoHeaderOrder(),
-
-			// Header order: exact Firefox 148 HPACK encoding order
-			HeaderOrder: t.headerOrder,
-
-			// HEADERS frame PRIORITY: Firefox 148 sends Priority flag (0x20)
-			// with weight=42, depends_on=0, exclusive=false
+			DisableCompression:        cfg.DisableCompression,
+			AllowHTTP:                 false,
+			MaxDecoderHeaderTableSize: t.h2Settings.HeaderTableSize,
+			MaxReadFrameSize:          maxReadFrame,
+			Settings:                  buildH2Settings(t.h2Settings),
+			ConnectionFlow:            t.h2Settings.ConnectionWindowSize,
+			PseudoHeaderOrder:         h2p.PseudoHeaders,
+			HeaderOrder:               t.headerOrder,
 			HeaderPriority: http2.PriorityParam{
-				Weight: Firefox148PriorityWeight(), // 42
+				Weight:    h2p.PriorityWeight,
+				Exclusive: h2p.PriorityExclusive,
 			},
-
-			// Allow new connections when per-connection stream limit is hit.
-			// With StrictMaxConcurrentStreams=false, the transport creates new TCP
-			// connections instead of blocking when all connections are at max streams.
-			// This is critical for high RPS: if server allows 100 streams/conn,
-			// 2048 concurrent requests use ~21 connections with proper multiplexing.
 			StrictMaxConcurrentStreams: false,
-
-			// Keep-alive via PING frames.
-			// ReadIdleTimeout triggers a PING when no frames are received for this duration.
-			// This detects dead connections killed by NAT/proxy/load balancers silently,
-			// preventing requests from being sent to zombie connections.
-			ReadIdleTimeout: 15 * time.Second,
-
-			// PingTimeout closes the connection if PING response is not received in time.
-			PingTimeout: 5 * time.Second,
-
-			// WriteByteTimeout closes connections stuck on write (network issue).
-			WriteByteTimeout: 30 * time.Second,
+			ReadIdleTimeout:           15 * time.Second,
+			PingTimeout:               5 * time.Second,
+			WriteByteTimeout:          30 * time.Second,
 		}
 	}
 
@@ -243,13 +226,7 @@ func (t *Transport) dialTLSForH2(ctx context.Context, network, addr string) (net
 	return t.dialTLS(ctx, network, addr, []string{"h2", "http/1.1"})
 }
 
-// dialTLS performs TLS handshake using our custom ctls package with exact Firefox 148 ClientHello.
-// If a proxy is configured, it tunnels through the proxy via CONNECT before TLS.
-//
-// This produces the correct JA3/JA4 fingerprint:
-//
-//	JA3 Hash: 0e76c7e9d06fa0e211b1827687dd8f43
-//	JA4:      t13d1717h2_5b57614c22b0_e6dcd7ae0a9e
+// dialTLS performs TLS handshake using our custom ctls package with browser-specific ClientHello.
 func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -263,8 +240,14 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 		return nil, err
 	}
 
-	// Perform custom TLS 1.3 handshake with Firefox 148 fingerprint
-	tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs)
+	// Map browser profile to ctls browser type
+	browserType := ctls.BrowserFirefox148
+	if t.browser == Chrome146 {
+		browserType = ctls.BrowserChrome146
+	}
+
+	// Perform custom TLS 1.3 handshake with browser fingerprint
+	tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, browserType)
 	if err != nil {
 		rawConn.Close()
 		return nil, fmt.Errorf("tls handshake: %w", err)
@@ -398,7 +381,9 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 				mu.Unlock()
 				return
 			}
-			applyFirefoxHeaders(req, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "en-US,en;q=0.5")
+			// Set minimal headers for pre-warm; actual browser headers are set by the Client layer.
+			req.Header.Set("User-Agent", "Mozilla/5.0")
+			req.Header.Set("Accept", "*/*")
 
 			resp, err := t.RoundTrip(req)
 			if err != nil {
