@@ -3,6 +3,8 @@ package gofire
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +37,21 @@ type Pipeline struct {
 	Stats   PipelineStats
 	closed  atomic.Bool
 
+	// OnResult is called for every completed request (both success and error).
+	// When set, FireAndForget will invoke this callback instead of discarding results.
+	// The callback must be set before sending any requests.
+	// IMPORTANT: The callback should NOT call Response.Close() - the pipeline
+	// drains response bodies asynchronously to avoid blocking workers.
+	OnResult func(resp *Response, err error, latency time.Duration)
+
+	// Pre-built request template for FastDo path (set via SetTemplate)
+	template *http.Request
+
+	// Async body drain pool - workers hand off response bodies here
+	// so they can immediately pick up the next request
+	drainCh chan *http.Response
+	drainWg sync.WaitGroup
+
 	// Object pools to reduce GC pressure at high RPS
 	jobPool    sync.Pool
 	resultPool sync.Pool
@@ -62,13 +79,20 @@ func newPipeline(c *Client, workers int) *Pipeline {
 		workers = 1000
 	}
 
+	// Drain workers handle body reading asynchronously so request workers
+	// aren't blocked by slow response body transfers.
+	drainWorkers := workers / 2
+	if drainWorkers < 64 {
+		drainWorkers = 64
+	}
+
 	p := &Pipeline{
 		client:  c,
 		workers: workers,
 		// Large buffer prevents sender blocking under burst load.
-		// At 100k RPS with 5000 workers, each worker processes ~20 req/s,
-		// so 16x buffer gives ~1.6s of burst capacity.
 		jobCh: make(chan *pipelineJob, workers*16),
+		// Drain channel: buffered to absorb bursts of completed responses
+		drainCh: make(chan *http.Response, drainWorkers*4),
 		jobPool: sync.Pool{
 			New: func() interface{} { return &pipelineJob{} },
 		},
@@ -77,13 +101,54 @@ func newPipeline(c *Client, workers int) *Pipeline {
 		},
 	}
 
-	// Launch worker pool
+	// Launch body drain pool - these read response bodies so workers don't block
+	p.drainWg.Add(drainWorkers)
+	for i := 0; i < drainWorkers; i++ {
+		go p.drainWorker()
+	}
+
+	// Launch request worker pool
 	p.wg.Add(workers)
 	for i := 0; i < workers; i++ {
 		go p.worker()
 	}
 
 	return p
+}
+
+// SetTemplate sets a pre-built request template for FastDo path.
+// When set, workers use FastDo (direct transport.RoundTrip) instead of DoWithContext,
+// bypassing cookie jar mutex, redirect handling, URL parsing, and header building.
+func (p *Pipeline) SetTemplate(tmpl *http.Request) {
+	p.template = tmpl
+}
+
+// drainWorker reads and discards response bodies asynchronously.
+// This keeps HTTP/2 streams clean (END_STREAM not RST_STREAM) without blocking request workers.
+func (p *Pipeline) drainWorker() {
+	defer p.drainWg.Done()
+	for resp := range p.drainCh {
+		if resp != nil && resp.Body != nil {
+			io.CopyN(io.Discard, resp.Body, 256*1024) //nolint:errcheck
+			resp.Body.Close()
+		}
+	}
+}
+
+// asyncDrain hands off a response body to the drain pool for async reading.
+// The worker can immediately proceed to the next request.
+func (p *Pipeline) asyncDrain(resp *Response) {
+	if resp == nil || resp.Response == nil || resp.Response.Body == nil || resp.bodyRead {
+		return
+	}
+	select {
+	case p.drainCh <- resp.Response:
+		// Handed off to drain worker
+	default:
+		// Drain channel full - drain inline to avoid dropping
+		io.CopyN(io.Discard, resp.Response.Body, 256*1024) //nolint:errcheck
+		resp.Response.Body.Close()
+	}
 }
 
 // worker processes jobs from the channel.
@@ -94,7 +159,13 @@ func (p *Pipeline) worker() {
 		start := time.Now()
 		p.Stats.TotalSent.Add(1)
 
-		resp, err := p.client.DoWithContext(job.ctx, job.method, job.url, job.body, job.headers)
+		var resp *Response
+		var err error
+		if p.template != nil {
+			resp, err = p.client.FastDo(job.ctx, p.template)
+		} else {
+			resp, err = p.client.DoWithContext(job.ctx, job.method, job.url, job.body, job.headers)
+		}
 
 		latency := time.Since(start)
 
@@ -113,18 +184,23 @@ func (p *Pipeline) worker() {
 			select {
 			case job.result <- result:
 			default:
-				// Result channel full, discard to avoid blocking
 				if resp != nil {
-					resp.Close()
+					p.asyncDrain(resp)
 				}
 				result.Response = nil
 				result.Err = nil
 				p.resultPool.Put(result)
 			}
-		} else {
-			// No result channel - fire and forget, close response
+		} else if p.OnResult != nil {
+			// Fire and forget with callback - drain body async
+			p.OnResult(resp, err, latency)
 			if resp != nil {
-				resp.Close()
+				p.asyncDrain(resp)
+			}
+		} else {
+			// No result channel, no callback - drain async
+			if resp != nil {
+				p.asyncDrain(resp)
 			}
 		}
 
@@ -322,6 +398,9 @@ func (p *Pipeline) Close() {
 	if p.closed.CompareAndSwap(false, true) {
 		close(p.jobCh)
 		p.wg.Wait()
+		// Close drain pool after all workers are done
+		close(p.drainCh)
+		p.drainWg.Wait()
 	}
 }
 

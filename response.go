@@ -96,16 +96,17 @@ func (r *Response) JSON(v interface{}) error {
 }
 
 // Close releases the response body.
-// Uses a bounded read (256KB) to drain the body for connection reuse
-// without blocking on unexpectedly large responses.
+// Fully drains the body to avoid RST_STREAM on HTTP/2 (which WAFs detect as anomalous).
+// Real browsers always consume the full response, so we must too.
 func (r *Response) Close() {
-	if r.Response != nil && r.Response.Body != nil && !r.bodyRead {
-		// Drain up to 256KB so the connection can be reused.
-		// Larger bodies will cause the connection to be closed instead of pooled,
-		// which is acceptable - avoiding blocking is more important at high RPS.
-		io.CopyN(io.Discard, r.Response.Body, 256*1024) //nolint:errcheck
-		r.Response.Body.Close()
+	if r.Response == nil || r.Response.Body == nil || r.bodyRead {
+		return
 	}
+	// Drain body so HTTP/2 stream closes with END_STREAM (not RST_STREAM).
+	// 256KB is enough for typical HTML responses. Larger responses cause
+	// connection drop which is fine - avoiding RST_STREAM is what matters.
+	io.CopyN(io.Discard, r.Response.Body, 256*1024) //nolint:errcheck
+	r.Response.Body.Close()
 }
 
 // Headers returns the response headers.

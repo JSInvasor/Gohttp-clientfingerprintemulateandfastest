@@ -17,7 +17,7 @@ func main() {
 	}
 	defer client.Close()
 
-	url := "https://doffybee.com"
+	url := "https://2t1.online"
 	fmt.Printf("Sending single GET to %s...\n", url)
 
 	start := time.Now()
