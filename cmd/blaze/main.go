@@ -157,8 +157,8 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		totalClients += bs.clients
 	}
 	workersPerClient := (threads * streams) / totalClients
-	if workersPerClient < 50 {
-		workersPerClient = 50
+	if workersPerClient < 1 {
+		workersPerClient = 1
 	}
 
 	for bi, bs := range browsers {
