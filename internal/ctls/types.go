@@ -32,6 +32,7 @@ type BrowserType int
 const (
 	BrowserFirefox148 BrowserType = iota
 	BrowserChrome146
+	BrowserSafariIOS18
 )
 
 // TLS extension IDs

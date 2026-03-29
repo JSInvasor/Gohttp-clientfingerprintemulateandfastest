@@ -8,9 +8,11 @@ import (
 type H2Settings struct {
 	HeaderTableSize      uint32
 	EnablePush           uint32
+	MaxConcurrentStreams uint32 // 0 = not sent (Safari sends 100)
 	InitialWindowSize    uint32
 	MaxFrameSize         uint32 // 0 = not sent (Chrome omits this)
 	MaxHeaderListSize    uint32 // 0 = not sent (Firefox omits this)
+	NoRFC7540Priorities  uint32 // 0 = not sent (Safari sends 1)
 	ConnectionWindowSize uint32
 }
 
@@ -92,17 +94,67 @@ func Chrome146H2Profile() H2Profile {
 	}
 }
 
+// ========== Safari iOS 18 ==========
+
+// Safari iOS 18.7 TLS fingerprint identifiers (verified via tls.peet.ws on 2026-03-28).
+//
+// JA3 Hash: 773906b0efdefa24a7f2b8eb6985bf37
+// JA4: t13d2014h2_a09f3c656075_7f0f34a4126d
+//
+// Akamai HTTP/2 fingerprint: 2:0;3:100;4:2097152;9:1|10420225|0|m,s,a,p
+// Akamai hash: c52879e43202aeb92740be6e8c86ea96
+
+func SafariIOS18H2Settings() H2Settings {
+	return H2Settings{
+		EnablePush:           0,
+		MaxConcurrentStreams: 100,
+		InitialWindowSize:    2097152,
+		NoRFC7540Priorities:  1,
+		ConnectionWindowSize: 10420225,
+	}
+}
+
+func SafariIOS18PseudoHeaderOrder() []string {
+	return []string{":method", ":scheme", ":authority", ":path"}
+}
+
+func SafariIOS18H2Profile() H2Profile {
+	return H2Profile{
+		Settings:          SafariIOS18H2Settings(),
+		PseudoHeaders:     SafariIOS18PseudoHeaderOrder(),
+		PriorityWeight:    255, // weight 256
+		PriorityExclusive: false,
+	}
+}
+
 // buildH2Settings converts H2Settings into the ordered []http2.Setting slice.
+// The order matches what each browser sends (critical for Akamai fingerprinting).
 func buildH2Settings(s H2Settings) []http2.Setting {
 	var settings []http2.Setting
-	settings = append(settings, http2.Setting{ID: http2.SettingHeaderTableSize, Val: s.HeaderTableSize})
+
+	// Firefox/Chrome: HEADER_TABLE_SIZE first; Safari doesn't send it
+	if s.HeaderTableSize > 0 {
+		settings = append(settings, http2.Setting{ID: http2.SettingHeaderTableSize, Val: s.HeaderTableSize})
+	}
+	// ENABLE_PUSH (all browsers send this)
 	settings = append(settings, http2.Setting{ID: http2.SettingEnablePush, Val: s.EnablePush})
+	// MAX_CONCURRENT_STREAMS (Safari sends 100, others don't)
+	if s.MaxConcurrentStreams > 0 {
+		settings = append(settings, http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: s.MaxConcurrentStreams})
+	}
+	// INITIAL_WINDOW_SIZE (all browsers)
 	settings = append(settings, http2.Setting{ID: http2.SettingInitialWindowSize, Val: s.InitialWindowSize})
+	// MAX_FRAME_SIZE (Firefox sends, Chrome/Safari don't)
 	if s.MaxFrameSize > 0 {
 		settings = append(settings, http2.Setting{ID: http2.SettingMaxFrameSize, Val: s.MaxFrameSize})
 	}
+	// MAX_HEADER_LIST_SIZE (Chrome sends 262144, others don't)
 	if s.MaxHeaderListSize > 0 {
 		settings = append(settings, http2.Setting{ID: http2.SettingMaxHeaderListSize, Val: s.MaxHeaderListSize})
+	}
+	// NO_RFC7540_PRIORITIES (Safari sends 1, others don't)
+	if s.NoRFC7540Priorities > 0 {
+		settings = append(settings, http2.Setting{ID: http2.SettingNoRFC7540Priorities, Val: s.NoRFC7540Priorities})
 	}
 	return settings
 }

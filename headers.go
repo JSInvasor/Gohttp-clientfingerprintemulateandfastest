@@ -102,6 +102,8 @@ func applyBrowserHeaders(req *http.Request, browser BrowserProfile, accept, lang
 	switch browser {
 	case Chrome146:
 		applyChromeHeaders(req, accept, lang)
+	case SafariIOS18:
+		applySafariHeaders(req, accept, lang)
 	default:
 		applyFirefoxHeaders(req, accept, lang)
 	}
@@ -220,4 +222,71 @@ func applyChromeHeaders(req *http.Request, accept, lang string) {
 	// - DNT
 	// - Sec-GPC
 	// - Connection (not in HTTP/2)
+}
+
+// ========== Safari iOS 18 Headers ==========
+
+// Safari iOS 18 User-Agent (iPhone)
+const SafariIOS18UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7 Mobile/15E148 Safari/604.1"
+
+// safariIOS18HeaderOrder defines the exact header order Safari iOS 18 sends.
+// From tls.peet.ws capture:
+//
+//	:method, :scheme, :authority, :path (pseudo-headers)
+//	sec-fetch-dest
+//	user-agent
+//	accept
+//	[referer]
+//	sec-fetch-site
+//	sec-fetch-mode
+//	accept-language
+//	priority
+//	accept-encoding
+//
+// NOTE: Safari header order is unique:
+//   - sec-fetch-dest BEFORE user-agent (Chrome/Firefox put it after)
+//   - accept-encoding LAST (Firefox/Chrome put it earlier)
+//   - No sec-ch-ua (Safari doesn't support Client Hints)
+//   - No TE: trailers (Firefox-only)
+//   - No upgrade-insecure-requests
+//   - No sec-fetch-user
+var safariIOS18HeaderOrder = []string{
+	"Sec-Fetch-Dest",
+	"User-Agent",
+	"Accept",
+	"Content-Type",
+	"Content-Length",
+	"Origin",
+	"Referer",
+	"Cookie",
+	"Sec-Fetch-Site",
+	"Sec-Fetch-Mode",
+	"Accept-Language",
+	"Priority",
+	"Accept-Encoding",
+}
+
+// applySafariHeaders sets exact Safari iOS 18 default headers on the request.
+func applySafariHeaders(req *http.Request, accept, lang string) {
+	h := req.Header
+	if h == nil {
+		h = make(http.Header, 10)
+		req.Header = h
+	}
+
+	setIfEmpty(h, "Sec-Fetch-Dest", "document")
+	setIfEmpty(h, "User-Agent", SafariIOS18UserAgent)
+	setIfEmpty(h, "Accept", accept)
+	setIfEmpty(h, "Sec-Fetch-Site", "none")
+	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
+	setIfEmpty(h, "Accept-Language", lang)
+	setIfEmpty(h, "Priority", "u=0, i")
+	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br")
+
+	// NOTE: Safari does NOT send:
+	// - TE: trailers (Firefox-only)
+	// - Upgrade-Insecure-Requests (Chrome/Firefox send this)
+	// - Sec-Fetch-User (Chrome/Firefox send ?1)
+	// - Sec-Ch-Ua headers (Chrome-only)
+	// - zstd in Accept-Encoding (Safari only supports gzip, deflate, br)
 }

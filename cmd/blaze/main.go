@@ -132,6 +132,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	browsers := []browserSpec{
 		{"firefox", gofire.Firefox148},
 		{"chrome", gofire.Chrome146},
+		{"safari", gofire.SafariIOS18},
 	}
 
 	groups := make([]*clientGroup, len(browsers))
@@ -178,8 +179,8 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	actualWorkers := workersPerClient * totalClients
 	fmt.Printf("hedef: %s | sure: %ds | worker: %d (%d/client) | method: %s\n",
 		targetURL, durSec, actualWorkers, workersPerClient, method)
-	fmt.Printf("browser: %d firefox + %d chrome client (toplam %d h2 baglanti)\n",
-		clientsPerBrowser, clientsPerBrowser, totalClients)
+	fmt.Printf("browser: %d firefox + %d chrome + %d safari client (toplam %d h2 baglanti)\n",
+		clientsPerBrowser, clientsPerBrowser, clientsPerBrowser, totalClients)
 	if proxyRotator != nil {
 		fmt.Printf("proxy: %d adet (rotate)\n", proxyRotator.Count())
 	} else if proxyArg != "" {
