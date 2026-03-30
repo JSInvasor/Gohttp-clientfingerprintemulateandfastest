@@ -104,9 +104,18 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		gofire.WithDNSCacheTTL(30 * time.Minute),
 		gofire.WithIdleConnTimeout(120 * time.Second),
 		gofire.WithMaxRedirects(3),
-		gofire.WithReferer("https://www.google.com/"),
 		gofire.WithWriteBufferSize(128 * 1024),
 		gofire.WithReadBufferSize(128 * 1024),
+	}
+
+	// Per-browser referers - each browser uses a realistic search engine referer.
+	// Safari iOS: mobile Google (iPhone users almost exclusively use Google)
+	// Chrome: desktop Google (Chrome's default search engine)
+	// Firefox: DuckDuckGo (privacy-focused users prefer Firefox+DDG)
+	browserReferers := map[string]string{
+		"safari":  "https://www.google.com/search?client=safari&channel=iphone_bm",
+		"chrome":  "https://www.google.com/",
+		"firefox": "https://duckduckgo.com/",
 	}
 
 	// Detect proxy mode
@@ -164,8 +173,11 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	for bi, bs := range browsers {
 		cg := &clientGroup{name: bs.name}
 
+		// Append browser-specific referer to options
+		opts := append(baseOpts, gofire.WithReferer(browserReferers[bs.name]))
+
 		for i := 0; i < bs.clients; i++ {
-			c, err := gofire.Emulate(bs.profile, baseOpts...)
+			c, err := gofire.Emulate(bs.profile, opts...)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "hata: %s client[%d] olusturulamadi: %v\n", bs.name, i, err)
 				os.Exit(1)
