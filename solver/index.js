@@ -12,7 +12,7 @@ async function solve() {
   let browser;
   try {
     const result = await connect({
-      headless: "new",
+      headless: false,
       turnstile: true,
       args: [
         "--no-sandbox",
