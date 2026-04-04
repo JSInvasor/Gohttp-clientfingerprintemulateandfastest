@@ -21,7 +21,8 @@ import (
 
 // ANSI colors
 const (
-	green = "\033[1;32m"
+	white = "\033[1;37m"
+	gray  = "\033[38;5;245m"
 	red   = "\033[1;31m"
 	reset = "\033[0m"
 )
@@ -121,7 +122,7 @@ func solveCFChallenge(targetURL string) (cookies string, userAgent string, err e
 		return "", "", fmt.Errorf("cookie yok (status: %s)", result.Status)
 	}
 
-	fmt.Printf("%schallenge cozuldu!%s\n", green, reset)
+	fmt.Printf("%schallenge cozuldu!%s\n", white, reset)
 	return result.Cookies, result.UserAgent, nil
 }
 
@@ -165,22 +166,39 @@ func (cg *clientGroup) updateCookies(newCookies string) {
 	}
 }
 
+// browserLabel maps tag to full display name
+var browserLabel = map[string]string{
+	"Ch": "Chrome 146",
+	"FF": "Firefox 148",
+	"SF": "Safari iOS 18",
+}
+
 // formatTestResult returns the impersonate line for a browser test.
 func formatTestResult(tag string, statusCode int, err error) string {
+	label := browserLabel[tag]
+	if label == "" {
+		label = tag
+	}
+
 	if err != nil {
 		errMsg := err.Error()
-		if strings.Contains(errMsg, "tls handshake") || strings.Contains(errMsg, "handshake") {
-			return fmt.Sprintf("%sImpersonate %s > tls handshake failed%s", red, tag, reset)
+		var reason string
+		switch {
+		case strings.Contains(errMsg, "tls handshake") || strings.Contains(errMsg, "handshake"):
+			reason = "tls handshake failed"
+		case strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "Timeout"):
+			reason = "timeout"
+		case strings.Contains(errMsg, "connection refused"):
+			reason = "connection refused"
+		default:
+			reason = errMsg
+			if len(reason) > 80 {
+				reason = reason[:80]
+			}
 		}
-		if strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "Timeout") {
-			return fmt.Sprintf("%sImpersonate %s > timeout%s", red, tag, reset)
-		}
-		if strings.Contains(errMsg, "connection refused") {
-			return fmt.Sprintf("%sImpersonate %s > connection refused%s", red, tag, reset)
-		}
-		return fmt.Sprintf("%sImpersonate %s > %s%s", red, tag, errMsg, reset)
+		return fmt.Sprintf("%sImpersonate %s %s>%s %s%s%s", white, label, gray, reset, red, reason, reset)
 	}
-	return fmt.Sprintf("%sImpersonate %s > %d%s", green, tag, statusCode, reset)
+	return fmt.Sprintf("%sImpersonate %s %s>%s %s%d%s", white, label, gray, reset, white, statusCode, reset)
 }
 
 func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies, solvedUA string, solveEnabled bool) {
