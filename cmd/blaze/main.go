@@ -21,9 +21,9 @@ import (
 
 // ANSI colors
 const (
-	white = "\033[1;37m"
+	white = "\033[37m"
 	gray  = "\033[38;5;245m"
-	red   = "\033[1;31m"
+	red   = "\033[31m"
 	reset = "\033[0m"
 )
 
@@ -477,8 +477,34 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}()
 	}
 
-	// Silent - no stats during run
+	// RPS stats
+	startTime := time.Now()
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		var lastSent int64
+		var peakRPS int64
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sent := totalSent.Load()
+				elapsed := time.Since(startTime).Seconds()
+				rps := sent - lastSent
+				lastSent = sent
+				if rps > peakRPS {
+					peakRPS = rps
+				}
+				fmt.Printf("\r%ssent:%d rps:%d peak:%d %.0fs%s   ",
+					white, sent, rps, peakRPS, elapsed, reset)
+			}
+		}
+	}()
+
 	feedWg.Wait()
+	fmt.Println()
 
 	// Only show errors on stop
 	errMu.Lock()
