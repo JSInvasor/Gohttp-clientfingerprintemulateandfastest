@@ -129,7 +129,7 @@ func (p *Pipeline) drainWorker() {
 	defer p.drainWg.Done()
 	for resp := range p.drainCh {
 		if resp != nil && resp.Body != nil {
-			io.CopyN(io.Discard, resp.Body, 256*1024) //nolint:errcheck
+			io.CopyN(io.Discard, resp.Body, 64*1024) //nolint:errcheck
 			resp.Body.Close()
 		}
 	}
@@ -146,7 +146,7 @@ func (p *Pipeline) asyncDrain(resp *Response) {
 		// Handed off to drain worker
 	default:
 		// Drain channel full - drain inline to avoid dropping
-		io.CopyN(io.Discard, resp.Response.Body, 256*1024) //nolint:errcheck
+		io.CopyN(io.Discard, resp.Response.Body, 64*1024) //nolint:errcheck
 		resp.Response.Body.Close()
 	}
 }

@@ -105,7 +105,7 @@ func (r *Response) Close() {
 	// Drain body so HTTP/2 stream closes with END_STREAM (not RST_STREAM).
 	// 256KB is enough for typical HTML responses. Larger responses cause
 	// connection drop which is fine - avoiding RST_STREAM is what matters.
-	io.CopyN(io.Discard, r.Response.Body, 256*1024) //nolint:errcheck
+	io.CopyN(io.Discard, r.Response.Body, 64*1024) //nolint:errcheck
 	r.Response.Body.Close()
 }
 
