@@ -45,7 +45,8 @@ type Pipeline struct {
 	OnResult func(resp *Response, err error, latency time.Duration)
 
 	// Pre-built request template for FastDo path (set via SetTemplate)
-	template *http.Request
+	// Uses atomic.Pointer for lock-free concurrent access during cookie refresh.
+	template atomic.Pointer[http.Request]
 
 	// Async body drain pool - workers hand off response bodies here
 	// so they can immediately pick up the next request
@@ -120,7 +121,7 @@ func newPipeline(c *Client, workers int) *Pipeline {
 // When set, workers use FastDo (direct transport.RoundTrip) instead of DoWithContext,
 // bypassing cookie jar mutex, redirect handling, URL parsing, and header building.
 func (p *Pipeline) SetTemplate(tmpl *http.Request) {
-	p.template = tmpl
+	p.template.Store(tmpl)
 }
 
 // drainWorker reads and discards response bodies asynchronously.
@@ -161,8 +162,8 @@ func (p *Pipeline) worker() {
 
 		var resp *Response
 		var err error
-		if p.template != nil {
-			resp, err = p.client.FastDo(job.ctx, p.template)
+		if tmpl := p.template.Load(); tmpl != nil {
+			resp, err = p.client.FastDo(job.ctx, tmpl)
 		} else {
 			resp, err = p.client.DoWithContext(job.ctx, job.method, job.url, job.body, job.headers)
 		}

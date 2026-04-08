@@ -161,8 +161,12 @@ func (cg *clientGroup) ActiveConnections() int64 {
 }
 
 func (cg *clientGroup) updateCookies(newCookies string) {
-	for _, tmpl := range cg.templates {
-		tmpl.Header.Set("Cookie", newCookies)
+	for i, tmpl := range cg.templates {
+		// Clone the template and set new cookie - atomic swap, no race.
+		newTmpl := tmpl.Clone(tmpl.Context())
+		newTmpl.Header.Set("Cookie", newCookies)
+		cg.templates[i] = newTmpl
+		cg.pipelines[i].SetTemplate(newTmpl)
 	}
 }
 
