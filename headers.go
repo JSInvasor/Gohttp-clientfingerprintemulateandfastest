@@ -4,8 +4,13 @@ import (
 	"net/http"
 )
 
-// Firefox 148 User-Agent (Windows 10 x64)
-const Firefox148UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0"
+// Firefox150UserAgent is the User-Agent string sent by Firefox 150 on Windows 10 x64.
+const Firefox150UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
+
+// Firefox148UserAgent is kept for backward compatibility. It now resolves to the
+// Firefox 150 User-Agent because the underlying TLS/H2 fingerprint matches that
+// release.
+const Firefox148UserAgent = Firefox150UserAgent
 
 // firefox148HeaderOrder defines the exact header order Firefox 148 sends
 // in an HTTP/2 HEADERS frame (verified from tls.peet.ws capture).
@@ -73,7 +78,7 @@ func applyFirefoxHeaders(req *http.Request, accept, lang string) {
 		req.Header = h
 	}
 
-	setIfEmpty(h, "User-Agent", Firefox148UserAgent)
+	setIfEmpty(h, "User-Agent", Firefox150UserAgent)
 	setIfEmpty(h, "Accept", accept)
 	setIfEmpty(h, "Accept-Language", lang)
 	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br, zstd")
