@@ -243,11 +243,11 @@ func applyChromeHeaders(req *http.Request, accept, lang string) {
 
 // ========== Safari iOS 18 Headers ==========
 
-// Safari iOS 18 User-Agent (iPhone)
-const SafariIOS18UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7 Mobile/15E148 Safari/604.1"
+// SafariIOS18UserAgent is the User-Agent string sent by Safari on iPhone with iOS 18.7.5.
+const SafariIOS18UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7.5 Mobile/15E148 Safari/604.1"
 
 // safariIOS18HeaderOrder defines the exact header order Safari iOS 18 sends.
-// From tls.peet.ws capture:
+// Verified against a real Safari iOS 18.7.5 capture from tls.peet.ws:
 //
 //	:method, :scheme, :authority, :path (pseudo-headers)
 //	sec-fetch-dest
@@ -262,15 +262,15 @@ const SafariIOS18UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7_1 like Mac
 //
 // NOTE: Safari header order is unique:
 //   - sec-fetch-dest BEFORE user-agent (Chrome/Firefox put it after)
-//   - upgrade-insecure-requests between user-agent and accept
 //   - accept-encoding LAST (Firefox/Chrome put it earlier)
+//   - No upgrade-insecure-requests (Apple stopped sending it on top-level
+//     navigations; Chrome/Firefox still send it)
 //   - No sec-ch-ua (Safari doesn't support Client Hints)
 //   - No TE: trailers (Firefox-only)
 //   - No sec-fetch-user
 var safariIOS18HeaderOrder = []string{
 	"Sec-Fetch-Dest",
 	"User-Agent",
-	"Upgrade-Insecure-Requests",
 	"Accept",
 	"Content-Type",
 	"Content-Length",
@@ -294,7 +294,6 @@ func applySafariHeaders(req *http.Request, accept, lang string) {
 
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
 	setIfEmpty(h, "User-Agent", SafariIOS18UserAgent)
-	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "Accept", accept)
 	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(h))
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
@@ -302,7 +301,8 @@ func applySafariHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "Priority", "u=0, i")
 	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br")
 
-	// NOTE: Safari does NOT send:
+	// NOTE: Safari iOS 18 does NOT send:
+	// - Upgrade-Insecure-Requests (Apple stopped sending on top-level navs)
 	// - TE: trailers (Firefox-only)
 	// - Sec-Fetch-User (Chrome/Firefox send ?1)
 	// - Sec-Ch-Ua headers (Chrome-only)
