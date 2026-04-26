@@ -129,10 +129,11 @@ class PoolSlot {
       this.browser = result.browser;
       this.page = result.page;
 
-      // Match blaze's emulated Chrome 146 UA exactly. UAM frequently binds
+      // Match blaze's emulated Chrome 147 UA exactly. UAM frequently binds
       // cf_clearance to UA, so any drift between the solver browser's UA
       // and the gofire client's UA invalidates the cookie immediately.
-      const targetUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+      const targetUA = process.env.SOLVER_UA ||
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
       try { await this.page.setUserAgent(targetUA); } catch {}
 
       // Mild stealth boost on top of puppeteer-real-browser's existing patches.

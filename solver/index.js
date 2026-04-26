@@ -30,9 +30,9 @@ async function solve() {
     browser = result.browser;
     const page = result.page;
 
-    // Force Chrome 146 User-Agent (matches blaze's Chrome 146 TLS fingerprint)
+    // Force Chrome 147 User-Agent (matches blaze's Chrome 147 TLS fingerprint)
     await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
     );
 
     // Navigate to target and wait for challenge to resolve

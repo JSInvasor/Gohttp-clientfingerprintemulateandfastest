@@ -171,7 +171,7 @@ func (cg *clientGroup) updateCookies(newCookies string) {
 
 // browserLabel maps tag to full display name
 var browserLabel = map[string]string{
-	"Ch": "Chrome 146",
+	"Ch": "Chrome 147",
 	"FF": "Firefox 150",
 	"SF": "Safari iOS 18",
 }
@@ -273,7 +273,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 
 	if solvedCookies != "" {
 		browsers = []browserSpec{
-			{"chrome", "Ch", gofire.Chrome146, totalTargetClients},
+			{"chrome", "Ch", gofire.Chrome147, totalTargetClients},
 		}
 		if solvedUA != "" {
 			baseOpts = append(baseOpts, gofire.WithUserAgent(solvedUA))
@@ -293,7 +293,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}
 		browsers = []browserSpec{
 			{"firefox", "FF", gofire.Firefox150, firefoxClients},
-			{"chrome", "Ch", gofire.Chrome146, chromeClients},
+			{"chrome", "Ch", gofire.Chrome147, chromeClients},
 			{"safari", "SF", gofire.SafariIOS18, safariClients},
 		}
 	}
