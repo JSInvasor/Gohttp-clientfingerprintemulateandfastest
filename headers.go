@@ -80,7 +80,7 @@ func applyFirefoxHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
-	setIfEmpty(h, "Sec-Fetch-Site", "same-origin")
+	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(h))
 	setIfEmpty(h, "Sec-Fetch-User", "?1")
 	setIfEmpty(h, "Priority", "u=0, i")
 	setIfEmpty(h, "TE", "trailers")
@@ -95,6 +95,18 @@ func setIfEmpty(h http.Header, key, value string) {
 	if h.Get(key) == "" {
 		h.Set(key, value)
 	}
+}
+
+// secFetchSiteFor returns the correct Sec-Fetch-Site value for a navigation
+// based on whether a Referer is present. Real browsers send "none" for
+// address-bar/bookmark navigations (no referrer) and "same-origin" once a
+// referrer chain exists. Hardcoding "same-origin" on a referer-less first
+// request is a known bot signal that Cloudflare scores against you.
+func secFetchSiteFor(h http.Header) string {
+	if h.Get("Referer") == "" {
+		return "none"
+	}
+	return "same-origin"
 }
 
 // applyBrowserHeaders applies headers based on the browser profile.
@@ -209,7 +221,7 @@ func applyChromeHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "User-Agent", Chrome146UserAgent)
 	setIfEmpty(h, "Accept", accept)
-	setIfEmpty(h, "Sec-Fetch-Site", "same-origin")
+	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(h))
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
 	setIfEmpty(h, "Sec-Fetch-User", "?1")
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
@@ -279,7 +291,7 @@ func applySafariHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "User-Agent", SafariIOS18UserAgent)
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "Accept", accept)
-	setIfEmpty(h, "Sec-Fetch-Site", "same-origin")
+	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(h))
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
 	setIfEmpty(h, "Accept-Language", lang)
 	setIfEmpty(h, "Priority", "u=0, i")
