@@ -45,7 +45,8 @@ type Pipeline struct {
 	OnResult func(resp *Response, err error, latency time.Duration)
 
 	// Pre-built request template for FastDo path (set via SetTemplate)
-	template *http.Request
+	// Uses atomic.Pointer for lock-free concurrent access during cookie refresh.
+	template atomic.Pointer[http.Request]
 
 	// Async body drain pool - workers hand off response bodies here
 	// so they can immediately pick up the next request
@@ -120,16 +121,22 @@ func newPipeline(c *Client, workers int) *Pipeline {
 // When set, workers use FastDo (direct transport.RoundTrip) instead of DoWithContext,
 // bypassing cookie jar mutex, redirect handling, URL parsing, and header building.
 func (p *Pipeline) SetTemplate(tmpl *http.Request) {
-	p.template = tmpl
+	p.template.Store(tmpl)
 }
 
 // drainWorker reads and discards response bodies asynchronously.
 // This keeps HTTP/2 streams clean (END_STREAM not RST_STREAM) without blocking request workers.
+//
+// Drain reads to EOF (unbounded) so the stream closes via END_STREAM. Truncating
+// the read causes net/http2 to send RST_STREAM, which Cloudflare/Akamai score as
+// an "abusive client" signal — defeats the purpose of fingerprint emulation.
+// Drain workers run in their own pool, so unbounded reads here do not block
+// request workers.
 func (p *Pipeline) drainWorker() {
 	defer p.drainWg.Done()
 	for resp := range p.drainCh {
 		if resp != nil && resp.Body != nil {
-			io.CopyN(io.Discard, resp.Body, 64*1024) //nolint:errcheck
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
 			resp.Body.Close()
 		}
 	}
@@ -145,8 +152,11 @@ func (p *Pipeline) asyncDrain(resp *Response) {
 	case p.drainCh <- resp.Response:
 		// Handed off to drain worker
 	default:
-		// Drain channel full - drain inline to avoid dropping
-		io.CopyN(io.Discard, resp.Response.Body, 64*1024) //nolint:errcheck
+		// Drain channel full - drain inline up to 1MB (covers most HTML pages
+		// without blocking the worker too long). If the body is larger, the
+		// remainder is RST'd; this is the overload-relief path, not the steady
+		// state. Tune drain pool size if this triggers often.
+		io.CopyN(io.Discard, resp.Response.Body, 1<<20) //nolint:errcheck
 		resp.Response.Body.Close()
 	}
 }
@@ -161,8 +171,8 @@ func (p *Pipeline) worker() {
 
 		var resp *Response
 		var err error
-		if p.template != nil {
-			resp, err = p.client.FastDo(job.ctx, p.template)
+		if tmpl := p.template.Load(); tmpl != nil {
+			resp, err = p.client.FastDo(job.ctx, tmpl)
 		} else {
 			resp, err = p.client.DoWithContext(job.ctx, job.method, job.url, job.body, job.headers)
 		}

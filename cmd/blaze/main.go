@@ -161,15 +161,19 @@ func (cg *clientGroup) ActiveConnections() int64 {
 }
 
 func (cg *clientGroup) updateCookies(newCookies string) {
-	for _, tmpl := range cg.templates {
-		tmpl.Header.Set("Cookie", newCookies)
+	for i, tmpl := range cg.templates {
+		// Clone the template and set new cookie - atomic swap, no race.
+		newTmpl := tmpl.Clone(tmpl.Context())
+		newTmpl.Header.Set("Cookie", newCookies)
+		cg.templates[i] = newTmpl
+		cg.pipelines[i].SetTemplate(newTmpl)
 	}
 }
 
 // browserLabel maps tag to full display name
 var browserLabel = map[string]string{
 	"Ch": "Chrome 146",
-	"FF": "Firefox 148",
+	"FF": "Firefox 150",
 	"SF": "Safari iOS 18",
 }
 
@@ -212,13 +216,21 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		totalTargetClients = 10
 	}
 
+	// MaxConnsPerHost cap. With HTTP/2 each connection multiplexes ~100 streams,
+	// so we don't need a connection per worker. Capping at 2x the idle pool size
+	// gives us burst headroom (new dials block briefly under spikes) without
+	// letting the client open thousands of TCP sockets per second - which
+	// Cloudflare/Akamai score as connection flooding and rate-limit.
+	const idlePerHost = 256
+	const maxPerHost = idlePerHost * 2
+
 	baseOpts := []gofire.Option{
 		gofire.WithTimeout(10 * time.Second),
 		gofire.WithTLSHandshakeTimeout(8 * time.Second),
 		gofire.WithDialTimeout(8 * time.Second),
-		gofire.WithMaxIdleConnsPerHost(256),
+		gofire.WithMaxIdleConnsPerHost(idlePerHost),
 		gofire.WithMaxIdleConns(1024),
-		gofire.WithMaxConnsPerHost(0),
+		gofire.WithMaxConnsPerHost(maxPerHost),
 		gofire.WithDNSCacheTTL(30 * time.Minute),
 		gofire.WithIdleConnTimeout(120 * time.Second),
 		gofire.WithMaxRedirects(3),
@@ -281,7 +293,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 			firefoxClients = 1
 		}
 		browsers = []browserSpec{
-			{"firefox", "FF", gofire.Firefox148, firefoxClients},
+			{"firefox", "FF", gofire.Firefox150, firefoxClients},
 			{"chrome", "Ch", gofire.Chrome146, chromeClients},
 			{"safari", "SF", gofire.SafariIOS18, safariClients},
 		}

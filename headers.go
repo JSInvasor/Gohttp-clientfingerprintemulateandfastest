@@ -4,8 +4,13 @@ import (
 	"net/http"
 )
 
-// Firefox 148 User-Agent (Windows 10 x64)
-const Firefox148UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0"
+// Firefox150UserAgent is the User-Agent string sent by Firefox 150 on Windows 10 x64.
+const Firefox150UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
+
+// Firefox148UserAgent is kept for backward compatibility. It now resolves to the
+// Firefox 150 User-Agent because the underlying TLS/H2 fingerprint matches that
+// release.
+const Firefox148UserAgent = Firefox150UserAgent
 
 // firefox148HeaderOrder defines the exact header order Firefox 148 sends
 // in an HTTP/2 HEADERS frame (verified from tls.peet.ws capture).
@@ -73,14 +78,14 @@ func applyFirefoxHeaders(req *http.Request, accept, lang string) {
 		req.Header = h
 	}
 
-	setIfEmpty(h, "User-Agent", Firefox148UserAgent)
+	setIfEmpty(h, "User-Agent", Firefox150UserAgent)
 	setIfEmpty(h, "Accept", accept)
 	setIfEmpty(h, "Accept-Language", lang)
 	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br, zstd")
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
-	setIfEmpty(h, "Sec-Fetch-Site", "none")
+	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(h))
 	setIfEmpty(h, "Sec-Fetch-User", "?1")
 	setIfEmpty(h, "Priority", "u=0, i")
 	setIfEmpty(h, "TE", "trailers")
@@ -95,6 +100,18 @@ func setIfEmpty(h http.Header, key, value string) {
 	if h.Get(key) == "" {
 		h.Set(key, value)
 	}
+}
+
+// secFetchSiteFor returns the correct Sec-Fetch-Site value for a navigation
+// based on whether a Referer is present. Real browsers send "none" for
+// address-bar/bookmark navigations (no referrer) and "same-origin" once a
+// referrer chain exists. Hardcoding "same-origin" on a referer-less first
+// request is a known bot signal that Cloudflare scores against you.
+func secFetchSiteFor(h http.Header) string {
+	if h.Get("Referer") == "" {
+		return "none"
+	}
+	return "same-origin"
 }
 
 // applyBrowserHeaders applies headers based on the browser profile.
@@ -209,7 +226,7 @@ func applyChromeHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "User-Agent", Chrome146UserAgent)
 	setIfEmpty(h, "Accept", accept)
-	setIfEmpty(h, "Sec-Fetch-Site", "none")
+	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(h))
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
 	setIfEmpty(h, "Sec-Fetch-User", "?1")
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
@@ -279,7 +296,7 @@ func applySafariHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "User-Agent", SafariIOS18UserAgent)
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "Accept", accept)
-	setIfEmpty(h, "Sec-Fetch-Site", "none")
+	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(h))
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
 	setIfEmpty(h, "Accept-Language", lang)
 	setIfEmpty(h, "Priority", "u=0, i")

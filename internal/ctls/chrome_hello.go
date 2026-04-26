@@ -3,6 +3,7 @@ package ctls
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"math/big"
 )
 
 // Chrome 146 ClientHello builder.
@@ -131,77 +132,75 @@ func buildChromeClientHello(serverName string, alpn []string, km *keyMaterial) (
 // 16. status_request (5)
 // 17. session_ticket (35)
 // 18. GREASE
+// chromeExt is one extension entry pending serialization.
+type chromeExt struct {
+	typ  uint16
+	data []byte
+}
+
 func buildChromeExtensions(serverName string, alpn []string, km *keyMaterial, gs greaseSet) ([]byte, error) {
-	var out []byte
-
-	// 1. GREASE extension (empty)
-	out = appendExt(out, gs.extFirst, []byte{0x00})
-
-	// 2. psk_key_exchange_modes (45) - psk_dhe_ke
-	out = appendExt(out, extPSKKeyExchangeModes, []byte{1, pskModePSKDHE})
-
-	// 3. ec_point_formats (11) - uncompressed
-	out = appendExt(out, extECPointFormats, []byte{1, 0x00})
-
-	// 4. key_share (51) - GREASE + X25519MLKEM768 + X25519
 	keyShareData, err := buildChromeKeyShare(km, gs)
 	if err != nil {
 		return nil, err
 	}
-	out = appendExt(out, extKeyShare, keyShareData)
-
-	// 5. compress_certificate (27) - brotli only
-	out = appendExt(out, extCompressCertificate, []byte{
-		0x02,       // list length: 2 bytes
-		0x00, 0x02, // brotli
-	})
-
-	// 6. extended_master_secret (23) - empty
-	out = appendExt(out, extExtendedMasterSecret, nil)
-
-	// 7. supported_versions (43) - GREASE + TLS 1.3 + TLS 1.2
-	out = appendExt(out, extSupportedVersions, buildChromeSupportedVersions(gs))
-
-	// 8. signed_certificate_timestamp (18) - empty
-	out = appendExt(out, extSCT, nil)
-
-	// 9. renegotiation_info (65281) - empty renegotiated_connection
-	out = appendExt(out, extRenegotiationInfo, []byte{0x00})
-
-	// 10. ALPN (16)
-	out = appendExt(out, extALPN, buildALPN(alpn))
-
-	// 11. server_name (0)
-	out = appendExt(out, extServerName, buildSNI(serverName))
-
-	// 12. supported_groups (10) - GREASE + X25519MLKEM768 + X25519 + P-256 + P-384
-	out = appendExt(out, extSupportedGroups, buildChromeSupportedGroups(gs))
-
-	// 13. application_settings / ALPS (17613)
-	out = appendExt(out, extALPS, buildALPS(alpn))
-
-	// 14. signature_algorithms (13)
-	out = appendExt(out, extSignatureAlgorithms, buildChromeSigAlgs())
-
-	// 15. encrypted_client_hello / ECH GREASE (65037)
 	echGrease, err := buildECHGrease()
 	if err != nil {
 		return nil, err
 	}
-	out = appendExt(out, extECH, echGrease)
 
-	// 16. status_request (5) - OCSP stapling
-	out = appendExt(out, extStatusRequest, buildStatusRequest())
+	// Middle extensions - shuffled per ClientHello to match Chrome 110+ behavior.
+	// Real Chrome (BoringSSL tls_extension_permutation_enabled, default-on since
+	// 110) randomizes extension order on every connection so each request emits
+	// a different JA3 hash. A fixed order produces zero JA3 entropy across
+	// connections, which Cloudflare/Akamai score as a strong bot signal.
+	// JA4 is unaffected (it sorts extensions before hashing).
+	middle := []chromeExt{
+		{extPSKKeyExchangeModes, []byte{1, pskModePSKDHE}},
+		{extECPointFormats, []byte{1, 0x00}},
+		{extKeyShare, keyShareData},
+		{extCompressCertificate, []byte{0x02, 0x00, 0x02}}, // brotli only
+		{extExtendedMasterSecret, nil},
+		{extSupportedVersions, buildChromeSupportedVersions(gs)},
+		{extSCT, nil},
+		{extRenegotiationInfo, []byte{0x00}},
+		{extALPN, buildALPN(alpn)},
+		{extServerName, buildSNI(serverName)},
+		{extSupportedGroups, buildChromeSupportedGroups(gs)},
+		{extALPS, buildALPS(alpn)},
+		{extSignatureAlgorithms, buildChromeSigAlgs()},
+		{extECH, echGrease},
+		{extStatusRequest, buildStatusRequest()},
+		{extSessionTicket, nil},
+	}
+	if err := shuffleChromeExts(middle); err != nil {
+		return nil, err
+	}
 
-	// 17. session_ticket (35) - empty
-	out = appendExt(out, extSessionTicket, nil)
-
-	// 18. GREASE extension (empty)
+	var out []byte
+	// First GREASE: pinned at index 0.
+	out = appendExt(out, gs.extFirst, []byte{0x00})
+	for _, e := range middle {
+		out = appendExt(out, e.typ, e.data)
+	}
+	// Last GREASE: pinned at the end. (pre_shared_key would have to come after
+	// this on a resumed session per RFC 8446, but we don't send PSK on initial
+	// connections, so the trailing GREASE is the final extension.)
 	out = appendExt(out, gs.extLast, []byte{0x00})
 
-	// NOTE: pre_shared_key (41) is NOT sent on initial connections (no session to resume).
-
 	return out, nil
+}
+
+// shuffleChromeExts shuffles s in place using crypto/rand (Fisher-Yates).
+func shuffleChromeExts(s []chromeExt) error {
+	for i := len(s) - 1; i > 0; i-- {
+		bn, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		if err != nil {
+			return err
+		}
+		j := int(bn.Int64())
+		s[i], s[j] = s[j], s[i]
+	}
+	return nil
 }
 
 // buildChromeKeyShare builds key_share with GREASE + X25519MLKEM768 + X25519.
