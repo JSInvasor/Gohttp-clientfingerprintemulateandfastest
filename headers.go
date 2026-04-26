@@ -117,7 +117,7 @@ func secFetchSiteFor(h http.Header) string {
 // applyBrowserHeaders applies headers based on the browser profile.
 func applyBrowserHeaders(req *http.Request, browser BrowserProfile, accept, lang string) {
 	switch browser {
-	case Chrome146:
+	case Chrome147:
 		applyChromeHeaders(req, accept, lang)
 	case SafariIOS18:
 		applySafariHeaders(req, accept, lang)
@@ -161,8 +161,24 @@ type HeaderKV struct {
 
 // ========== Chrome 146 Headers ==========
 
-// Chrome 146 User-Agent (Windows 10 x64)
-const Chrome146UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+// Chrome147UserAgent is the User-Agent string sent by Chrome 147 on Windows 10 x64.
+const Chrome147UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+
+// Chrome146UserAgent is kept for backward compatibility. It now resolves to
+// the Chrome 147 User-Agent because the underlying TLS/H2 fingerprint matches
+// that release (only UA + sec-ch-ua brand list moved).
+const Chrome146UserAgent = Chrome147UserAgent
+
+// Chrome147SecChUa is the sec-ch-ua header value for Chrome 147 on Windows.
+// Chrome rotates the "Not A Brand" entry per major version using a deterministic
+// algorithm, so this string is version-bound. Chrome 147 specifically emits:
+//
+//	"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"
+//
+// Note that the brand strings differ between versions (e.g. Chrome 146 used
+// "Not-A.Brand";v="24"). UAM/bot scoring systems compare this header to the
+// UA major version - drift here is a fake-Chrome signal.
+const Chrome147SecChUa = `"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"`
 
 // chrome146HeaderOrder defines the exact header order Chrome 146 sends
 // in an HTTP/2 HEADERS frame (verified from tls.peet.ws capture).
@@ -220,11 +236,11 @@ func applyChromeHeaders(req *http.Request, accept, lang string) {
 	}
 
 	// Chrome-specific Client Hints (not present in Firefox)
-	setIfEmpty(h, "Sec-Ch-Ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`)
+	setIfEmpty(h, "Sec-Ch-Ua", Chrome147SecChUa)
 	setIfEmpty(h, "Sec-Ch-Ua-Mobile", "?0")
 	setIfEmpty(h, "Sec-Ch-Ua-Platform", `"Windows"`)
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
-	setIfEmpty(h, "User-Agent", Chrome146UserAgent)
+	setIfEmpty(h, "User-Agent", Chrome147UserAgent)
 	setIfEmpty(h, "Accept", accept)
 	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(h))
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
@@ -243,11 +259,11 @@ func applyChromeHeaders(req *http.Request, accept, lang string) {
 
 // ========== Safari iOS 18 Headers ==========
 
-// Safari iOS 18 User-Agent (iPhone)
-const SafariIOS18UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7 Mobile/15E148 Safari/604.1"
+// SafariIOS18UserAgent is the User-Agent string sent by Safari on iPhone with iOS 18.7.5.
+const SafariIOS18UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7.5 Mobile/15E148 Safari/604.1"
 
 // safariIOS18HeaderOrder defines the exact header order Safari iOS 18 sends.
-// From tls.peet.ws capture:
+// Verified against a real Safari iOS 18.7.5 capture from tls.peet.ws:
 //
 //	:method, :scheme, :authority, :path (pseudo-headers)
 //	sec-fetch-dest
@@ -262,15 +278,15 @@ const SafariIOS18UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7_1 like Mac
 //
 // NOTE: Safari header order is unique:
 //   - sec-fetch-dest BEFORE user-agent (Chrome/Firefox put it after)
-//   - upgrade-insecure-requests between user-agent and accept
 //   - accept-encoding LAST (Firefox/Chrome put it earlier)
+//   - No upgrade-insecure-requests (Apple stopped sending it on top-level
+//     navigations; Chrome/Firefox still send it)
 //   - No sec-ch-ua (Safari doesn't support Client Hints)
 //   - No TE: trailers (Firefox-only)
 //   - No sec-fetch-user
 var safariIOS18HeaderOrder = []string{
 	"Sec-Fetch-Dest",
 	"User-Agent",
-	"Upgrade-Insecure-Requests",
 	"Accept",
 	"Content-Type",
 	"Content-Length",
@@ -294,7 +310,6 @@ func applySafariHeaders(req *http.Request, accept, lang string) {
 
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
 	setIfEmpty(h, "User-Agent", SafariIOS18UserAgent)
-	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "Accept", accept)
 	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(h))
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
@@ -302,7 +317,8 @@ func applySafariHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "Priority", "u=0, i")
 	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br")
 
-	// NOTE: Safari does NOT send:
+	// NOTE: Safari iOS 18 does NOT send:
+	// - Upgrade-Insecure-Requests (Apple stopped sending on top-level navs)
 	// - TE: trailers (Firefox-only)
 	// - Sec-Fetch-User (Chrome/Firefox send ?1)
 	// - Sec-Ch-Ua headers (Chrome-only)
