@@ -162,11 +162,13 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 			h2p = Firefox148H2Profile()
 		}
 
-		// MaxReadFrameSize: use MaxFrameSize if set, otherwise use default 16384
-		maxReadFrame := t.h2Settings.MaxFrameSize
-		if maxReadFrame == 0 {
-			maxReadFrame = 16384
-		}
+		// MaxReadFrameSize controls the framer's accept cap (NOT what we advertise).
+		// We advertise the browser's MAX_FRAME_SIZE via the custom Settings slice below,
+		// but real browsers tolerate frames larger than they advertise. Setting the cap
+		// to 1MB matches Go stdlib's defaultMaxReadFrameSize and prevents
+		// ErrFrameTooLarge ("http2: frame too large") on CDNs that occasionally
+		// emit slightly oversized DATA/HEADERS frames under load.
+		const framerAcceptCap = 1 << 20 // 1MB
 
 		t.h2Transport = &http2.Transport{
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *cryptotls.Config) (net.Conn, error) {
@@ -175,7 +177,7 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 			DisableCompression:        cfg.DisableCompression,
 			AllowHTTP:                 false,
 			MaxDecoderHeaderTableSize: t.h2Settings.HeaderTableSize,
-			MaxReadFrameSize:          maxReadFrame,
+			MaxReadFrameSize:          framerAcceptCap,
 			Settings:                  buildH2Settings(t.h2Settings),
 			ConnectionFlow:            t.h2Settings.ConnectionWindowSize,
 			PseudoHeaderOrder:         h2p.PseudoHeaders,
