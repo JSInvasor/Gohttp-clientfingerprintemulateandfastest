@@ -276,7 +276,9 @@ func (c *Client) PrepareRequest(method, rawURL string) (*http.Request, error) {
 // Skips: cookie jar (no mutex), redirect handling, retry logic, URL parsing.
 // This is the fastest path for high-RPS workloads while maintaining full fingerprint bypass.
 func (c *Client) FastDo(ctx context.Context, template *http.Request) (*Response, error) {
-	req := template.Clone(ctx)
+	// Use WithContext for a fast shallow copy instead of Clone() which does a deep
+	// copy of headers/URL. Deep copies at high RPS cause massive GC pressure.
+	req := template.WithContext(ctx)
 	resp, err := c.transport.RoundTrip(req)
 	if err != nil {
 		return nil, err
