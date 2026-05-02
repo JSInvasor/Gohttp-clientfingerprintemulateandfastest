@@ -122,15 +122,11 @@ type dialCall struct {
 
 // requires p.mu is held.
 func (p *clientConnPool) getStartDialLocked(ctx context.Context, addr string) *dialCall {
-	if call, ok := p.dialing[addr]; ok {
-		// A dial is already in-flight. Don't start another.
-		return call
-	}
+	// Always start a new dial. The original code de-duplicated dials to the
+	// same host, which meant at most 1 TCP connection was being established
+	// at a time. Under high concurrency this is the primary RPS bottleneck:
+	// the pool grows one connection at a time while hundreds of workers wait.
 	call := &dialCall{p: p, done: make(chan struct{}), ctx: ctx}
-	if p.dialing == nil {
-		p.dialing = make(map[string]*dialCall)
-	}
-	p.dialing[addr] = call
 	go call.dial(call.ctx, addr)
 	return call
 }
@@ -141,7 +137,6 @@ func (c *dialCall) dial(ctx context.Context, addr string) {
 	c.res, c.err = c.p.t.dialClientConn(ctx, addr, singleUse)
 
 	c.p.mu.Lock()
-	delete(c.p.dialing, addr)
 	if c.err == nil {
 		c.p.addConnLocked(addr, c.res)
 	}
