@@ -3,6 +3,7 @@ package gofire
 import (
 	"bufio"
 	"context"
+	cryptorand "crypto/rand"
 	cryptotls "crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -234,6 +236,13 @@ func (t *Transport) dialTLSForH2(ctx context.Context, network, addr string) (net
 }
 
 // dialTLS performs TLS handshake using our custom ctls package with browser-specific ClientHello.
+//
+// Includes a bounded retry loop on transient failures (EOF, connection reset,
+// i/o timeout). Under heavy parallel dialing - thousands of workers all
+// opening connections to the same edge - some TCP/TLS handshakes get dropped
+// by the load balancer or fail mid-handshake. Real browsers retry these
+// transparently; our previous behavior surfaced them to the worker as
+// "tls handshake failed" errors, polluting blaze's error report.
 func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -241,13 +250,7 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 		port = "443"
 	}
 
-	// Get raw TCP connection (direct or through proxy)
-	rawConn, err := t.dialRaw(ctx, network, host, port)
-	if err != nil {
-		return nil, err
-	}
-
-	// Map browser profile to ctls browser type
+	// Map browser profile to ctls browser type once, outside the loop.
 	browserType := ctls.BrowserFirefox148
 	switch t.browser {
 	case Chrome147:
@@ -256,15 +259,77 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 		browserType = ctls.BrowserSafariIOS18
 	}
 
-	// Perform custom TLS 1.3 handshake with browser fingerprint
-	tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, browserType)
-	if err != nil {
-		rawConn.Close()
-		return nil, fmt.Errorf("tls handshake: %w", err)
-	}
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			// Jittered backoff: ~50-150ms, ~150-400ms.
+			minMs := 50 * attempt
+			maxMs := 50 + 100*attempt
+			delay := time.Duration(minMs+secureRandIntn(maxMs-minMs)) * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
 
-	t.connCount.Add(1)
-	return tlsConn, nil
+		rawConn, err := t.dialRaw(ctx, network, host, port)
+		if err != nil {
+			lastErr = err
+			if !isTransientDialErr(err) {
+				return nil, err
+			}
+			continue
+		}
+
+		tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, browserType)
+		if err != nil {
+			rawConn.Close()
+			lastErr = fmt.Errorf("tls handshake: %w", err)
+			if !isTransientDialErr(err) {
+				return nil, lastErr
+			}
+			continue
+		}
+
+		t.connCount.Add(1)
+		return tlsConn, nil
+	}
+	return nil, lastErr
+}
+
+// isTransientDialErr classifies errors that are worth retrying. We only
+// retry connection-level transients - protocol errors, certificate failures,
+// and context cancellation surface immediately.
+func isTransientDialErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "EOF") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "no route to host") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "TLS handshake failure") ||
+		strings.Contains(s, "unexpected EOF")
+}
+
+// secureRandIntn returns a uniform random int in [0, n) using crypto/rand.
+// Used for handshake retry jitter; not on the hot path.
+func secureRandIntn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	var b [4]byte
+	_, _ = cryptorand.Read(b[:])
+	v := int(b[0])<<24 | int(b[1])<<16 | int(b[2])<<8 | int(b[3])
+	if v < 0 {
+		v = -v
+	}
+	return v % n
 }
 
 // dialRaw establishes a raw TCP connection, optionally through a proxy.
