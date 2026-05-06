@@ -27,6 +27,7 @@
 //     soft-fail, so a fresh tab/session can succeed.
 
 import { connect } from "puppeteer-real-browser";
+import { execSync } from "node:child_process";
 
 const url = process.argv[2];
 const timeoutSec = parseInt(process.argv[3] || "75", 10);
@@ -49,6 +50,120 @@ if (!url) {
   );
   process.exit(1);
 }
+
+// ---- Process tracking + hard cleanup ----------------------------------------
+//
+// puppeteer-real-browser launches Chromium plus an Xvfb wrapper plus
+// renderer/GPU child processes. browser.close() is best-effort: if the node
+// process is killed (blaze timeout, SIGKILL) the chromium tree is orphaned
+// and keeps eating CPU/RAM. We track every PID we know about and kill the
+// whole tree on every exit path - signals, exceptions, normal exit.
+//
+// Additionally, on Linux we run a `pkill` sweep using a unique env-var marker
+// the chromium processes inherit, so any straggler that escaped our PID
+// tracking still gets cleaned up.
+
+const SESSION_MARK = `BLAZE_SOLVER_SESSION=${process.pid}-${Date.now()}`;
+process.env.BLAZE_SOLVER_SESSION = SESSION_MARK.split("=")[1];
+
+const trackedPids = new Set();
+let cleanedUp = false;
+
+function trackPid(pid) {
+  if (pid && Number.isInteger(pid)) trackedPids.add(pid);
+}
+
+function killProcessTree(pid, signal) {
+  try {
+    // Negative pid = kill the entire process group. Requires the child to
+    // have been started in its own group (puppeteer does this by default
+    // for the Chromium it spawns).
+    process.kill(-pid, signal);
+  } catch {}
+  try {
+    process.kill(pid, signal);
+  } catch {}
+}
+
+function cleanup() {
+  if (cleanedUp) return;
+  cleanedUp = true;
+
+  // 1) Try graceful close on the live browser handle.
+  if (currentBrowser) {
+    try {
+      currentBrowser.close();
+    } catch {}
+    currentBrowser = null;
+  }
+
+  // 2) SIGTERM every PID we tracked, then SIGKILL after a short grace window.
+  for (const pid of trackedPids) killProcessTree(pid, "SIGTERM");
+  setTimeout(() => {
+    for (const pid of trackedPids) killProcessTree(pid, "SIGKILL");
+  }, 500).unref();
+
+  // 3) Linux belt-and-braces sweep: kill any chromium descendant that
+  //    inherited our session marker. Catches stragglers that puppeteer-
+  //    real-browser detached from us (Xvfb wrapper etc.).
+  if (process.platform === "linux") {
+    try {
+      execSync(
+        `pgrep -af "BLAZE_SOLVER_SESSION=${process.env.BLAZE_SOLVER_SESSION}" | awk '{print $1}' | xargs -r kill -9`,
+        { stdio: "ignore", timeout: 2000 }
+      );
+    } catch {}
+  }
+}
+
+process.on("SIGINT", () => {
+  cleanup();
+  process.exit(130);
+});
+process.on("SIGTERM", () => {
+  cleanup();
+  process.exit(143);
+});
+process.on("SIGHUP", () => {
+  cleanup();
+  process.exit(129);
+});
+process.on("uncaughtException", (e) => {
+  try {
+    console.log(
+      JSON.stringify({ status: "error", error: e?.message || String(e) })
+    );
+  } catch {}
+  cleanup();
+  process.exit(1);
+});
+process.on("unhandledRejection", (e) => {
+  try {
+    console.log(
+      JSON.stringify({
+        status: "error",
+        error: (e && e.message) || String(e),
+      })
+    );
+  } catch {}
+  cleanup();
+  process.exit(1);
+});
+process.on("exit", cleanup);
+
+// Hard backstop: even if the run hangs forever, we self-terminate at
+// (timeout + 30s) so we never become the zombie ourselves.
+setTimeout(() => {
+  try {
+    console.log(
+      JSON.stringify({ status: "error", error: "watchdog timeout" })
+    );
+  } catch {}
+  cleanup();
+  process.exit(2);
+}, TIMEOUT_MS + 30_000).unref();
+
+let currentBrowser = null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -80,6 +195,14 @@ async function launch() {
   });
 
   const { browser, page } = result;
+  currentBrowser = browser;
+
+  // Track the chromium PID so cleanup() can kill the whole tree even if
+  // browser.close() never runs (timeout, kill -9 from blaze, etc.).
+  try {
+    const proc = browser.process && browser.process();
+    if (proc && proc.pid) trackPid(proc.pid);
+  } catch {}
 
   // Force the gofire-matching UA before any navigation.
   try {
@@ -259,6 +382,7 @@ async function solve() {
       await r.browser.close().catch(() => {});
       r.browser = undefined;
     }
+    if (currentBrowser === r.browser) currentBrowser = null;
 
     if (r.status === "ok") {
       const out = {

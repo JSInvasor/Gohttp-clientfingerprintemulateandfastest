@@ -107,6 +107,19 @@ func solveCFChallenge(targetURL string) (cookies string, userAgent string, err e
 
 	cmd := exec.CommandContext(ctx, "node", solverPath, targetURL, "75")
 	cmd.Stderr = os.Stderr
+	// Put node + every chromium child in their own process group so we can
+	// kill the WHOLE tree on timeout. Without Setpgid, exec.CommandContext
+	// only kills the immediate node process - chromium children survive as
+	// orphans and keep eating CPU/RAM.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// On context cancel, send SIGKILL to the entire process group (-pid).
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 5 * time.Second // grace window for graceful close after Cancel
 	output, errCmd := cmd.Output()
 	if errCmd != nil {
 		return "", "", fmt.Errorf("solver calistirilamadi: %w", errCmd)
