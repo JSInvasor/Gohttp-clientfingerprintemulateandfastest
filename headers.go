@@ -2,6 +2,10 @@ package gofire
 
 import (
 	"net/http"
+	"net/url"
+	"strings"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 // Firefox150UserAgent is the User-Agent string sent by Firefox 150 on Windows 10 x64.
@@ -85,7 +89,7 @@ func applyFirefoxHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
-	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(h))
+	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(req))
 	setIfEmpty(h, "Sec-Fetch-User", "?1")
 	setIfEmpty(h, "Priority", "u=0, i")
 	setIfEmpty(h, "TE", "trailers")
@@ -103,15 +107,73 @@ func setIfEmpty(h http.Header, key, value string) {
 }
 
 // secFetchSiteFor returns the correct Sec-Fetch-Site value for a navigation
-// based on whether a Referer is present. Real browsers send "none" for
-// address-bar/bookmark navigations (no referrer) and "same-origin" once a
-// referrer chain exists. Hardcoding "same-origin" on a referer-less first
-// request is a known bot signal that Cloudflare scores against you.
-func secFetchSiteFor(h http.Header) string {
-	if h.Get("Referer") == "" {
+// based on the relationship between the Referer and the request URL.
+//
+//   - none:        no referrer (address bar, bookmark, fresh tab)
+//   - same-origin: scheme + host + port match
+//   - same-site:   same registrable domain (eTLD+1), different host/port/scheme
+//   - cross-site:  different registrable domain
+//
+// Hardcoding "same-origin" whenever a Referer exists is a fingerprint mismatch
+// that Cloudflare/Akamai score against you - if the referrer is google.com but
+// Sec-Fetch-Site says same-origin, the request is obviously synthetic. The
+// referrer host has to drive the annotation.
+func secFetchSiteFor(req *http.Request) string {
+	if req == nil {
 		return "none"
 	}
-	return "same-origin"
+	referer := req.Header.Get("Referer")
+	if referer == "" {
+		return "none"
+	}
+	refURL, err := url.Parse(referer)
+	if err != nil || refURL.Host == "" || req.URL == nil || req.URL.Host == "" {
+		return "none"
+	}
+
+	reqHost := strings.ToLower(req.URL.Hostname())
+	refHost := strings.ToLower(refURL.Hostname())
+	reqPort := req.URL.Port()
+	refPort := refURL.Port()
+	if reqPort == "" {
+		reqPort = defaultPortForScheme(req.URL.Scheme)
+	}
+	if refPort == "" {
+		refPort = defaultPortForScheme(refURL.Scheme)
+	}
+
+	if req.URL.Scheme == refURL.Scheme && reqHost == refHost && reqPort == refPort {
+		return "same-origin"
+	}
+	if sameRegistrableDomain(reqHost, refHost) {
+		return "same-site"
+	}
+	return "cross-site"
+}
+
+func defaultPortForScheme(scheme string) string {
+	switch scheme {
+	case "https", "wss":
+		return "443"
+	case "http", "ws":
+		return "80"
+	}
+	return ""
+}
+
+func sameRegistrableDomain(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	aSite, err := publicsuffix.EffectiveTLDPlusOne(a)
+	if err != nil {
+		return false
+	}
+	bSite, err := publicsuffix.EffectiveTLDPlusOne(b)
+	if err != nil {
+		return false
+	}
+	return aSite == bSite
 }
 
 // applyBrowserHeaders applies headers based on the browser profile.
@@ -242,7 +304,7 @@ func applyChromeHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	setIfEmpty(h, "User-Agent", Chrome147UserAgent)
 	setIfEmpty(h, "Accept", accept)
-	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(h))
+	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(req))
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
 	setIfEmpty(h, "Sec-Fetch-User", "?1")
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
@@ -311,7 +373,7 @@ func applySafariHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "Sec-Fetch-Dest", "document")
 	setIfEmpty(h, "User-Agent", SafariIOS18UserAgent)
 	setIfEmpty(h, "Accept", accept)
-	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(h))
+	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(req))
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
 	setIfEmpty(h, "Accept-Language", lang)
 	setIfEmpty(h, "Priority", "u=0, i")

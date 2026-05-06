@@ -64,6 +64,10 @@ func NewClient(opts ...Option) (*Client, error) {
 		if len(via) >= cfg.maxRedirects {
 			return fmt.Errorf("stopped after %d redirects", cfg.maxRedirects)
 		}
+		// Sec-Fetch-Site has to be recomputed for the new URL+Referer pair;
+		// otherwise the stale value from the previous hop leaks through and
+		// no longer matches the actual origin transition.
+		req.Header.Del("Sec-Fetch-Site")
 		applyBrowserHeaders(req, cfg.browser, cfg.accept, cfg.acceptLanguage)
 		return nil
 	}
@@ -177,17 +181,21 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 
-		// Apply browser default headers
+		// Stage Referer BEFORE applyBrowserHeaders so Sec-Fetch-Site can be
+		// computed against the correct origin. Caller-supplied Referer wins
+		// over the configured default.
+		if v, ok := headers["Referer"]; ok && v != "" {
+			req.Header.Set("Referer", v)
+		} else if c.config.referer != "" {
+			req.Header.Set("Referer", c.config.referer)
+		}
+
+		// Apply browser default headers (Sec-Fetch-Site reads the staged Referer).
 		applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage)
 
 		// Apply custom User-Agent if set
 		if c.config.userAgent != "" {
 			req.Header.Set("User-Agent", c.config.userAgent)
-		}
-
-		// Apply default Referer if set
-		if c.config.referer != "" {
-			setIfEmpty(req.Header, "Referer", c.config.referer)
 		}
 
 		// Apply custom headers (override defaults)
@@ -237,13 +245,14 @@ func (c *Client) shouldRetryStatus(statusCode int) bool {
 
 // DoHTTPRequest executes a standard *http.Request with fingerprint headers applied.
 func (c *Client) DoHTTPRequest(req *http.Request) (*Response, error) {
+	// Stage Referer first so Sec-Fetch-Site sees the correct origin.
+	if c.config.referer != "" {
+		setIfEmpty(req.Header, "Referer", c.config.referer)
+	}
 	applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage)
 
 	if c.config.userAgent != "" {
 		req.Header.Set("User-Agent", c.config.userAgent)
-	}
-	if c.config.referer != "" {
-		setIfEmpty(req.Header, "Referer", c.config.referer)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -262,12 +271,13 @@ func (c *Client) PrepareRequest(method, rawURL string) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Stage Referer first so Sec-Fetch-Site sees the correct origin.
+	if c.config.referer != "" {
+		setIfEmpty(req.Header, "Referer", c.config.referer)
+	}
 	applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage)
 	if c.config.userAgent != "" {
 		req.Header.Set("User-Agent", c.config.userAgent)
-	}
-	if c.config.referer != "" {
-		setIfEmpty(req.Header, "Referer", c.config.referer)
 	}
 	return req, nil
 }
