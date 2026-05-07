@@ -1,16 +1,17 @@
 package gofire
 
 import (
-	"bufio"
 	"context"
 	cryptorand "crypto/rand"
 	cryptotls "crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,8 +47,9 @@ type Transport struct {
 	dialer      *net.Dialer
 
 	// Proxy support - used directly in dialTLS to tunnel through proxies
-	proxyMu   sync.RWMutex
-	proxyFunc func(*http.Request) (*url.URL, error) // nil = no proxy
+	proxyMu       sync.RWMutex
+	proxyFunc     func(*http.Request) (*url.URL, error) // nil = no proxy
+	proxyRotator  *ProxyRotator                         // nil unless SetProxyRotator was used
 }
 
 // TransportConfig holds configuration for creating a Transport.
@@ -333,21 +335,48 @@ func secureRandIntn(n int) int {
 }
 
 // dialRaw establishes a raw TCP connection, optionally through a proxy.
+//
+// When a ProxyRotator is configured, dial failures are reported back so dead
+// proxies are taken out of rotation, and a single dial will retry up to
+// proxyDialAttempts times against different rotator entries before giving up.
+// This keeps a few dead members of a large proxy list from translating into
+// per-request failures.
 func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (net.Conn, error) {
 	t.proxyMu.RLock()
 	proxyFunc := t.proxyFunc
+	rotator := t.proxyRotator
 	t.proxyMu.RUnlock()
 
 	targetAddr := net.JoinHostPort(host, port)
 
-	// Check if proxy is configured
-	if proxyFunc != nil {
+	if rotator != nil {
+		const proxyDialAttempts = 3
+		var lastErr error
+		for attempt := 0; attempt < proxyDialAttempts; attempt++ {
+			proxyURL, entry := rotator.nextProxyEntry()
+			if proxyURL == nil {
+				break
+			}
+			conn, err := t.dialViaProxy(ctx, network, targetAddr, proxyURL)
+			if err == nil {
+				rotator.MarkSuccess(entry)
+				return conn, nil
+			}
+			rotator.MarkFailure(entry)
+			lastErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+		}
+		if lastErr != nil {
+			return nil, lastErr
+		}
+	} else if proxyFunc != nil {
 		dummyReq := &http.Request{URL: &url.URL{Scheme: "https", Host: targetAddr}}
 		proxyURL, err := proxyFunc(dummyReq)
 		if err != nil {
 			return nil, fmt.Errorf("proxy func: %w", err)
 		}
-
 		if proxyURL != nil {
 			return t.dialViaProxy(ctx, network, targetAddr, proxyURL)
 		}
@@ -371,66 +400,357 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 	return conn, nil
 }
 
-// dialViaProxy connects through an HTTP/SOCKS5 proxy using CONNECT tunnel.
+// dialViaProxy connects through a proxy. Supports HTTP CONNECT, HTTPS CONNECT
+// (TLS to the proxy first), and SOCKS5 (RFC 1928) with optional username/password
+// authentication (RFC 1929).
 func (t *Transport) dialViaProxy(ctx context.Context, network, targetAddr string, proxyURL *url.URL) (net.Conn, error) {
-	proxyAddr := proxyURL.Host
-	if proxyURL.Port() == "" {
-		if proxyURL.Scheme == "https" {
-			proxyAddr = net.JoinHostPort(proxyURL.Hostname(), "443")
-		} else {
-			proxyAddr = net.JoinHostPort(proxyURL.Hostname(), "8080")
-		}
+	scheme := strings.ToLower(proxyURL.Scheme)
+	switch scheme {
+	case "socks5", "socks5h":
+		return t.dialViaSocks5(ctx, network, targetAddr, proxyURL)
+	case "http", "https", "":
+		return t.dialViaHTTPConnect(ctx, network, targetAddr, proxyURL)
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme %q", proxyURL.Scheme)
 	}
+}
 
-	// Connect to proxy
-	proxyConn, err := t.dialer.DialContext(ctx, network, proxyAddr)
+// proxyDefaultPort returns the conventional default port for a proxy scheme.
+func proxyDefaultPort(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "https":
+		return "443"
+	case "socks5", "socks5h":
+		return "1080"
+	default:
+		return "8080"
+	}
+}
+
+// dialViaHTTPConnect implements HTTP CONNECT tunneling. For "https" scheme it
+// performs a real TLS handshake to the proxy first.
+//
+// The classic bufio bug in this routine: a bufio.Reader over the proxy conn
+// can read MORE bytes than just the CONNECT response (it greedily fills its
+// buffer). After CONNECT 200 the next bytes belong to the inner TLS handshake,
+// so any byte stuck in the bufio buffer is silently lost the moment the TLS
+// layer reads from the underlying conn directly. We protect against this by
+// reading the response status+headers byte-by-byte until "\r\n\r\n", so the
+// underlying conn's read offset is exactly at the start of the tunneled stream.
+func (t *Transport) dialViaHTTPConnect(ctx context.Context, network, targetAddr string, proxyURL *url.URL) (net.Conn, error) {
+	proxyHost := proxyURL.Hostname()
+	proxyPort := proxyURL.Port()
+	if proxyPort == "" {
+		proxyPort = proxyDefaultPort(proxyURL.Scheme)
+	}
+	proxyAddr := net.JoinHostPort(proxyHost, proxyPort)
+
+	rawConn, err := t.dialer.DialContext(ctx, network, proxyAddr)
 	if err != nil {
 		return nil, fmt.Errorf("dial proxy %s: %w", proxyAddr, err)
 	}
 
-	// Build CONNECT request
-	connectReq := "CONNECT " + targetAddr + " HTTP/1.1\r\n"
-	connectReq += "Host: " + targetAddr + "\r\n"
-
-	// Add proxy authentication if present
-	if proxyURL.User != nil {
-		username := proxyURL.User.Username()
-		password, _ := proxyURL.User.Password()
-		auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
-		connectReq += "Proxy-Authorization: Basic " + auth + "\r\n"
+	// HTTPS proxy: TLS-wrap the tunnel BEFORE sending CONNECT.
+	var proxyConn net.Conn = rawConn
+	if strings.ToLower(proxyURL.Scheme) == "https" {
+		tlsCfg := &cryptotls.Config{
+			ServerName:         proxyHost,
+			InsecureSkipVerify: t.skipVerify,
+			RootCAs:            t.rootCAs,
+		}
+		tlsConn := cryptotls.Client(rawConn, tlsCfg)
+		if deadline, ok := ctx.Deadline(); ok {
+			tlsConn.SetDeadline(deadline)
+		}
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
+			return nil, fmt.Errorf("tls handshake to proxy %s: %w", proxyAddr, err)
+		}
+		proxyConn = tlsConn
 	}
 
-	connectReq += "\r\n"
-
-	// Set deadline for CONNECT handshake
 	if deadline, ok := ctx.Deadline(); ok {
 		proxyConn.SetDeadline(deadline)
 	}
 
-	// Send CONNECT
-	if _, err := proxyConn.Write([]byte(connectReq)); err != nil {
+	// Build CONNECT request.
+	var b strings.Builder
+	b.WriteString("CONNECT ")
+	b.WriteString(targetAddr)
+	b.WriteString(" HTTP/1.1\r\nHost: ")
+	b.WriteString(targetAddr)
+	b.WriteString("\r\nProxy-Connection: keep-alive\r\nUser-Agent: gofire\r\n")
+	if proxyURL.User != nil {
+		username := proxyURL.User.Username()
+		password, _ := proxyURL.User.Password()
+		auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+		b.WriteString("Proxy-Authorization: Basic ")
+		b.WriteString(auth)
+		b.WriteString("\r\n")
+	}
+	b.WriteString("\r\n")
+
+	if _, err := proxyConn.Write([]byte(b.String())); err != nil {
 		proxyConn.Close()
-		return nil, fmt.Errorf("write CONNECT: %w", err)
+		return nil, fmt.Errorf("write CONNECT to %s: %w", proxyAddr, err)
 	}
 
-	// Read CONNECT response
-	br := bufio.NewReader(proxyConn)
-	resp, err := http.ReadResponse(br, nil)
+	statusLine, err := readHeaderLine(proxyConn)
 	if err != nil {
 		proxyConn.Close()
-		return nil, fmt.Errorf("read CONNECT response: %w", err)
+		return nil, fmt.Errorf("read CONNECT status from %s: %w", proxyAddr, err)
 	}
-	resp.Body.Close()
+	// Drain the rest of the response headers byte-by-byte until empty line.
+	for {
+		line, err := readHeaderLine(proxyConn)
+		if err != nil {
+			proxyConn.Close()
+			return nil, fmt.Errorf("read CONNECT headers from %s: %w", proxyAddr, err)
+		}
+		if line == "" {
+			break
+		}
+	}
 
-	if resp.StatusCode != 200 {
+	// Parse "HTTP/1.1 200 ..." status line.
+	parts := strings.SplitN(statusLine, " ", 3)
+	if len(parts) < 2 {
 		proxyConn.Close()
-		return nil, fmt.Errorf("proxy CONNECT failed: %s", resp.Status)
+		return nil, fmt.Errorf("malformed CONNECT response from %s: %q", proxyAddr, statusLine)
+	}
+	if parts[1] != "200" {
+		proxyConn.Close()
+		return nil, fmt.Errorf("proxy %s CONNECT failed: %s", proxyAddr, statusLine)
 	}
 
-	// Clear deadline after CONNECT
 	proxyConn.SetDeadline(time.Time{})
-
 	return proxyConn, nil
+}
+
+// readHeaderLine reads a single CRLF-terminated header line from conn,
+// byte-by-byte. We avoid bufio because any byte buffered past the end of the
+// CONNECT response would be lost when the caller starts reading the tunneled
+// (TLS) bytes directly from conn.
+func readHeaderLine(conn net.Conn) (string, error) {
+	const maxLine = 4096
+	var line []byte
+	var prev byte
+	buf := make([]byte, 1)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			return "", err
+		}
+		if n == 0 {
+			continue
+		}
+		c := buf[0]
+		line = append(line, c)
+		if prev == '\r' && c == '\n' {
+			return string(line[:len(line)-2]), nil
+		}
+		prev = c
+		if len(line) > maxLine {
+			return "", fmt.Errorf("header line too long")
+		}
+	}
+}
+
+// dialViaSocks5 implements RFC 1928 SOCKS5 + RFC 1929 username/password auth.
+// We send the target as a domain name (ATYP=0x03) when the target host is not
+// a literal IP, so the proxy does the DNS resolution - this is the standard
+// "socks5h" behavior and avoids local DNS leak / mismatch.
+func (t *Transport) dialViaSocks5(ctx context.Context, network, targetAddr string, proxyURL *url.URL) (net.Conn, error) {
+	proxyHost := proxyURL.Hostname()
+	proxyPort := proxyURL.Port()
+	if proxyPort == "" {
+		proxyPort = proxyDefaultPort(proxyURL.Scheme)
+	}
+	proxyAddr := net.JoinHostPort(proxyHost, proxyPort)
+
+	conn, err := t.dialer.DialContext(ctx, network, proxyAddr)
+	if err != nil {
+		return nil, fmt.Errorf("dial socks5 %s: %w", proxyAddr, err)
+	}
+
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+
+	var (
+		username string
+		password string
+	)
+	if proxyURL.User != nil {
+		username = proxyURL.User.Username()
+		password, _ = proxyURL.User.Password()
+	}
+
+	// Greeting: VER=5, NMETHODS, METHODS...
+	if username != "" || password != "" {
+		// Offer both no-auth and user/pass; let the server pick.
+		if _, err := conn.Write([]byte{0x05, 0x02, 0x00, 0x02}); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 greeting: %w", err)
+		}
+	} else {
+		if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 greeting: %w", err)
+		}
+	}
+
+	// Method selection response: VER, METHOD
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5 method select: %w", err)
+	}
+	if resp[0] != 0x05 {
+		conn.Close()
+		return nil, fmt.Errorf("socks5 bad version 0x%02x from %s", resp[0], proxyAddr)
+	}
+
+	switch resp[1] {
+	case 0x00:
+		// no auth
+	case 0x02:
+		// username/password (RFC 1929)
+		if username == "" && password == "" {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 %s requires auth, none provided", proxyAddr)
+		}
+		if len(username) > 255 || len(password) > 255 {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 username/password too long")
+		}
+		authReq := make([]byte, 0, 3+len(username)+len(password))
+		authReq = append(authReq, 0x01, byte(len(username)))
+		authReq = append(authReq, username...)
+		authReq = append(authReq, byte(len(password)))
+		authReq = append(authReq, password...)
+		if _, err := conn.Write(authReq); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 auth write: %w", err)
+		}
+		authResp := make([]byte, 2)
+		if _, err := io.ReadFull(conn, authResp); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 auth read: %w", err)
+		}
+		if authResp[1] != 0x00 {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 %s auth rejected (0x%02x)", proxyAddr, authResp[1])
+		}
+	case 0xFF:
+		conn.Close()
+		return nil, fmt.Errorf("socks5 %s rejected all auth methods", proxyAddr)
+	default:
+		conn.Close()
+		return nil, fmt.Errorf("socks5 %s selected unsupported method 0x%02x", proxyAddr, resp[1])
+	}
+
+	// CONNECT request: VER, CMD=CONNECT, RSV=0, ATYP, ADDR, PORT
+	host, portStr, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5 split host: %w", err)
+	}
+	port64, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5 port parse: %w", err)
+	}
+	port := uint16(port64)
+
+	req := make([]byte, 0, 22)
+	req = append(req, 0x05, 0x01, 0x00)
+	if ip := net.ParseIP(host); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			req = append(req, 0x01)
+			req = append(req, v4...)
+		} else {
+			req = append(req, 0x04)
+			req = append(req, ip.To16()...)
+		}
+	} else {
+		if len(host) > 255 {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 hostname too long")
+		}
+		req = append(req, 0x03, byte(len(host)))
+		req = append(req, host...)
+	}
+	req = append(req, byte(port>>8), byte(port))
+
+	if _, err := conn.Write(req); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5 connect write: %w", err)
+	}
+
+	// Reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
+	head := make([]byte, 4)
+	if _, err := io.ReadFull(conn, head); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5 reply read: %w", err)
+	}
+	if head[0] != 0x05 {
+		conn.Close()
+		return nil, fmt.Errorf("socks5 bad reply version 0x%02x", head[0])
+	}
+	if head[1] != 0x00 {
+		conn.Close()
+		return nil, fmt.Errorf("socks5 %s connect failed: %s", proxyAddr, socks5ReplyMsg(head[1]))
+	}
+	// Skip BND.ADDR + BND.PORT so the conn read offset is at the start of the
+	// tunneled stream.
+	var skip int
+	switch head[3] {
+	case 0x01:
+		skip = 4
+	case 0x04:
+		skip = 16
+	case 0x03:
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 reply addr len: %w", err)
+		}
+		skip = int(lenBuf[0])
+	default:
+		conn.Close()
+		return nil, fmt.Errorf("socks5 unknown atyp 0x%02x", head[3])
+	}
+	if _, err := io.ReadFull(conn, make([]byte, skip+2)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5 reply addr/port: %w", err)
+	}
+
+	conn.SetDeadline(time.Time{})
+	return conn, nil
+}
+
+func socks5ReplyMsg(rep byte) string {
+	switch rep {
+	case 0x01:
+		return "general SOCKS server failure"
+	case 0x02:
+		return "connection not allowed by ruleset"
+	case 0x03:
+		return "network unreachable"
+	case 0x04:
+		return "host unreachable"
+	case 0x05:
+		return "connection refused"
+	case 0x06:
+		return "TTL expired"
+	case 0x07:
+		return "command not supported"
+	case 0x08:
+		return "address type not supported"
+	default:
+		return fmt.Sprintf("unknown rep 0x%02x", rep)
+	}
 }
 
 // PreConnect pre-warms n TLS connections to the given host.
@@ -496,6 +816,17 @@ func (t *Transport) ActiveConnections() int64 {
 func (t *Transport) setProxy(f func(*http.Request) (*url.URL, error)) {
 	t.proxyMu.Lock()
 	t.proxyFunc = f
+	t.proxyRotator = nil
+	t.proxyMu.Unlock()
+}
+
+// setProxyRotator binds a ProxyRotator to the transport. dialRaw will route
+// through the rotator (with health tracking + per-dial fallback) instead of
+// the simple proxyFunc path.
+func (t *Transport) setProxyRotator(pr *ProxyRotator) {
+	t.proxyMu.Lock()
+	t.proxyRotator = pr
+	t.proxyFunc = pr.ProxyFunc()
 	t.proxyMu.Unlock()
 }
 
