@@ -32,7 +32,20 @@ import { execSync } from "node:child_process";
 const url = process.argv[2];
 const timeoutSec = parseInt(process.argv[3] || "75", 10);
 const TIMEOUT_MS = timeoutSec * 1000;
-const MAX_ATTEMPTS = 2;
+// One attempt by default: blaze caps the whole solve at 90s, so a second 75s
+// attempt always gets SIGKILLed mid-flight and looks like a hang. Override
+// via SOLVER_ATTEMPTS=2 if you have a higher Go-side ceiling.
+const MAX_ATTEMPTS = parseInt(process.env.SOLVER_ATTEMPTS || "1", 10);
+
+// Progress logging to stderr (blaze pipes stderr through, stdout is reserved
+// for the final JSON). Without this the user sees "cozuluyor..." for 60s
+// with no signal whether the browser launched, navigated, or hung.
+function log(stage, extra) {
+  const line = extra ? `[solver] ${stage}: ${extra}` : `[solver] ${stage}`;
+  try {
+    process.stderr.write(line + "\n");
+  } catch {}
+}
 
 // Match blaze's emulated Chrome 147. Override via env if your VPS Chrome is
 // a different major version - drift between solver UA and gofire UA causes
@@ -152,8 +165,10 @@ process.on("unhandledRejection", (e) => {
 process.on("exit", cleanup);
 
 // Hard backstop: even if the run hangs forever, we self-terminate at
-// (timeout + 30s) so we never become the zombie ourselves.
+// (timeout + 10s) so we never become the zombie ourselves. Blaze's 90s
+// ceiling sits just above this so a clean watchdog fires before SIGKILL.
 setTimeout(() => {
+  log("watchdog timeout - aborting");
   try {
     console.log(
       JSON.stringify({ status: "error", error: "watchdog timeout" })
@@ -161,7 +176,7 @@ setTimeout(() => {
   } catch {}
   cleanup();
   process.exit(2);
-}, TIMEOUT_MS + 30_000).unref();
+}, TIMEOUT_MS + 10_000).unref();
 
 let currentBrowser = null;
 
@@ -175,6 +190,7 @@ function rand(a, b) {
 // Launch a fresh real-browser session with stealth shims layered on top of
 // puppeteer-real-browser's existing rebrowser-puppeteer-core patches.
 async function launch() {
+  log("launching chromium");
   const result = await connect({
     headless: false,
     turnstile: true,
@@ -245,6 +261,7 @@ async function launch() {
     } catch {}
   });
 
+  log("chromium ready");
   return { browser, page };
 }
 
@@ -252,12 +269,21 @@ async function launch() {
 // challenge state (title flips back to a normal one). Returns the cookie
 // object on success, null if no challenge was present, throws on timeout.
 async function waitForClearance(browser, page, deadline) {
+  let lastTitle = "";
+  let polls = 0;
   while (Date.now() < deadline) {
     const cookies = await browser.cookies(url).catch(() => []);
     const cf = cookies.find((c) => c.name === "cf_clearance");
-    if (cf) return cf;
+    if (cf) {
+      log("cf_clearance acquired");
+      return cf;
+    }
 
     const title = await page.title().catch(() => "");
+    if (title && title !== lastTitle) {
+      log("title", title);
+      lastTitle = title;
+    }
     if (
       title &&
       !/just a moment|attention required|checking your browser|verify you are human/i.test(
@@ -266,7 +292,13 @@ async function waitForClearance(browser, page, deadline) {
     ) {
       // Page is past the challenge gate even without an explicit clearance
       // cookie (some sites use Bot Fight Mode without UAM).
+      log("past challenge (no cf_clearance, but title cleared)");
       return null;
+    }
+    polls++;
+    if (polls % 10 === 0) {
+      const remaining = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+      log(`waiting for clearance (${remaining}s left)`);
     }
     await sleep(500);
   }
@@ -324,14 +356,20 @@ async function simulateHumanBehavior(page) {
 // One full attempt: launch, navigate, wait for clearance, simulate behavior,
 // capture cookies. Caller decides whether to retry on failure.
 async function attempt(attemptNum) {
+  log(`attempt ${attemptNum}/${MAX_ATTEMPTS}`);
   const { browser, page } = await launch();
   try {
     const deadline = Date.now() + TIMEOUT_MS;
 
+    // Navigation gets a tight 20s budget. CF interstitial HTML loads in <2s;
+    // if it takes longer the target itself is slow/down and we should bail
+    // fast rather than burn our whole budget on a stuck connect.
+    log("navigating", url);
     await page.goto(url, {
       waitUntil: "domcontentloaded",
-      timeout: TIMEOUT_MS,
+      timeout: 20_000,
     });
+    log("navigation done");
 
     const cf = await waitForClearance(browser, page, deadline);
     if (!cf && attemptNum < MAX_ATTEMPTS) {
@@ -341,6 +379,7 @@ async function attempt(attemptNum) {
 
     // Whether clearance was present or not, harvest behavior data so even
     // bot-fight-mode-only sites get a strong __cf_bm.
+    log("simulating human behavior");
     await simulateHumanBehavior(page);
 
     // Re-read cookies post-behavior (interaction can elevate __cf_bm).
@@ -349,6 +388,7 @@ async function attempt(attemptNum) {
     const userAgent = await page.evaluate(() => navigator.userAgent);
     const finalUrl = page.url();
 
+    log(cfFinal ? "result: ok" : "result: no_clearance");
     return {
       status: cfFinal ? "ok" : "no_clearance",
       url: finalUrl,
@@ -363,11 +403,13 @@ async function attempt(attemptNum) {
       browser,
     };
   } catch (err) {
+    log("attempt error", err.message || String(err));
     return { status: "error", error: err.message || String(err), browser };
   }
 }
 
 async function solve() {
+  log(`start url=${url} timeout=${timeoutSec}s attempts=${MAX_ATTEMPTS}`);
   const startTs = Date.now();
   let lastResult = null;
 
