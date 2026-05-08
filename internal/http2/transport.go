@@ -203,6 +203,15 @@ type Transport struct {
 	// Firefox 148 sends PRIORITY flag (0x20) with weight=42, depends_on=0, exclusive=false.
 	HeaderPriority PriorityParam
 
+	// MaxStreamsPerConn, if non-zero, retires a ClientConn after this many streams
+	// have been opened on it. Real browsers cycle connections based on idle/lifetime
+	// rather than running 100k+ streams over a single H2 conn — a long-lived
+	// monotonically-incrementing stream-ID sequence is an easy fingerprint signal.
+	// Setting this to e.g. 8000 causes the conn to be marked doNotReuse once the
+	// threshold is reached; in-flight streams finish, new requests dial fresh.
+	// Zero (default) disables the cap and lets the conn run until MaxInt32 streams.
+	MaxStreamsPerConn uint32
+
 	// t1, if non-nil, is the standard library Transport using
 	// this transport. Its settings are used (but not its
 	// RoundTrip method, etc).
@@ -1130,9 +1139,17 @@ func (cc *ClientConn) idleStateLocked() (st clientConnIdleState) {
 		maxConcurrentOkay = cc.currentRequestCountLocked() < int(cc.maxConcurrentStreams)
 	}
 
+	// Stream-ID cap: stream IDs increment by 2 per request (1, 3, 5, ...), so
+	// MaxStreamsPerConn=N means nextStreamID hits 2N+1 after N streams.
+	streamIDOK := true
+	if cap := cc.t.MaxStreamsPerConn; cap > 0 && cc.nextStreamID > 2*cap+1 {
+		streamIDOK = false
+	}
+
 	st.canTakeNewRequest = cc.goAway == nil && !cc.closed && !cc.closing && maxConcurrentOkay &&
 		!cc.doNotReuse &&
 		int64(cc.nextStreamID)+2*int64(cc.pendingRequests) < math.MaxInt32 &&
+		streamIDOK &&
 		!cc.tooIdleLocked()
 
 	// If this connection has never been used for a request and is closed,
