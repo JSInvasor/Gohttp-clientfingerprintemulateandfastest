@@ -191,20 +191,37 @@ function rand(a, b) {
 // puppeteer-real-browser's existing rebrowser-puppeteer-core patches.
 async function launch() {
   log("launching chromium");
+
+  const launchArgs = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-blink-features=AutomationControlled",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--window-size=1920,1080",
+  ];
+
+  // Optional residential/clean-IP proxy for the chromium itself. Datacenter
+  // VPS IPs (Hetzner, DO, OVH...) are flagged in CF's IP reputation and
+  // get permanent UAM no matter how clean the browser fingerprint is. A
+  // residential proxy on the solver side is usually the only way to get
+  // cf_clearance issued at all on those IPs. Format: scheme://host:port
+  // (auth via SOLVER_PROXY_USER/SOLVER_PROXY_PASS — chromium proxy auth
+  // is handled separately because --proxy-server doesn't accept
+  // user:pass in the URL).
+  const proxyURL = process.env.SOLVER_PROXY;
+  if (proxyURL) {
+    launchArgs.push(`--proxy-server=${proxyURL}`);
+    log("using proxy", proxyURL);
+  }
+
   const result = await connect({
     headless: false,
     turnstile: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-blink-features=AutomationControlled",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--window-size=1920,1080",
-    ],
+    args: launchArgs,
     connectOption: { defaultViewport: null },
     disableXvfb: false,
     ignoreAllFlags: false,
@@ -219,6 +236,20 @@ async function launch() {
     const proc = browser.process && browser.process();
     if (proc && proc.pid) trackPid(proc.pid);
   } catch {}
+
+  // Proxy auth: if user/pass were supplied alongside SOLVER_PROXY, register
+  // a credentials handler. This works around the fact that --proxy-server
+  // takes only scheme://host:port; auth has to be wired through CDP.
+  const proxyUser = process.env.SOLVER_PROXY_USER;
+  const proxyPass = process.env.SOLVER_PROXY_PASS;
+  if (proxyURL && proxyUser) {
+    try {
+      await page.authenticate({ username: proxyUser, password: proxyPass || "" });
+      log("proxy auth registered");
+    } catch (err) {
+      log("proxy auth setup failed", err.message || String(err));
+    }
+  }
 
   // Force the gofire-matching UA before any navigation.
   try {
