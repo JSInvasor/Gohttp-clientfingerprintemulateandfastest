@@ -235,10 +235,21 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		idlePerHost = 256
 	}
 
+	usingProxy := proxyArg != ""
+
+	reqTimeout := 10 * time.Second
+	dialTO := 8 * time.Second
+	tlsTO := 8 * time.Second
+	if usingProxy {
+		reqTimeout = 30 * time.Second
+		dialTO = 15 * time.Second
+		tlsTO = 15 * time.Second
+	}
+
 	baseOpts := []gofire.Option{
-		gofire.WithTimeout(10 * time.Second),
-		gofire.WithTLSHandshakeTimeout(8 * time.Second),
-		gofire.WithDialTimeout(8 * time.Second),
+		gofire.WithTimeout(reqTimeout),
+		gofire.WithTLSHandshakeTimeout(tlsTO),
+		gofire.WithDialTimeout(dialTO),
 		gofire.WithMaxIdleConnsPerHost(idlePerHost),
 		gofire.WithMaxIdleConns(0),
 		gofire.WithMaxConnsPerHost(0),
@@ -256,7 +267,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 	}
 
 	var proxyRotator *gofire.ProxyRotator
-	if proxyArg != "" {
+	if usingProxy {
 		if isProxyFile(proxyArg) {
 			var err error
 			proxyRotator, err = gofire.NewProxyRotatorFromFile(proxyArg)
