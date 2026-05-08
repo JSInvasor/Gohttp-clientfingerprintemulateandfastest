@@ -265,7 +265,19 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 		browserType = ctls.BrowserSafariIOS18
 	}
 
-	const maxAttempts = 2
+	// When a proxy rotator is configured, do exactly one TLS dial attempt:
+	// every retry calls dialRaw again which would consume another proxy from
+	// the rotator, meaning a single request could burn N proxies. User wants
+	// 1 request = 1 proxy. The next request will naturally pick a fresh
+	// proxy via round-robin if this one fails.
+	t.proxyMu.RLock()
+	hasRotator := t.proxyRotator != nil
+	t.proxyMu.RUnlock()
+
+	maxAttempts := 2
+	if hasRotator {
+		maxAttempts = 1
+	}
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
@@ -354,7 +366,12 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 	targetAddr := net.JoinHostPort(host, port)
 
 	if rotator != nil {
-		const proxyDialAttempts = 2
+		// One proxy per dial. If this proxy fails the rotator marks it as
+		// failed and the next request naturally picks a different proxy via
+		// round-robin in NextEntry(). Retrying within a single dial wasted
+		// the parent ctx budget AND meant 1 request consumed up to N
+		// proxies — user wants exactly 1 proxy per request.
+		const proxyDialAttempts = 1
 		var lastErr error
 		for attempt := 0; attempt < proxyDialAttempts; attempt++ {
 			proxyURL, entry := rotator.nextProxyEntry()
