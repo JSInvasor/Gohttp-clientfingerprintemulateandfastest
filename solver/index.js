@@ -192,16 +192,21 @@ function rand(a, b) {
 async function launch() {
   log("launching chromium");
 
+  // Default Chrome (post-118) does NOT pass these flags. Setting them is a
+  // bot signal CF's UAM JS reads via feature detection:
+  //   --disable-gpu                            -> WebGL renderer "SwiftShader"
+  //   --disable-features=IsolateOrigins,...    -> non-default site isolation
+  // We drop both. WebGL still works on Xvfb via ANGLE swiftshader, but the
+  // renderer string we patch below makes it look native.
   const launchArgs = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
-    "--disable-gpu",
     "--disable-blink-features=AutomationControlled",
     "--no-first-run",
     "--no-default-browser-check",
-    "--disable-features=IsolateOrigins,site-per-process",
     "--window-size=1920,1080",
+    "--lang=en-US,en",
   ];
 
   // Optional residential/clean-IP proxy for the chromium itself. Datacenter
@@ -216,6 +221,16 @@ async function launch() {
   if (proxyURL) {
     launchArgs.push(`--proxy-server=${proxyURL}`);
     log("using proxy", proxyURL);
+  }
+
+  // Persistent profile dir gives the browser cookies/cache/history from
+  // previous runs - a "warmer" fingerprint than a fresh profile every time.
+  // CF's bot score weights profile age. Default off (per-run fresh profile)
+  // because reusing a profile cross-target can leak cookies; opt in via env.
+  const profileDir = process.env.SOLVER_PROFILE_DIR;
+  if (profileDir) {
+    launchArgs.push(`--user-data-dir=${profileDir}`);
+    log("using profile dir", profileDir);
   }
 
   const result = await connect({
@@ -257,38 +272,93 @@ async function launch() {
   } catch {}
 
   // Stealth shims - applied to every new document so they survive navigations.
+  // Each block is wrapped in try/catch because some props are non-configurable
+  // on certain Chrome builds and a single throw would kill the whole script.
   await page.evaluateOnNewDocument(() => {
-    // navigator.webdriver -> undefined (CF Bot Score signal)
+    // 1. navigator.webdriver -> undefined (top CF Bot Score signal)
     try {
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     } catch {}
-    // languages: realistic en-US fallback
+
+    // 2. languages: realistic en-US fallback
     try {
       Object.defineProperty(navigator, "languages", {
         get: () => ["en-US", "en"],
       });
     } catch {}
-    // plugins: real Chrome reports several PDF-related entries
+
+    // 3. Real Chrome PluginArray (length-aware, named-item access).
     try {
-      Object.defineProperty(navigator, "plugins", {
+      const fakePlugins = [
+        { name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+        { name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "" },
+        { name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "" },
+        { name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "" },
+        { name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "" },
+      ];
+      Object.defineProperty(navigator, "plugins", { get: () => fakePlugins });
+      Object.defineProperty(navigator, "mimeTypes", {
         get: () => [
-          {
-            name: "PDF Viewer",
-            filename: "internal-pdf-viewer",
-            description: "Portable Document Format",
-          },
-          {
-            name: "Chrome PDF Viewer",
-            filename: "internal-pdf-viewer",
-            description: "",
-          },
-          {
-            name: "Chromium PDF Viewer",
-            filename: "internal-pdf-viewer",
-            description: "",
-          },
+          { type: "application/pdf", suffixes: "pdf", description: "" },
+          { type: "text/pdf", suffixes: "pdf", description: "" },
         ],
       });
+    } catch {}
+
+    // 4. chrome.runtime: real Chrome exposes a chrome object with runtime;
+    //    headless variants don't. Spoof a minimal believable shape.
+    try {
+      if (!window.chrome) window.chrome = {};
+      if (!window.chrome.runtime) {
+        window.chrome.runtime = {
+          OnInstalledReason: { CHROME_UPDATE: "chrome_update", INSTALL: "install", UPDATE: "update" },
+          PlatformOs: { LINUX: "linux", MAC: "mac", WIN: "win" },
+        };
+      }
+      if (!window.chrome.app) window.chrome.app = { isInstalled: false };
+    } catch {}
+
+    // 5. Permissions.query - bot detect compares notifications permission
+    //    state to the document.hasFocus() result; a headless browser is
+    //    typically "denied" while real Chrome on a focused tab is "default".
+    try {
+      const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+      if (origQuery) {
+        window.navigator.permissions.query = (params) =>
+          params && params.name === "notifications"
+            ? Promise.resolve({ state: Notification.permission, onchange: null })
+            : origQuery.call(window.navigator.permissions, params);
+      }
+    } catch {}
+
+    // 6. WebGL renderer string. With --disable-gpu removed, WebGL works via
+    //    ANGLE/SwiftShader on Xvfb but reports "Google Inc." / "SwiftShader"
+    //    which is a bot tell. Spoof an Intel iGPU string seen on real laptops.
+    try {
+      const getParam = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function (p) {
+        if (p === 37445) return "Intel Inc."; // UNMASKED_VENDOR_WEBGL
+        if (p === 37446) return "Intel Iris OpenGL Engine"; // UNMASKED_RENDERER_WEBGL
+        return getParam.call(this, p);
+      };
+      if (typeof WebGL2RenderingContext !== "undefined") {
+        const getParam2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function (p) {
+          if (p === 37445) return "Intel Inc.";
+          if (p === 37446) return "Intel Iris OpenGL Engine";
+          return getParam2.call(this, p);
+        };
+      }
+    } catch {}
+
+    // 7. hardwareConcurrency / deviceMemory: real laptops report 4-16 cores
+    //    and 4-16 GB. Xvfb-spawned chromium often inherits VPS values that
+    //    are too low (1-2 cores, very low memory).
+    try {
+      Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
+    } catch {}
+    try {
+      Object.defineProperty(navigator, "deviceMemory", { get: () => 8 });
     } catch {}
   });
 
@@ -469,14 +539,21 @@ async function attempt(attemptNum) {
   try {
     const deadline = Date.now() + TIMEOUT_MS;
 
-    // Navigation gets a tight 20s budget. CF interstitial HTML loads in <2s;
-    // if it takes longer the target itself is slow/down and we should bail
-    // fast rather than burn our whole budget on a stuck connect.
+    // Navigation: wait until network goes quiet (UAM JS finishes posting
+    // its challenge result and CF reloads). 30s ceiling — most legit UAM
+    // resolves in 5-12s; longer than that means either the JS challenge
+    // is being rejected or the target is unhealthy.
     log("navigating", url);
-    await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: 20_000,
-    });
+    try {
+      await page.goto(url, {
+        waitUntil: "networkidle2",
+        timeout: 30_000,
+      });
+    } catch (navErr) {
+      // networkidle2 timeout is expected on stuck UAM (JS keeps polling
+      // CF's beacon). Don't fail — drop into the cookie polling loop.
+      log("nav settle timeout (continuing to poll)", navErr.message || String(navErr));
+    }
     log("navigation done");
 
     const cf = await waitForClearance(browser, page, deadline);
