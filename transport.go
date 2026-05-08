@@ -773,7 +773,12 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req, err := http.NewRequestWithContext(ctx, "HEAD", host, nil)
+			// Use GET, not HEAD: some servers (peet.ws, certain CDNs) respond
+			// to HEAD with DATA frames, which net/http2 logs as
+			// "protocol error: received DATA on a HEAD request" and abandons
+			// the stream. GET + full drain leaves the H2 connection cleanly
+			// idle in the pool, ready for the real workload.
+			req, err := http.NewRequestWithContext(ctx, "GET", host, nil)
 			if err != nil {
 				mu.Lock()
 				errs = append(errs, err)
@@ -791,6 +796,7 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 				mu.Unlock()
 				return
 			}
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
 			resp.Body.Close()
 		}()
 	}
