@@ -80,9 +80,11 @@ func newPipeline(c *Client, workers int) *Pipeline {
 		workers = 1000
 	}
 
-	// Drain workers handle body reading asynchronously so request workers
-	// aren't blocked by slow response body transfers.
-	drainWorkers := workers / 2
+	// 1:1 drain workers — at high RPS each request completes ~as fast as
+	// drain reads its body, so we can't afford to be under-provisioned.
+	// Under-provisioned drain → drainCh fills → fallback truncate → RST_STREAM →
+	// CF/Akamai score the client as abusive → 403.
+	drainWorkers := workers
 	if drainWorkers < 64 {
 		drainWorkers = 64
 	}
@@ -92,8 +94,8 @@ func newPipeline(c *Client, workers int) *Pipeline {
 		workers: workers,
 		// Large buffer prevents sender blocking under burst load.
 		jobCh: make(chan *pipelineJob, workers*16),
-		// Drain channel: buffered to absorb bursts of completed responses
-		drainCh: make(chan *http.Response, drainWorkers*4),
+		// Drain channel: 4× workers to absorb bursts without ever truncating.
+		drainCh: make(chan *http.Response, workers*4),
 		jobPool: sync.Pool{
 			New: func() interface{} { return &pipelineJob{} },
 		},
@@ -144,21 +146,22 @@ func (p *Pipeline) drainWorker() {
 
 // asyncDrain hands off a response body to the drain pool for async reading.
 // The worker can immediately proceed to the next request.
+//
+// Backpressure policy: if the drain channel is full we BLOCK the worker rather
+// than truncate. Truncation issues RST_STREAM (CANCEL) which Cloudflare/Akamai
+// score as an abusive client and respond with 403. Worker stalling is the
+// lesser evil — it naturally throttles ingress until drain catches up.
+// The closed-pipeline branch ensures Close() never deadlocks.
 func (p *Pipeline) asyncDrain(resp *Response) {
 	if resp == nil || resp.Response == nil || resp.Response.Body == nil || resp.bodyRead {
 		return
 	}
-	select {
-	case p.drainCh <- resp.Response:
-		// Handed off to drain worker
-	default:
-		// Drain channel full - drain inline up to 1MB (covers most HTML pages
-		// without blocking the worker too long). If the body is larger, the
-		// remainder is RST'd; this is the overload-relief path, not the steady
-		// state. Tune drain pool size if this triggers often.
-		io.CopyN(io.Discard, resp.Response.Body, 1<<20) //nolint:errcheck
+	if p.closed.Load() {
+		io.Copy(io.Discard, resp.Response.Body) //nolint:errcheck
 		resp.Response.Body.Close()
+		return
 	}
+	p.drainCh <- resp.Response
 }
 
 // worker processes jobs from the channel.

@@ -194,6 +194,10 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 			ReadIdleTimeout:           15 * time.Second,
 			PingTimeout:               5 * time.Second,
 			WriteByteTimeout:          30 * time.Second,
+			// Cycle the H2 conn after ~8000 streams. Real browsers don't push
+			// 100k+ streams over a single connection; a long monotonic
+			// stream-ID sequence is a passive fingerprint signal.
+			MaxStreamsPerConn: 8000,
 		}
 	}
 
