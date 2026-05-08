@@ -16,10 +16,11 @@ import (
 //   - GREASE in ciphers, extensions, supported_groups, supported_versions, key_share
 //   - Only zlib for compress_certificate (not brotli/zstd)
 //   - Has extended_master_secret, renegotiation_info, ec_point_formats
-//   - Supports TLS 1.0/1.1/1.2/1.3 (Chrome/Firefox only 1.2/1.3)
+//   - supported_versions: GREASE + TLS 1.3 + TLS 1.2 only
+//     (Apple removed TLS 1.0/1.1 in iOS 13; iOS 18 does NOT advertise them)
 //   - Only X25519 key share (no P-256, no post-quantum)
 //   - 5 supported groups including P-521 (Chrome only has 4)
-//   - 10 signature algorithms with duplicate rsa_pss_rsae_sha384 and sha1
+//   - 9 unique signature algorithms (incl. sha1 for legacy server compat)
 //   - Has padding extension to reach 512-byte ClientHello
 //   - No ALPS, no ECH, no delegated_credentials, no record_size_limit
 //   - Pseudo-header order: m,s,a,p (unique to Safari)
@@ -55,14 +56,19 @@ var safariIOS18CipherSuites = []uint16{
 	cipherTLS_RSA_WITH_3DES_EDE_CBC_SHA,             // 0x000A
 }
 
-// Safari iOS 18 signature algorithms (10 algos, includes duplicate and sha1)
+// Safari iOS 18 signature algorithms (9 unique algos including SHA1 fallback).
+// Real iOS 18 Safari sends each sigalg exactly once. An older version of this
+// profile carried a duplicate 0x0805 (rsa_pss_rsae_sha384) based on a stale
+// capture; tls.peet.ws verification against a real iPhone 18 showed 9 unique
+// values, so the duplicate is removed. Keeping it produces a JA4_r/peetprint
+// hash that doesn't match any real Safari and makes the fingerprint uniquely
+// identifiable.
 var safariIOS18SigAlgs = []uint16{
 	0x0403, // ecdsa_secp256r1_sha256
 	0x0804, // rsa_pss_rsae_sha256
 	0x0401, // rsa_pkcs1_sha256
 	0x0503, // ecdsa_secp384r1_sha384
 	0x0805, // rsa_pss_rsae_sha384
-	0x0805, // rsa_pss_rsae_sha384 (duplicate - real Safari sends this twice!)
 	0x0501, // rsa_pkcs1_sha384
 	0x0806, // rsa_pss_rsae_sha512
 	0x0601, // rsa_pkcs1_sha512
@@ -257,16 +263,16 @@ func buildSafariSupportedGroups(gs greaseSet) []byte {
 	return data
 }
 
-// buildSafariSupportedVersions: GREASE + TLS 1.3 + 1.2 + 1.1 + 1.0
-// Safari uniquely supports TLS 1.0 and 1.1 (Chrome/Firefox don't)
+// buildSafariSupportedVersions: GREASE + TLS 1.3 + TLS 1.2.
+// Apple deprecated TLS 1.0/1.1 in iOS 13 (2019); real iOS 18 Safari only
+// advertises TLS 1.3 and TLS 1.2 in supported_versions. Advertising 1.0/1.1
+// is a strong "non-Apple synthetic client" signal for CF/Akamai bot scoring.
 func buildSafariSupportedVersions(gs greaseSet) []byte {
 	return []byte{
-		0x0A, // list length: 10 bytes (5 versions)
+		0x06, // list length: 6 bytes (3 versions)
 		byte(gs.version >> 8), byte(gs.version), // GREASE
 		0x03, 0x04, // TLS 1.3
 		0x03, 0x03, // TLS 1.2
-		0x03, 0x02, // TLS 1.1
-		0x03, 0x01, // TLS 1.0
 	}
 }
 
