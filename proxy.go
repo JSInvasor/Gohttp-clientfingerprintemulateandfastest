@@ -184,6 +184,19 @@ func (pr *ProxyRotator) Count() int {
 	return len(pr.proxies)
 }
 
+// ProxyURLs returns the canonical proxy URL strings (one per entry, in input
+// order). Useful when the caller wants to pin one proxy per client instead
+// of using shared rotation — the rotator's Next() is dial-time, so HTTP/2
+// connection reuse means a small number of dials only ever exercises a few
+// proxies. Pinning one proxy per client guarantees every entry is used.
+func (pr *ProxyRotator) ProxyURLs() []string {
+	out := make([]string, 0, len(pr.proxies))
+	for _, e := range pr.proxies {
+		out = append(out, e.url.String())
+	}
+	return out
+}
+
 // LiveCount returns the number of proxies not currently in cooldown.
 func (pr *ProxyRotator) LiveCount() int {
 	now := time.Now().UnixNano()

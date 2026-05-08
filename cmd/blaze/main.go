@@ -266,13 +266,28 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		"firefox": "https://duckduckgo.com/",
 	}
 
-	var proxyRotator *gofire.ProxyRotator
+	// Proxy plumbing has two modes:
+	//
+	//   single proxy URL on cmdline -> WithProxy on every client (existing)
+	//   proxy file                  -> one client per proxy, pinned via
+	//                                  WithProxy(<that-proxy>). The shared
+	//                                  rotator approach only rotates at dial
+	//                                  time, so H2 connection reuse meant a
+	//                                  300-entry list often only saw ~5
+	//                                  proxies actively in use. Per-proxy
+	//                                  clients guarantee every entry runs
+	//                                  its own connection pool.
+	var proxyURLs []string
 	if usingProxy {
 		if isProxyFile(proxyArg) {
-			var err error
-			proxyRotator, err = gofire.NewProxyRotatorFromFile(proxyArg)
+			pr, err := gofire.NewProxyRotatorFromFile(proxyArg)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%shata: proxy dosyasi yuklenemedi: %v%s\n", red, err, reset)
+				os.Exit(1)
+			}
+			proxyURLs = pr.ProxyURLs()
+			if len(proxyURLs) == 0 {
+				fmt.Fprintf(os.Stderr, "%shata: proxy dosyasi bos%s\n", red, reset)
 				os.Exit(1)
 			}
 		} else {
@@ -294,17 +309,25 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 
 	var browsers []browserSpec
 
+	// When a proxy file is in use, the *number of proxies* dictates client
+	// count (one client per proxy). Otherwise fall back to the user-supplied
+	// thread count.
+	clientBudget := totalTargetClients
+	if len(proxyURLs) > 0 {
+		clientBudget = len(proxyURLs)
+	}
+
 	if solvedCookies != "" {
 		browsers = []browserSpec{
-			{"chrome", "Ch", gofire.Chrome147, totalTargetClients},
+			{"chrome", "Ch", gofire.Chrome147, clientBudget},
 		}
 		if solvedUA != "" {
 			baseOpts = append(baseOpts, gofire.WithUserAgent(solvedUA))
 		}
 	} else {
-		safariClients := totalTargetClients * 4 / 10
-		chromeClients := totalTargetClients * 3 / 10
-		firefoxClients := totalTargetClients - safariClients - chromeClients
+		safariClients := clientBudget * 4 / 10
+		chromeClients := clientBudget * 3 / 10
+		firefoxClients := clientBudget - safariClients - chromeClients
 		if safariClients < 2 {
 			safariClients = 2
 		}
@@ -332,18 +355,25 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		workersPerClient = 1
 	}
 
+	// Walk the proxy list with a global cursor so each client across all
+	// browser groups gets a distinct proxy. With clientBudget == len(proxyURLs)
+	// the assignment is exactly 1:1.
+	proxyIdx := 0
+
 	for bi, bs := range browsers {
 		cg := &clientGroup{name: bs.name, tag: bs.tag}
 		opts := append(baseOpts, gofire.WithReferer(browserReferers[bs.name]))
 
 		for i := 0; i < bs.clients; i++ {
-			c, err := gofire.Emulate(bs.profile, opts...)
+			clientOpts := opts
+			if len(proxyURLs) > 0 {
+				clientOpts = append(clientOpts, gofire.WithProxy(proxyURLs[proxyIdx%len(proxyURLs)]))
+				proxyIdx++
+			}
+			c, err := gofire.Emulate(bs.profile, clientOpts...)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%shata: %s client olusturulamadi: %v%s\n", red, bs.name, err, reset)
 				os.Exit(1)
-			}
-			if proxyRotator != nil {
-				c.SetProxyRotator(proxyRotator)
 			}
 			if len(parsedCookies) > 0 {
 				_ = c.SetCookies(targetURL, parsedCookies)
