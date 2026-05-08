@@ -265,12 +265,68 @@ async function launch() {
   return { browser, page };
 }
 
+// Try to click the Turnstile checkbox. Modern CF challenges embed Turnstile
+// in an iframe whose origin is challenges.cloudflare.com. The checkbox sits
+// in a nested same-origin iframe; we can't penetrate cross-origin frames
+// from the main page, so instead we synthesize a click at the spot where
+// Turnstile widgets always render: roughly (centerX, ~280px from top of the
+// challenge container). Mouse moves before the click humanize timing.
+//
+// Returns true if we found a likely target and dispatched a click.
+async function tryTurnstileClick(page) {
+  try {
+    // Look for Turnstile iframe by src signature.
+    const frameInfo = await page.evaluate(() => {
+      const frames = Array.from(document.querySelectorAll("iframe"));
+      const tsFrame = frames.find(
+        (f) =>
+          f.src &&
+          (f.src.includes("challenges.cloudflare.com") ||
+            f.src.includes("turnstile"))
+      );
+      if (!tsFrame) {
+        return {
+          found: false,
+          frameCount: frames.length,
+          frameSrcs: frames.slice(0, 5).map((f) => f.src || "(empty)"),
+        };
+      }
+      const r = tsFrame.getBoundingClientRect();
+      return {
+        found: true,
+        x: r.left + r.width / 2,
+        y: r.top + r.height / 2,
+        w: r.width,
+        h: r.height,
+      };
+    });
+
+    if (!frameInfo.found) {
+      return { clicked: false, ...frameInfo };
+    }
+
+    // Move mouse with steps (humanizes), small pause, click.
+    const targetX = Math.round(frameInfo.x - frameInfo.w / 2 + 30); // Turnstile checkbox sits left-of-center
+    const targetY = Math.round(frameInfo.y);
+    await page.mouse.move(targetX - 50, targetY - 30, { steps: 8 });
+    await sleep(rand(180, 380));
+    await page.mouse.move(targetX, targetY, { steps: 6 });
+    await sleep(rand(120, 280));
+    await page.mouse.click(targetX, targetY, { delay: rand(40, 110) });
+    return { clicked: true, x: targetX, y: targetY };
+  } catch (err) {
+    return { clicked: false, error: err.message || String(err) };
+  }
+}
+
 // Wait until cf_clearance appears in the cookie jar OR the page leaves the
 // challenge state (title flips back to a normal one). Returns the cookie
 // object on success, null if no challenge was present, throws on timeout.
 async function waitForClearance(browser, page, deadline) {
   let lastTitle = "";
   let polls = 0;
+  let clickAttempts = 0;
+  let lastClickTs = 0;
   while (Date.now() < deadline) {
     const cookies = await browser.cookies(url).catch(() => []);
     const cf = cookies.find((c) => c.name === "cf_clearance");
@@ -295,6 +351,27 @@ async function waitForClearance(browser, page, deadline) {
       log("past challenge (no cf_clearance, but title cleared)");
       return null;
     }
+
+    // Periodic Turnstile click attempt. We start at ~3s (let widget mount),
+    // then re-try every 6s in case the widget reloads. Cap at 4 clicks so
+    // we don't spam if the widget is stuck.
+    const elapsed = Date.now() - (deadline - TIMEOUT_MS);
+    if (elapsed > 3000 && Date.now() - lastClickTs > 6000 && clickAttempts < 4) {
+      const r = await tryTurnstileClick(page);
+      if (r.clicked) {
+        clickAttempts++;
+        lastClickTs = Date.now();
+        log(`turnstile click #${clickAttempts} at ${r.x},${r.y}`);
+      } else if (clickAttempts === 0 && polls === 6) {
+        // First diagnostic dump after ~3s if we never found a Turnstile frame.
+        log(
+          `no turnstile iframe (frames=${r.frameCount || 0}): ${
+            r.frameSrcs ? r.frameSrcs.join(" | ") : ""
+          }`
+        );
+      }
+    }
+
     polls++;
     if (polls % 10 === 0) {
       const remaining = Math.max(0, Math.round((deadline - Date.now()) / 1000));
