@@ -265,7 +265,7 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 		browserType = ctls.BrowserSafariIOS18
 	}
 
-	const maxAttempts = 3
+	const maxAttempts = 2
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
@@ -354,7 +354,7 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 	targetAddr := net.JoinHostPort(host, port)
 
 	if rotator != nil {
-		const proxyDialAttempts = 3
+		const proxyDialAttempts = 2
 		var lastErr error
 		for attempt := 0; attempt < proxyDialAttempts; attempt++ {
 			proxyURL, entry := rotator.nextProxyEntry()
