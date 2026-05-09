@@ -210,9 +210,12 @@ func formatTestResult(tag string, statusCode int, err error) string {
 		case strings.Contains(errMsg, "connection refused"):
 			reason = "connection refused"
 		default:
+			// Show the full error. Previous 80-char cap was hiding the
+			// most important part — proxy CONNECT status lines like
+			// "HTTP/1.1 403 Forbidden" got truncated to "HTT".
 			reason = errMsg
-			if len(reason) > 80 {
-				reason = reason[:80]
+			if len(reason) > 240 {
+				reason = reason[:240] + "..."
 			}
 		}
 		return fmt.Sprintf("%sImpersonate %s %s>%s %s%s%s", white, label, gray, reset, red, reason, reset)
@@ -400,9 +403,21 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}
 	}()
 
-	// Test one client per browser - clean output
+	// Test one client per browser. With a proxy file in use this only
+	// samples 3 of N proxies (one per browser group), so a single failed
+	// test line doesn't mean the run will fail — it just means *that one*
+	// proxy is bad. The load test continues with all clients regardless.
+	if len(proxyURLs) > 0 {
+		fmt.Printf("%s%d proxy yuklendi (test asagidaki 3 proxy'i ornekliyor — geri kalan %d proxy yine de calisir)%s\n",
+			gray, len(proxyURLs), len(proxyURLs)-3, reset)
+	}
+	testTimeout := 15 * time.Second
+	if len(proxyURLs) > 0 {
+		// Proxies often need 5-10s just for CONNECT; 30s gives a fair test.
+		testTimeout = 30 * time.Second
+	}
 	for _, cg := range groups {
-		testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		testCtx, testCancel := context.WithTimeout(context.Background(), testTimeout)
 		resp, testErr := cg.clients[0].DoWithContext(testCtx, method, targetURL, nil, nil)
 		testCancel()
 		if testErr != nil {
