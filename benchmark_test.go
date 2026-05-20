@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -229,8 +230,13 @@ func TestHeaderOrder(t *testing.T) {
 }
 
 func TestBrowserProfile(t *testing.T) {
-	if Firefox148.String() != "Firefox/148.0" {
-		t.Errorf("Firefox148.String() = %q, want 'Firefox/148.0'", Firefox148.String())
+	// Firefox148 is a backward-compatible alias for Firefox150 (same TLS/H2
+	// fingerprint, only UA changed), so String() reports the canonical name.
+	if Firefox148.String() != "Firefox/150.0" {
+		t.Errorf("Firefox148.String() = %q, want 'Firefox/150.0'", Firefox148.String())
+	}
+	if Chrome146.String() != "Chrome/147.0" {
+		t.Errorf("Chrome146.String() = %q, want 'Chrome/147.0'", Chrome146.String())
 	}
 }
 
@@ -440,6 +446,94 @@ func TestPipelineFireAndForget(t *testing.T) {
 		t.Error("no requests completed in fire-and-forget mode")
 	}
 	t.Logf("FireAndForget: %d/100 completed", count.Load())
+}
+
+// TestPipelineCloseRace ensures Close() does not panic when a flood of
+// concurrent FireAndForget calls is racing with shutdown. The previous
+// implementation closed jobCh directly, which raced senders that had just
+// passed the closed.Load() check and panicked with "send on closed channel".
+func TestPipelineCloseRace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	pipeline := client.NewPipeline(32)
+	ctx := context.Background()
+
+	// Fire from many goroutines while another goroutine closes mid-burst.
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				pipeline.FireAndForget(ctx, "GET", server.URL, nil, nil)
+			}
+		}()
+	}
+
+	// Close while senders are still active. Must not panic.
+	time.Sleep(5 * time.Millisecond)
+	pipeline.Close()
+	wg.Wait()
+}
+
+// TestRetryExhaustionPreservesResponse verifies that when retries are
+// exhausted on a retryable status code, the caller still receives the final
+// response (so the body and headers are inspectable) rather than only a
+// stringified "HTTP 5xx" error.
+func TestRetryExhaustionPreservesResponse(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(503)
+		w.Write([]byte("upstream busy"))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(
+		WithForceHTTP1(),
+		WithTimeout(5*time.Second),
+		WithRetry(2, 1*time.Millisecond, 503),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	resp, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatalf("expected response on retry exhaustion, got error: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("expected non-nil response on retry exhaustion")
+	}
+	defer resp.Close()
+
+	if resp.StatusCode() != 503 {
+		t.Errorf("status = %d, want 503", resp.StatusCode())
+	}
+	if got := resp.GetHeader("Retry-After"); got != "1" {
+		t.Errorf("Retry-After header = %q, want %q", got, "1")
+	}
+	body, err := resp.Text()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if body != "upstream busy" {
+		t.Errorf("body = %q, want %q", body, "upstream busy")
+	}
+	if hits.Load() != 3 {
+		t.Errorf("server saw %d hits, want 3 (initial + 2 retries)", hits.Load())
+	}
 }
 
 func TestPreConnect(t *testing.T) {

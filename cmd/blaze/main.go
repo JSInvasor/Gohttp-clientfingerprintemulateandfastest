@@ -82,12 +82,20 @@ func main() {
 }
 
 type solverResult struct {
-	Status    string `json:"status"`
-	URL       string `json:"url"`
-	UserAgent string `json:"user_agent"`
-	Cookies   string `json:"cookies"`
-	Error     string `json:"error"`
+	Status          string `json:"status"`
+	URL             string `json:"url"`
+	UserAgent       string `json:"user_agent"`
+	Cookies         string `json:"cookies"`
+	Error           string `json:"error"`
+	ChromiumVersion string `json:"chromium_version"`
+	ChromiumMajor   int    `json:"chromium_major"`
 }
+
+// expectedChromiumMajor is the Chrome major version whose TLS/H2 fingerprint
+// the gofire client emulates. cf_clearance is bound to the JA4 of the
+// session that issued it, so if the solver's actual Chromium is a different
+// major, the cookie will die under load no matter what the UA header says.
+const expectedChromiumMajor = 147
 
 func solveCFChallenge(targetURL string) (cookies string, userAgent string, err error) {
 	fmt.Printf("cloudflare challenge cozuluyor...\n")
@@ -130,14 +138,37 @@ func solveCFChallenge(targetURL string) (cookies string, userAgent string, err e
 		return "", "", fmt.Errorf("solver ciktisi okunamadi: %w", errJSON)
 	}
 
-	if result.Status == "error" {
+	switch result.Status {
+	case "error":
 		return "", "", fmt.Errorf("%s", result.Error)
+	case "no_clearance":
+		// cf_clearance never appeared — only __cf_bm / other cookies. Useful
+		// against Bot-Fight-Mode-only targets but NOT against full UAM. Fail
+		// loud rather than letting the caller think the challenge was solved.
+		return "", "", fmt.Errorf("cf_clearance alinamadi (status: no_clearance) - hedefin UAM'i acik mi, JA4 drift mi var? Chromium: %s", result.ChromiumVersion)
+	case "ok":
+		// fall through
+	default:
+		return "", "", fmt.Errorf("solver beklenmedik status: %q", result.Status)
 	}
 	if result.Cookies == "" {
 		return "", "", fmt.Errorf("cookie yok (status: %s)", result.Status)
 	}
 
-	fmt.Printf("%schallenge cozuldu!%s\n", white, reset)
+	// JA4 drift check: cf_clearance is bound to the JA4 of the issuing
+	// session. If the solver's Chromium major doesn't match the version
+	// gofire emulates, the cookie will be invalidated within seconds under
+	// load — and the user has no way to know why. Loud warning is enough;
+	// we don't hard-fail because a same-major minor mismatch (e.g. 147.0 vs
+	// 147.1) still typically works.
+	if result.ChromiumMajor > 0 && result.ChromiumMajor != expectedChromiumMajor {
+		fmt.Fprintf(os.Stderr,
+			"%suyari: solver Chromium %d, gofire Chrome %d emule ediyor - JA4 drift cookie'yi yuk altinda oldurebilir (Chromium %d kur)%s\n",
+			red, result.ChromiumMajor, expectedChromiumMajor, expectedChromiumMajor, reset,
+		)
+	}
+
+	fmt.Printf("%schallenge cozuldu!%s (chromium %s)\n", white, reset, result.ChromiumVersion)
 	return result.Cookies, result.UserAgent, nil
 }
 

@@ -204,6 +204,19 @@ async function launch() {
     if (proc && proc.pid) trackPid(proc.pid);
   } catch {}
 
+  // Read the actual Chromium build so the caller (blaze) can compare to the
+  // emulated Chrome major. cf_clearance is bound to the JA4 of the session
+  // that issued it — if our Chromium is e.g. 138 but gofire replays as 147,
+  // the cookie dies under load. Surfacing the version lets blaze warn loudly
+  // instead of silently failing.
+  let chromiumVersion = "";
+  let chromiumMajor = 0;
+  try {
+    chromiumVersion = await browser.version(); // e.g. "HeadlessChrome/147.0.7390.54"
+    const m = chromiumVersion.match(/(\d+)\.\d+\.\d+\.\d+/);
+    if (m) chromiumMajor = parseInt(m[1], 10);
+  } catch {}
+
   // Force the gofire-matching UA before any navigation.
   try {
     await page.setUserAgent(TARGET_UA);
@@ -245,7 +258,7 @@ async function launch() {
     } catch {}
   });
 
-  return { browser, page };
+  return { browser, page, chromiumVersion, chromiumMajor };
 }
 
 // Wait until cf_clearance appears in the cookie jar OR the page leaves the
@@ -323,20 +336,24 @@ async function simulateHumanBehavior(page) {
 
 // One full attempt: launch, navigate, wait for clearance, simulate behavior,
 // capture cookies. Caller decides whether to retry on failure.
-async function attempt(attemptNum) {
-  const { browser, page } = await launch();
+//
+// attemptDeadline is a wall-clock timestamp (ms) shared across attempts so a
+// long first attempt cannot blow past the overall solver budget. page.goto
+// + waitForClearance both honor it.
+async function attempt(attemptNum, attemptDeadline) {
+  const { browser, page, chromiumVersion, chromiumMajor } = await launch();
   try {
-    const deadline = Date.now() + TIMEOUT_MS;
+    const budgetMs = Math.max(1000, attemptDeadline - Date.now());
 
     await page.goto(url, {
       waitUntil: "domcontentloaded",
-      timeout: TIMEOUT_MS,
+      timeout: budgetMs,
     });
 
-    const cf = await waitForClearance(browser, page, deadline);
+    const cf = await waitForClearance(browser, page, attemptDeadline);
     if (!cf && attemptNum < MAX_ATTEMPTS) {
       // No clearance and we still have a retry left - signal caller.
-      return { status: "no_clearance", browser };
+      return { status: "no_clearance", browser, chromiumVersion, chromiumMajor };
     }
 
     // Whether clearance was present or not, harvest behavior data so even
@@ -361,18 +378,33 @@ async function attempt(attemptNum) {
         expires: c.expires,
       })),
       browser,
+      chromiumVersion,
+      chromiumMajor,
     };
   } catch (err) {
-    return { status: "error", error: err.message || String(err), browser };
+    return {
+      status: "error",
+      error: err.message || String(err),
+      browser,
+      chromiumVersion,
+      chromiumMajor,
+    };
   }
 }
 
 async function solve() {
   const startTs = Date.now();
+  // Single overall deadline shared by every attempt — prevents a slow first
+  // attempt from leaving the second with no time, or the whole solver from
+  // overshooting the parent's (blaze's) outer timeout.
+  const overallDeadline = startTs + TIMEOUT_MS;
   let lastResult = null;
 
   for (let i = 1; i <= MAX_ATTEMPTS; i++) {
-    const r = await attempt(i);
+    // Stop early if we've already overshot the global deadline.
+    if (Date.now() >= overallDeadline) break;
+
+    const r = await attempt(i, overallDeadline);
     lastResult = r;
 
     // Always close the browser before deciding whether to retry. Keeping
@@ -393,14 +425,17 @@ async function solve() {
         cookie_list: r.cookie_list,
         duration_ms: Date.now() - startTs,
         attempts: i,
+        chromium_version: r.chromiumVersion || "",
+        chromium_major: r.chromiumMajor || 0,
       };
       console.log(JSON.stringify(out));
       return;
     }
 
     // Non-ok and we have another attempt: small jittered backoff so the
-    // retry hits the edge with a clean PoP rotation.
-    if (i < MAX_ATTEMPTS) {
+    // retry hits the edge with a clean PoP rotation, but only if we still
+    // have meaningful time left.
+    if (i < MAX_ATTEMPTS && overallDeadline - Date.now() > 3_000) {
       await sleep(rand(800, 1500));
     }
   }
@@ -415,6 +450,8 @@ async function solve() {
       cookie_list: lastResult.cookie_list || [],
       duration_ms: Date.now() - startTs,
       attempts: MAX_ATTEMPTS,
+      chromium_version: lastResult.chromiumVersion || "",
+      chromium_major: lastResult.chromiumMajor || 0,
     };
     console.log(JSON.stringify(out));
     return;
@@ -426,6 +463,8 @@ async function solve() {
       error: (lastResult && lastResult.error) || "solve failed",
       duration_ms: Date.now() - startTs,
       attempts: MAX_ATTEMPTS,
+      chromium_version: (lastResult && lastResult.chromiumVersion) || "",
+      chromium_major: (lastResult && lastResult.chromiumMajor) || 0,
     })
   );
 }

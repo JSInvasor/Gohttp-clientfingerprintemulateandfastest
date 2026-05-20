@@ -269,7 +269,9 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			// Jittered backoff: ~50-150ms, ~150-400ms.
+			// Jittered backoff: ~50-150ms on the only retry. Keep the
+			// formula attempt-driven so bumping maxAttempts adds longer
+			// later windows (~150-400ms, ...) without rewriting the math.
 			minMs := 50 * attempt
 			maxMs := 50 + 100*attempt
 			delay := time.Duration(minMs+secureRandIntn(maxMs-minMs)) * time.Millisecond
@@ -372,9 +374,14 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 				return nil, ctx.Err()
 			}
 		}
+		// A configured rotator MUST NOT silently fall through to a direct
+		// connection — the user expects every request to go through a proxy.
+		// Surface the failure (or an explicit "no proxies" error if the rotator
+		// is empty) instead of leaking the client's real IP.
 		if lastErr != nil {
 			return nil, lastErr
 		}
+		return nil, fmt.Errorf("proxy rotator: no usable proxies")
 	} else if proxyFunc != nil {
 		dummyReq := &http.Request{URL: &url.URL{Scheme: "https", Host: targetAddr}}
 		proxyURL, err := proxyFunc(dummyReq)
@@ -763,6 +770,17 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 		n = 10
 	}
 
+	// Use the browser profile's User-Agent so the pre-warm HEAD doesn't show
+	// up in logs/fingerprinters as a "Mozilla/5.0" mismatch against the FF/
+	// Chrome/Safari TLS handshake we just performed.
+	ua := Firefox150UserAgent
+	switch t.browser {
+	case Chrome147:
+		ua = Chrome147UserAgent
+	case SafariIOS18:
+		ua = SafariIOS18UserAgent
+	}
+
 	var (
 		wg   sync.WaitGroup
 		mu   sync.Mutex
@@ -780,8 +798,7 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 				mu.Unlock()
 				return
 			}
-			// Set minimal headers for pre-warm; actual browser headers are set by the Client layer.
-			req.Header.Set("User-Agent", "Mozilla/5.0")
+			req.Header.Set("User-Agent", ua)
 			req.Header.Set("Accept", "*/*")
 
 			resp, err := t.RoundTrip(req)
@@ -850,6 +867,13 @@ type dnsCacheEntry struct {
 }
 
 func newDNSCache(ttl time.Duration) *dnsCache {
+	// Guard against zero/negative TTLs — time.NewTicker(0) panics, and a
+	// negative TTL would expire every lookup immediately. Either is almost
+	// certainly a configuration mistake (e.g. WithDNSCacheTTL(0)), so fall
+	// back to a sane default rather than crashing the process.
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
 	d := &dnsCache{
 		ttl:    ttl,
 		stopCh: make(chan struct{}),
