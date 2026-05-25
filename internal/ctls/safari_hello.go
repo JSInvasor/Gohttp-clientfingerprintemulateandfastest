@@ -6,10 +6,12 @@ import (
 )
 
 // Safari iOS 18.7 ClientHello builder.
-// Verified against real Safari iOS 18.7.1 via tls.peet.ws.
 //
-// JA3 Hash: 773906b0efdefa24a7f2b8eb6985bf37
-// JA4: t13d2014h2_a09f3c656075_7f0f34a4126d
+// NOTE: JA3/JA4 below are stale — they were captured before the sigalg-dedup
+// and TLS-1.0/1.1 removal. The current ClientHello (9 unique sigalgs, only
+// TLS 1.3/1.2) matches a real iOS 18 device and produces a different hash;
+// re-capture on tls.peet.ws to refresh. JA3: 773906b0efdefa24a7f2b8eb6985bf37
+// / JA4: t13d2014h2_a09f3c656075_7f0f34a4126d (PRE-FIX, do not trust).
 //
 // Key differences from Firefox 148 and Chrome 146:
 //   - 21 cipher suites including 3DES and CBC legacy ciphers

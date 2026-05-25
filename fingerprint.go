@@ -96,13 +96,16 @@ func Chrome146H2Profile() H2Profile {
 
 // ========== Safari iOS 18 ==========
 
-// Safari iOS 18.7 TLS fingerprint identifiers (verified via tls.peet.ws on 2026-03-28).
+// Safari iOS 18.7 TLS fingerprint identifiers.
 //
-// JA3 Hash: 773906b0efdefa24a7f2b8eb6985bf37
-// JA4: t13d2014h2_a09f3c656075_7f0f34a4126d
+// NOTE: the JA3/JA4 hashes below predate the sigalg-dedup + TLS-1.0/1.1
+// removal fix. The ClientHello now sends 9 unique signature algorithms and
+// only advertises TLS 1.3/1.2 in supported_versions (matching a real iPhone
+// on iOS 18), so the live JA3/JA4_r/peetprint will differ from these stale
+// values. Re-capture on tls.peet.ws after a build to record the current hash.
 //
 // Akamai HTTP/2 fingerprint: 2:0;3:100;4:2097152;9:1|10420225|0|m,s,a,p
-// Akamai hash: c52879e43202aeb92740be6e8c86ea96
+// Akamai hash: c52879e43202aeb92740be6e8c86ea96 (verified current)
 
 func SafariIOS18H2Settings() H2Settings {
 	return H2Settings{

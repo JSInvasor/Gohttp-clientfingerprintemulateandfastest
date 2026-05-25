@@ -222,14 +222,24 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 
 		// Check if we should retry on this status code
 		if attempt < maxAttempts-1 && c.shouldRetryStatus(resp.StatusCode) {
-			// Keep this response around — if retries exhaust without a non-retryable
-			// status, the caller still gets the final attempt's full response
-			// (body, headers, status) rather than just an "HTTP 503" error.
+			// Keep the most recent response so the caller still gets a full
+			// response (body, headers, status) if retries exhaust. Drain any
+			// PRIOR retained response first — leaving it open leaks the H2
+			// stream and eventually triggers RST_STREAM, the abusive-client
+			// signal fingerprint emulation avoids.
+			if lastResp != nil {
+				lastResp.Close()
+			}
 			lastResp = r
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 			continue
 		}
 
+		// A non-retryable response supersedes any retained one; drain that.
+		if lastResp != nil {
+			lastResp.Close()
+			lastResp = nil
+		}
 		return r, nil
 	}
 
