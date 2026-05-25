@@ -247,11 +247,13 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 	if bodySize > 0 {
 		bodyBytes = make([]byte, bodySize)
 		// urlencoded form shape: "f=AAAA..." so Content-Type matches a real
-		// browser form POST. First 2 bytes are the field name + '='.
-		bodyBytes[0] = 'f'
-		bodyBytes[1] = '='
-		for i := 2; i < len(bodyBytes); i++ {
+		// browser form POST. Guard the prefix bytes for tiny sizes.
+		for i := range bodyBytes {
 			bodyBytes[i] = 'A'
+		}
+		if len(bodyBytes) >= 2 {
+			bodyBytes[0] = 'f'
+			bodyBytes[1] = '='
 		}
 		fmt.Printf("%sbody modu: %s %d byte/request (origin'e buyuk paket)%s\n",
 			gray, method, bodySize, reset)
@@ -437,13 +439,18 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}
 	}()
 
-	// Test one client per browser. With a proxy file in use this only
-	// samples 3 of N proxies (one per browser group), so a single failed
+	// Test one client per browser. With a proxy file in use this only samples
+	// len(groups) of N proxies (one per browser group), so a single failed
 	// test line doesn't mean the run will fail — it just means *that one*
 	// proxy is bad. The load test continues with all clients regardless.
 	if len(proxyURLs) > 0 {
-		fmt.Printf("%s%d proxy yuklendi (test asagidaki 3 proxy'i ornekliyor — geri kalan %d proxy yine de calisir)%s\n",
-			gray, len(proxyURLs), len(proxyURLs)-3, reset)
+		sampled := len(groups)
+		rest := len(proxyURLs) - sampled
+		if rest < 0 {
+			rest = 0
+		}
+		fmt.Printf("%s%d proxy yuklendi (test asagidaki %d proxy'i ornekliyor — geri kalan %d proxy yine de calisir)%s\n",
+			gray, len(proxyURLs), sampled, rest, reset)
 	}
 	testTimeout := 15 * time.Second
 	if len(proxyURLs) > 0 {

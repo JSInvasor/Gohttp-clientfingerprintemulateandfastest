@@ -229,8 +229,13 @@ func TestHeaderOrder(t *testing.T) {
 }
 
 func TestBrowserProfile(t *testing.T) {
-	if Firefox148.String() != "Firefox/148.0" {
-		t.Errorf("Firefox148.String() = %q, want 'Firefox/148.0'", Firefox148.String())
+	// Firefox148 is a backward-compatible alias for Firefox150, so its
+	// String() resolves to the current "Firefox/150.0".
+	if Firefox150.String() != "Firefox/150.0" {
+		t.Errorf("Firefox150.String() = %q, want 'Firefox/150.0'", Firefox150.String())
+	}
+	if Firefox148 != Firefox150 {
+		t.Errorf("Firefox148 should alias Firefox150")
 	}
 }
 
