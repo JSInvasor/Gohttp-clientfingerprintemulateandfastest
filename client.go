@@ -285,10 +285,23 @@ func (c *Client) PrepareRequest(method, rawURL string) (*http.Request, error) {
 // FastDo sends a request using a pre-built template, bypassing http.Client.Do entirely.
 // Skips: cookie jar (no mutex), redirect handling, retry logic, URL parsing.
 // This is the fastest path for high-RPS workloads while maintaining full fingerprint bypass.
+//
+// If the template carries a body (POST/PUT), template.GetBody must be set: the
+// shallow WithContext copy shares the single Body reader, which is consumed
+// after the first send. We pull a fresh reader from GetBody on every call so
+// the same template can be replayed with its body intact across millions of
+// requests.
 func (c *Client) FastDo(ctx context.Context, template *http.Request) (*Response, error) {
 	// Use WithContext for a fast shallow copy instead of Clone() which does a deep
 	// copy of headers/URL. Deep copies at high RPS cause massive GC pressure.
 	req := template.WithContext(ctx)
+	if template.GetBody != nil {
+		body, err := template.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		req.Body = body
+	}
 	resp, err := c.transport.RoundTrip(req)
 	if err != nil {
 		return nil, err

