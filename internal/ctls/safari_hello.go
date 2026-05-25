@@ -34,7 +34,8 @@ const (
 	cipherTLS_RSA_WITH_3DES_EDE_CBC_SHA          = 0x000A
 )
 
-// Safari iOS 18 cipher suite order (21 suites, GREASE prefix added at build time)
+// Safari iOS 18 cipher suite order (20 suites; a GREASE value is prepended at
+// build time for 21 on the wire)
 var safariIOS18CipherSuites = []uint16{
 	cipherTLS_AES_128_GCM_SHA256,                     // 0x1301
 	cipherTLS_AES_256_GCM_SHA384,                     // 0x1302
@@ -192,7 +193,7 @@ func buildSafariExtensions(serverName string, alpn []string, km *keyMaterial, gs
 	// 12. psk_key_exchange_modes (45) - psk_dhe_ke
 	out = appendExt(out, extPSKKeyExchangeModes, []byte{1, pskModePSKDHE})
 
-	// 13. supported_versions (43) - GREASE + TLS 1.3 + 1.2 + 1.1 + 1.0
+	// 13. supported_versions (43) - GREASE + TLS 1.3 + 1.2
 	out = appendExt(out, extSupportedVersions, buildSafariSupportedVersions(gs))
 
 	// 14. compress_certificate (27) - zlib only (Safari uses zlib, not brotli!)
@@ -279,7 +280,9 @@ func buildSafariSupportedVersions(gs greaseSet) []byte {
 }
 
 // buildSafariSigAlgs builds Safari iOS 18 signature algorithms.
-// Note: rsa_pss_rsae_sha384 appears TWICE - this matches real Safari behavior.
+// 9 unique algorithms — see safariIOS18SigAlgs for why the old duplicate
+// rsa_pss_rsae_sha384 entry was removed. The list length is computed from the
+// slice, so the on-wire bytes track the slice automatically.
 func buildSafariSigAlgs() []byte {
 	algs := safariIOS18SigAlgs
 	data := make([]byte, 2+len(algs)*2)
@@ -301,7 +304,7 @@ func appendSafariPadding(extensions []byte) []byte {
 	// But this varies based on SNI length. We calculate dynamically.
 	//
 	// Target total ClientHello (without record/handshake headers):
-	// 2(version) + 32(random) + 1+32(sessionID) + 2+44(ciphers) + 2(compression)
+	// 2(version) + 32(random) + 1+32(sessionID) + 2+42(ciphers) + 2(compression)
 	// + 2(extensions_length) + extensions = ~512 target
 	// Fixed part = 2+32+33+44+2+2 = 115 bytes
 	// So extensions target = 512 - 115 = 397 bytes... but actual target varies.
