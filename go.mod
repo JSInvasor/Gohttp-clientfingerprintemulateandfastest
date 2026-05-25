@@ -1,12 +1,13 @@
 module github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest
 
-go 1.23.0
+go 1.24
 
 toolchain go1.24.7
 
 require (
 	github.com/andybalholm/brotli v1.1.1
 	github.com/cloudflare/circl v1.6.3
+	github.com/klauspost/compress v1.18.6
 	golang.org/x/crypto v0.31.0
 	golang.org/x/net v0.33.0
 	golang.org/x/sys v0.28.0

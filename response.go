@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 )
 
 // Response wraps http.Response with convenience methods and zero-alloc helpers.
@@ -53,11 +54,17 @@ func (r *Response) Bytes() ([]byte, error) {
 	case "br":
 		reader = brotli.NewReader(r.Response.Body)
 	case "deflate":
-		reader = flate.NewReader(r.Response.Body)
+		fr := flate.NewReader(r.Response.Body)
+		defer fr.Close()
+		reader = fr
 	case "zstd":
-		// Pass through zstd-compressed data without decompression.
-		// Use Accept-Encoding without zstd if decompression is needed.
-		reader = r.Response.Body
+		zr, err := zstd.NewReader(r.Response.Body)
+		if err != nil {
+			r.bodyErr = err
+			return nil, err
+		}
+		defer zr.Close()
+		reader = zr
 	default:
 		reader = r.Response.Body
 	}
@@ -102,10 +109,12 @@ func (r *Response) Close() {
 	if r.Response == nil || r.Response.Body == nil || r.bodyRead {
 		return
 	}
-	// Drain body so HTTP/2 stream closes with END_STREAM (not RST_STREAM).
-	// 256KB is enough for typical HTML responses. Larger responses cause
-	// connection drop which is fine - avoiding RST_STREAM is what matters.
-	io.CopyN(io.Discard, r.Response.Body, 64*1024) //nolint:errcheck
+	// Unbounded drain so the HTTP/2 stream closes with END_STREAM (not
+	// RST_STREAM/CANCEL). Cloudflare/Akamai score cancelled streams as
+	// abusive — exactly what fingerprint emulation is trying to avoid.
+	// Callers that don't want to pay this cost should hand the response to
+	// the Pipeline's async drain pool instead of calling Close synchronously.
+	io.Copy(io.Discard, r.Response.Body) //nolint:errcheck
 	r.Response.Body.Close()
 }
 

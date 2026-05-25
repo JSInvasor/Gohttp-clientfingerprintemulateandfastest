@@ -34,6 +34,10 @@ type Pipeline struct {
 	workers int
 	wg      sync.WaitGroup
 	jobCh   chan *pipelineJob
+	// stopCh is closed by Close() to signal senders to abandon their writes
+	// to jobCh. Senders select on stopCh alongside jobCh so a concurrent
+	// Close() can never cause a "send on closed channel" panic.
+	stopCh  chan struct{}
 	Stats   PipelineStats
 	closed  atomic.Bool
 
@@ -93,7 +97,8 @@ func newPipeline(c *Client, workers int) *Pipeline {
 		client:  c,
 		workers: workers,
 		// Large buffer prevents sender blocking under burst load.
-		jobCh: make(chan *pipelineJob, workers*16),
+		jobCh:  make(chan *pipelineJob, workers*16),
+		stopCh: make(chan struct{}),
 		// Drain channel: 4× workers to absorb bursts without ever truncating.
 		drainCh: make(chan *http.Response, workers*4),
 		jobPool: sync.Pool{
@@ -165,10 +170,27 @@ func (p *Pipeline) asyncDrain(resp *Response) {
 }
 
 // worker processes jobs from the channel.
+//
+// Workers select on stopCh so Close() can shut them down without closing
+// jobCh — closing jobCh would race with Send/FireAndForget writers and panic.
 func (p *Pipeline) worker() {
 	defer p.wg.Done()
 
-	for job := range p.jobCh {
+	for {
+		var job *pipelineJob
+		// Prioritize stopCh so Close() takes effect promptly even when jobCh
+		// is full and Go's select would otherwise round-robin.
+		select {
+		case <-p.stopCh:
+			return
+		default:
+		}
+		select {
+		case <-p.stopCh:
+			return
+		case job = <-p.jobCh:
+		}
+
 		start := time.Now()
 		p.Stats.TotalSent.Add(1)
 
@@ -251,6 +273,9 @@ func (p *Pipeline) Send(ctx context.Context, method, url string, body []byte, he
 	case <-ctx.Done():
 		ch <- &PipelineResult{Err: ctx.Err()}
 		p.jobPool.Put(job)
+	case <-p.stopCh:
+		ch <- &PipelineResult{Err: ErrPipelineClosed}
+		p.jobPool.Put(job)
 	}
 
 	return ch
@@ -275,6 +300,8 @@ func (p *Pipeline) FireAndForget(ctx context.Context, method, url string, body [
 	select {
 	case p.jobCh <- job:
 	case <-ctx.Done():
+		p.jobPool.Put(job)
+	case <-p.stopCh:
 		p.jobPool.Put(job)
 	}
 }
@@ -407,9 +434,15 @@ type SprayResult struct {
 }
 
 // Close shuts down the pipeline and waits for all workers to finish.
+//
+// We close stopCh and let workers exit via select; jobCh is NOT closed
+// because a concurrent Send/FireAndForget that just passed the closed check
+// could still race a close(jobCh) and panic ("send on closed channel"). Any
+// jobs buffered in jobCh at shutdown are discarded — acceptable for a
+// fire-and-forget RPS pipeline.
 func (p *Pipeline) Close() {
 	if p.closed.CompareAndSwap(false, true) {
-		close(p.jobCh)
+		close(p.stopCh)
 		p.wg.Wait()
 		// Close drain pool after all workers are done
 		close(p.drainCh)

@@ -161,6 +161,11 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 	var lastResp *Response
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// Drop any prior retryable response — only the final one is returned.
+		if lastResp != nil {
+			lastResp.Close()
+			lastResp = nil
+		}
 		if attempt > 0 {
 			// Exponential backoff: baseDelay * 2^(attempt-1)
 			delay := c.config.retryBaseDelay * (1 << (attempt - 1))
@@ -217,9 +222,10 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 
 		// Check if we should retry on this status code
 		if attempt < maxAttempts-1 && c.shouldRetryStatus(resp.StatusCode) {
-			// Drain and close the body before retrying
-			r.Close()
-			lastResp = nil
+			// Keep this response around — if retries exhaust without a non-retryable
+			// status, the caller still gets the final attempt's full response
+			// (body, headers, status) rather than just an "HTTP 503" error.
+			lastResp = r
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 			continue
 		}
@@ -227,6 +233,8 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 		return r, nil
 	}
 
+	// All retries exhausted on retryable status codes — surface the last
+	// response so the caller can still inspect headers/body.
 	if lastResp != nil {
 		return lastResp, nil
 	}
@@ -306,7 +314,7 @@ func (c *Client) FastDo(ctx context.Context, template *http.Request) (*Response,
 	if err != nil {
 		return nil, err
 	}
-	return &Response{Response: resp}, nil
+	return &Response{Response: resp, maxBodySize: c.config.maxResponseBody}, nil
 }
 
 // PreConnect pre-warms n TLS connections to the given URL.

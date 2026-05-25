@@ -79,7 +79,7 @@ func withBrowserProfile(profile BrowserProfile) Option {
 			c.acceptLanguage = "en-US,en;q=0.9"
 			c.accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
 		case SafariIOS18:
-			c.acceptLanguage = "tr-TR,tr;q=0.9"
+			c.acceptLanguage = "en-US,en;q=0.9"
 			c.accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 		}
 	}
