@@ -230,20 +230,23 @@ func TestHeaderOrder(t *testing.T) {
 }
 
 func TestBrowserProfile(t *testing.T) {
-	// Firefox148/Chrome146 are backward-compatible aliases for Firefox150/
-	// Chrome147 (same TLS/H2 fingerprint, only UA changed), so String()
-	// reports the canonical current name.
+	// Firefox148/Chrome146/Chrome147 are backward-compatible aliases for
+	// Firefox150/Chrome148 (same TLS/H2 fingerprint, only UA changed), so
+	// String() reports the canonical current name.
 	if Firefox150.String() != "Firefox/150.0" {
 		t.Errorf("Firefox150.String() = %q, want 'Firefox/150.0'", Firefox150.String())
 	}
 	if Firefox148 != Firefox150 {
 		t.Errorf("Firefox148 should alias Firefox150")
 	}
-	if Chrome147.String() != "Chrome/147.0" {
-		t.Errorf("Chrome147.String() = %q, want 'Chrome/147.0'", Chrome147.String())
+	if Chrome148.String() != "Chrome/148.0" {
+		t.Errorf("Chrome148.String() = %q, want 'Chrome/148.0'", Chrome148.String())
 	}
-	if Chrome146 != Chrome147 {
-		t.Errorf("Chrome146 should alias Chrome147")
+	if Chrome146 != Chrome148 {
+		t.Errorf("Chrome146 should alias Chrome148")
+	}
+	if Chrome147 != Chrome148 {
+		t.Errorf("Chrome147 should alias Chrome148")
 	}
 }
 

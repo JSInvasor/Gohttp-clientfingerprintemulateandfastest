@@ -103,7 +103,7 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 
 	// Set browser-specific fingerprint
 	switch browser {
-	case Chrome147:
+	case Chrome148:
 		t.h2Settings = Chrome146H2Settings()
 		t.headerOrder = chrome146HeaderOrder
 	case SafariIOS18:
@@ -158,7 +158,7 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		// Get browser-specific H2 profile
 		var h2p H2Profile
 		switch browser {
-		case Chrome147:
+		case Chrome148:
 			h2p = Chrome146H2Profile()
 		case SafariIOS18:
 			h2p = SafariIOS18H2Profile()
@@ -259,7 +259,7 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 	// Map browser profile to ctls browser type once, outside the loop.
 	browserType := ctls.BrowserFirefox148
 	switch t.browser {
-	case Chrome147:
+	case Chrome148:
 		browserType = ctls.BrowserChrome146
 	case SafariIOS18:
 		browserType = ctls.BrowserSafariIOS18
@@ -795,8 +795,8 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 	// Chrome/Safari TLS handshake we just performed.
 	ua := Firefox150UserAgent
 	switch t.browser {
-	case Chrome147:
-		ua = Chrome147UserAgent
+	case Chrome148:
+		ua = Chrome148UserAgent
 	case SafariIOS18:
 		ua = SafariIOS18UserAgent
 	}

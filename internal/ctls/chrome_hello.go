@@ -6,13 +6,19 @@ import (
 	"math/big"
 )
 
-// Chrome 146 ClientHello builder.
-// Verified against real Chrome 146 via tls.peet.ws.
+// Chrome ClientHello builder (Chrome 146-148 share an identical TLS layer;
+// only UA + sec-ch-ua differ between those releases).
+// Verified against real Chrome via tls.peet.ws.
 //
-// JA3: 771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,
-//      45-11-51-27-23-43-18-65281-16-0-10-17613-13-65037-5-35-41,4588-29-23-24,0
-// JA3 Hash: 9271bc66017f8920fe4549ad9e47e63b
-// JA4: t13d1517h2_8daaf6152771_b6f405a00624
+// JA3 ciphers + extension SET match real Chrome. Extensions are shuffled per
+// connection (see buildChromeExtensions), so the JA3 hash varies by design.
+//
+// JA4 on a COLD connection (no session ticket): t13d1516h2_8daaf6152771_...
+//   - 15 = cipher count, 16 = non-GREASE extension count.
+// On a RESUMED connection Chrome adds pre_shared_key (41), giving 17 extensions
+// and the t13d1517h2_8daaf6152771_b6f405a00624 seen in resumed captures. We do
+// not emulate PSK resumption (the binder is cryptographically bound to a prior
+// session), so cold-connection output is the canonical t13d1516h2 form.
 //
 // Key differences from Firefox 148:
 //   - GREASE values in cipher suites, extensions, supported_groups, supported_versions, key_share
@@ -166,7 +172,11 @@ func buildChromeExtensions(serverName string, alpn []string, km *keyMaterial, gs
 		{extALPN, buildALPN(alpn)},
 		{extServerName, buildSNI(serverName)},
 		{extSupportedGroups, buildChromeSupportedGroups(gs)},
-		{extALPS, buildALPS(alpn)},
+		// ALPS advertises only "h2" - real Chrome never lists http/1.1 here,
+		// even though ALPN (above) carries both. Passing the full ALPN slice
+		// would leak http/1.1 into application_settings and mismatch the
+		// real-Chrome capture.
+		{extALPS, buildALPS([]string{"h2"})},
 		{extSignatureAlgorithms, buildChromeSigAlgs()},
 		{extECH, echGrease},
 		{extStatusRequest, buildStatusRequest()},
@@ -293,7 +303,7 @@ func buildChromeSigAlgs() []byte {
 }
 
 // buildALPS builds the application_settings (ALPS) extension.
-// Chrome sends this with "h2" protocol.
+// Chrome sends this with the "h2" protocol only (never http/1.1).
 func buildALPS(alpn []string) []byte {
 	// ALPS format: protocol_list_length(2) + [ length(1) + protocol ... ]
 	total := 0

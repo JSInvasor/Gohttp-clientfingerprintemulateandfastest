@@ -387,7 +387,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 
 	if solvedCookies != "" {
 		browsers = []browserSpec{
-			{"chrome", "Ch", gofire.Chrome147, clientBudget},
+			{"chrome", "Ch", gofire.Chrome148, clientBudget},
 		}
 		if solvedUA != "" {
 			baseOpts = append(baseOpts, gofire.WithUserAgent(solvedUA))
@@ -407,7 +407,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		}
 		browsers = []browserSpec{
 			{"firefox", "FF", gofire.Firefox150, firefoxClients},
-			{"chrome", "Ch", gofire.Chrome147, chromeClients},
+			{"chrome", "Ch", gofire.Chrome148, chromeClients},
 			{"safari", "SF", gofire.SafariIOS18, safariClients},
 		}
 	}
