@@ -793,7 +793,7 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 	// Use the browser profile's User-Agent so the pre-warm HEAD doesn't show
 	// up in logs/fingerprinters as a "Mozilla/5.0" mismatch against the FF/
 	// Chrome/Safari TLS handshake we just performed.
-	ua := Firefox150UserAgent
+	ua := Firefox151UserAgent
 	switch t.browser {
 	case Chrome148:
 		ua = Chrome148UserAgent

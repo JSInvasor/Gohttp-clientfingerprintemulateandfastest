@@ -8,11 +8,13 @@ import (
 type BrowserProfile int
 
 const (
-	// Firefox150 emulates Firefox 150 with full TLS/HTTP2/header fingerprint.
-	// The TLS profile (cipher order, supported_groups including P-521 + ffdhe,
-	// delegated_credentials, record_size_limit, compress_certificate variants)
-	// matches Firefox 150 as captured from tls.peet.ws.
-	Firefox150 BrowserProfile = iota
+	// Firefox151 emulates Firefox 151 with full TLS/HTTP2/header fingerprint.
+	// The TLS profile (16-suite cipher order, supported_groups including
+	// P-521 + ffdhe, delegated_credentials, record_size_limit,
+	// compress_certificate variants) matches Firefox 151 as captured from
+	// tls.peet.ws. Cold-connection JA4 is t13d1617h2_86a278354501_...
+	// (resumed sessions swap session_ticket for pre_shared_key).
+	Firefox151 BrowserProfile = iota
 	// Chrome148 emulates Chrome 148 with full TLS/HTTP2/header fingerprint.
 	// TLS layer (ciphers, extensions, Akamai H2 52d84b1...) is shared with
 	// Chrome 146/147; only UA and sec-ch-ua brand list differ. Cold-connection
@@ -22,11 +24,11 @@ const (
 	// SafariIOS18 emulates Safari iOS 18.7 with full TLS/HTTP2/header fingerprint.
 	SafariIOS18
 
-	// Firefox148 is a backward-compatible alias for Firefox150. The previous
-	// Firefox 148 fingerprint was bumped to 150 because the underlying TLS
-	// extensions and ClientHello layout already matched the newer release;
-	// only the User-Agent string changed. New code should use Firefox150.
-	Firefox148 = Firefox150
+	// Firefox148 / Firefox150 are backward-compatible aliases for Firefox151.
+	// The underlying TLS/H2 fingerprint is shared across those releases; only
+	// the User-Agent string changed. New code should use Firefox151.
+	Firefox150 = Firefox151
+	Firefox148 = Firefox151
 	// Chrome146 / Chrome147 are backward-compatible aliases for Chrome148. Same
 	// reason as Firefox148: TLS layer is unchanged, only UA + sec-ch-ua moved.
 	// New code should use Chrome148.
@@ -37,8 +39,8 @@ const (
 // String returns the browser profile name.
 func (b BrowserProfile) String() string {
 	switch b {
-	case Firefox150:
-		return "Firefox/150.0"
+	case Firefox151:
+		return "Firefox/151.0"
 	case Chrome148:
 		return "Chrome/148.0"
 	case SafariIOS18:
@@ -53,12 +55,12 @@ func (b BrowserProfile) String() string {
 //
 // Usage:
 //
-//	client, err := gofire.Emulate(gofire.Firefox150)
+//	client, err := gofire.Emulate(gofire.Firefox151)
 //	client, err := gofire.Emulate(gofire.Chrome148)
 //	client, err := gofire.Emulate(gofire.Chrome148, gofire.WithProxy("socks5://..."))
 func Emulate(profile BrowserProfile, opts ...Option) (*Client, error) {
 	switch profile {
-	case Firefox150, Chrome148, SafariIOS18:
+	case Firefox151, Chrome148, SafariIOS18:
 		allOpts := make([]Option, 0, len(opts)+1)
 		allOpts = append(allOpts, withBrowserProfile(profile))
 		allOpts = append(allOpts, opts...)
@@ -75,7 +77,7 @@ func withBrowserProfile(profile BrowserProfile) Option {
 		c.transport.DisableCompression = true
 
 		switch profile {
-		case Firefox150:
+		case Firefox151:
 			c.acceptLanguage = "en-US,en;q=0.5"
 			c.accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 		case Chrome148:

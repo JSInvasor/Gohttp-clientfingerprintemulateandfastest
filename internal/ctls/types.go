@@ -89,7 +89,11 @@ const (
 	cipherTLS_RSA_WITH_AES_256_CBC_SHA               = 0x0035
 )
 
-// Firefox 148 cipher suite order
+// Firefox 151 cipher suite order (16 suites). Verified against a real
+// Firefox 151 capture from tls.peet.ws (JA3 ciphers
+// 4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49171-49172-156-157-47-53).
+// Note: modern Firefox dropped ECDHE_ECDSA_WITH_AES_128_CBC_SHA (0xC009) - it
+// sends only the ECDSA AES256 CBC suite (0xC00A) among the ECDSA CBC pair.
 var firefox148CipherSuites = []uint16{
 	cipherTLS_AES_128_GCM_SHA256,
 	cipherTLS_CHACHA20_POLY1305_SHA256,
@@ -101,7 +105,6 @@ var firefox148CipherSuites = []uint16{
 	cipherTLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 	cipherTLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 	cipherTLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-	cipherTLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
 	cipherTLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
 	cipherTLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
 	cipherTLS_RSA_WITH_AES_128_GCM_SHA256,

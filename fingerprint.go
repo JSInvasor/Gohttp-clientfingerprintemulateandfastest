@@ -24,15 +24,20 @@ type H2Profile struct {
 	PriorityExclusive bool
 }
 
-// ========== Firefox 148 ==========
+// ========== Firefox (146-151 share this TLS/H2 layer) ==========
 
-// Firefox148 TLS fingerprint identifiers (verified via tls.peet.ws on 2026-03-22).
+// Firefox TLS fingerprint identifiers (verified against a real Firefox 151
+// capture via tls.peet.ws). The H2 function names keep the historical 148
+// suffix; the layer is unchanged across releases.
 //
-// JA3 Hash: 6f7889b9fb1a62a9577e685c1fcfa919
-// JA4: t13d1717h2_5b57614c22b0_3cbfd9057e0d
+// JA3 ciphers (16 suites): 4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49171-49172-156-157-47-53
+// JA4 (cold connection): t13d1617h2_86a278354501_...
+//   On a RESUMED session Firefox swaps the empty session_ticket(35) for
+//   pre_shared_key(41); that capture reads t13d1617h2_86a278354501_e6dcd7ae0a9e.
+//   We do not emulate PSK resumption, so cold output keeps session_ticket.
 //
 // Akamai HTTP/2 fingerprint: 1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s
-// Akamai hash: 6ea73faa8fc5aac76bded7bd238f6433
+// Akamai hash: 6ea73faa8fc5aac76bded7bd238f6433 (verified current)
 
 func Firefox148H2Settings() H2Settings {
 	return H2Settings{

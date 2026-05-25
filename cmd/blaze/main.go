@@ -406,7 +406,7 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 			firefoxClients = 1
 		}
 		browsers = []browserSpec{
-			{"firefox", "FF", gofire.Firefox150, firefoxClients},
+			{"firefox", "FF", gofire.Firefox151, firefoxClients},
 			{"chrome", "Ch", gofire.Chrome148, chromeClients},
 			{"safari", "SF", gofire.SafariIOS18, safariClients},
 		}
