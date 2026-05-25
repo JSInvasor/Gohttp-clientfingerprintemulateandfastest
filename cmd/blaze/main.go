@@ -207,6 +207,45 @@ var browserLabel = map[string]string{
 	"SF": "Safari iOS 18",
 }
 
+// classifyErr turns a raw error string into a short, actionable reason.
+// Handshake failures in particular get broken down by *why* they failed —
+// the generic "tls handshake failed" hid whether the cause was a slow proxy
+// (timeout), a proxy dropping the tunnel (reset/EOF), a MITM proxy (cert),
+// or a non-tunneling proxy (CONNECT failed).
+func classifyErr(errMsg string) string {
+	lc := strings.ToLower(errMsg)
+	switch {
+	case strings.Contains(lc, "connect failed") || strings.Contains(lc, "connect "):
+		// Proxy refused/failed the CONNECT — show the proxy's status line.
+		return trimErr(errMsg, "proxy CONNECT failed: ")
+	case strings.Contains(lc, "i/o timeout") || strings.Contains(lc, "deadline exceeded") || strings.Contains(lc, "timeout"):
+		if strings.Contains(lc, "handshake") || strings.Contains(lc, "server hello") {
+			return "tls handshake timeout (slow/dead proxy)"
+		}
+		return "timeout (slow/dead proxy)"
+	case strings.Contains(lc, "certificate") || strings.Contains(lc, "x509"):
+		return "tls cert error (MITM/transparent proxy?)"
+	case strings.Contains(lc, "eof") || strings.Contains(lc, "reset") || strings.Contains(lc, "broken pipe"):
+		return "tls handshake: tunnel dropped by proxy"
+	case strings.Contains(lc, "server hello") || strings.Contains(lc, "handshake"):
+		// Some other handshake-stage failure — keep the real detail.
+		return trimErr(errMsg, "tls handshake: ")
+	case strings.Contains(lc, "connection refused"):
+		return "connection refused"
+	case strings.Contains(lc, "no route to host"):
+		return "no route to host (dead proxy)"
+	default:
+		return trimErr(errMsg, "")
+	}
+}
+
+func trimErr(errMsg, prefix string) string {
+	if len(errMsg) > 200 {
+		errMsg = errMsg[:200] + "..."
+	}
+	return prefix + errMsg
+}
+
 // formatTestResult returns the impersonate line for a browser test.
 func formatTestResult(tag string, statusCode int, err error) string {
 	label := browserLabel[tag]
@@ -215,25 +254,7 @@ func formatTestResult(tag string, statusCode int, err error) string {
 	}
 
 	if err != nil {
-		errMsg := err.Error()
-		var reason string
-		switch {
-		case strings.Contains(errMsg, "tls handshake") || strings.Contains(errMsg, "handshake"):
-			reason = "tls handshake failed"
-		case strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "Timeout"):
-			reason = "timeout"
-		case strings.Contains(errMsg, "connection refused"):
-			reason = "connection refused"
-		default:
-			// Show the full error. Previous 80-char cap was hiding the
-			// most important part — proxy CONNECT status lines like
-			// "HTTP/1.1 403 Forbidden" got truncated to "HTT".
-			reason = errMsg
-			if len(reason) > 240 {
-				reason = reason[:240] + "..."
-			}
-		}
-		return fmt.Sprintf("%sImpersonate %s %s>%s %s%s%s", white, label, gray, reset, red, reason, reset)
+		return fmt.Sprintf("%sImpersonate %s %s>%s %s%s%s", white, label, gray, reset, red, classifyErr(err.Error()), reset)
 	}
 	return fmt.Sprintf("%sImpersonate %s %s>%s %s%d%s", white, label, gray, reset, white, statusCode, reset)
 }

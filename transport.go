@@ -304,7 +304,10 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 		tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, browserType)
 		if err != nil {
 			rawConn.Close()
-			lastErr = fmt.Errorf("tls handshake: %w", err)
+			// WrapConn already prefixes "tls handshake:"; don't double-wrap.
+			// The underlying detail (e.g. "read server hello record: i/o
+			// timeout") is what makes proxy failures diagnosable, so keep it.
+			lastErr = err
 			if !isTransientDialErr(err) {
 				return nil, lastErr
 			}
