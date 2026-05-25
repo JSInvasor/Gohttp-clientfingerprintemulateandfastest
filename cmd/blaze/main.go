@@ -213,8 +213,8 @@ func (cg *clientGroup) updateCookies(newCookies string) {
 
 // browserLabel maps tag to full display name
 var browserLabel = map[string]string{
-	"Ch": "Chrome 147",
-	"FF": "Firefox 150",
+	"Ch": "Chrome 148",
+	"FF": "Firefox 151",
 	"SF": "Safari iOS 18",
 }
 
