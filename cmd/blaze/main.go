@@ -145,11 +145,22 @@ func solveCFChallenge(targetURL string) (cookies string, userAgent string, err e
 		return "", "", fmt.Errorf("solver ciktisi okunamadi: %w", errJSON)
 	}
 
-	if result.Status == "error" {
+	// Strict status check. Treating any non-empty cookie jar as success is a
+	// trap: the no_clearance case still harvests __cf_bm, so a full UAM target
+	// that never issued cf_clearance would print "cozuldu!" and then 403 the
+	// whole run. Only status=="ok" (cf_clearance present) is a real solve.
+	switch result.Status {
+	case "ok":
+		// real cf_clearance — fall through
+	case "no_clearance":
+		return "", "", fmt.Errorf("cf_clearance alinamadi (challenge gecilemedi — IP reputation / UAM). status=no_clearance")
+	case "error":
 		return "", "", fmt.Errorf("%s", result.Error)
+	default:
+		return "", "", fmt.Errorf("beklenmeyen solver durumu: %s", result.Status)
 	}
 	if result.Cookies == "" {
-		return "", "", fmt.Errorf("cookie yok (status: %s)", result.Status)
+		return "", "", fmt.Errorf("cookie bos (status: %s)", result.Status)
 	}
 
 	fmt.Printf("%schallenge cozuldu!%s\n", white, reset)
