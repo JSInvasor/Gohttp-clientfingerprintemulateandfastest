@@ -489,15 +489,49 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		// Proxies often need 5-10s just for CONNECT; 30s gives a fair test.
 		testTimeout = 30 * time.Second
 	}
+	// The connectivity banner always probes with GET: its job is to confirm we
+	// can reach and TLS-handshake the target with the browser fingerprint, not
+	// to exercise the load method. Promoting it to POST (when --body is set)
+	// made a target-side POST rejection — a WAF/405/RST or an IP ban on an
+	// unexpected POST — surface as a misleading "connection refused" on the
+	// banner, as if the client itself were dead. The real POST+body request is
+	// probed separately below so its result is shown plainly.
 	for _, cg := range groups {
 		testCtx, testCancel := context.WithTimeout(context.Background(), testTimeout)
-		resp, testErr := cg.clients[0].DoWithContext(testCtx, method, targetURL, nil, nil)
+		resp, testErr := cg.clients[0].DoWithContext(testCtx, "GET", targetURL, nil, nil)
 		testCancel()
 		if testErr != nil {
 			fmt.Println(formatTestResult(cg.tag, 0, testErr))
 		} else {
 			fmt.Println(formatTestResult(cg.tag, resp.StatusCode(), nil))
 			resp.Close()
+		}
+	}
+
+	// When the load ships a body, probe the actual POST+body request once per
+	// browser. A failure here (while the GET line above is green) means the
+	// target rejects the POST itself — the connection is fine. This keeps the
+	// banner honest instead of blaming the client for a refused POST.
+	if bodyBytes != nil {
+		for _, cg := range groups {
+			if len(cg.templates) == 0 {
+				continue
+			}
+			label := browserLabel[cg.tag]
+			if label == "" {
+				label = cg.tag
+			}
+			probeCtx, probeCancel := context.WithTimeout(context.Background(), testTimeout)
+			resp, probeErr := cg.clients[0].FastDo(probeCtx, cg.templates[0])
+			probeCancel()
+			if probeErr != nil {
+				fmt.Printf("%sPOST %s %db %s>%s %s%s%s\n",
+					white, label, len(bodyBytes), gray, reset, red, classifyErr(probeErr.Error()), reset)
+			} else {
+				fmt.Printf("%sPOST %s %db %s>%s %s%d%s\n",
+					white, label, len(bodyBytes), gray, reset, white, resp.StatusCode(), reset)
+				resp.Close()
+			}
 		}
 	}
 
