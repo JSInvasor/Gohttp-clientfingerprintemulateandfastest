@@ -24,6 +24,13 @@ type ProxyRotator struct {
 
 	// failThreshold is the consecutive failure count that marks a proxy dead.
 	failThreshold int
+
+	// primaryIdx, when >= 0, makes this rotator "sticky": NextEntry always
+	// prefers proxies[primaryIdx] while it is alive, and only rotates to a live
+	// backup when the primary is in cooldown. -1 means pure round-robin.
+	// Per-client views created via Pinned share the same proxyEntry pointers
+	// (and thus health) but carry their own primaryIdx + counter.
+	primaryIdx int
 }
 
 type proxyEntry struct {
@@ -78,7 +85,31 @@ func NewProxyRotator(proxies []string) (*ProxyRotator, error) {
 		proxies:       parsed,
 		cooldown:      30 * time.Second,
 		failThreshold: 3,
+		primaryIdx:    -1,
 	}, nil
+}
+
+// Pinned returns a lightweight per-client view of this rotator with a sticky
+// primary proxy (proxies[idx]). The view SHARES the underlying proxy entries —
+// and therefore their health (failure counts, cooldown) — with the parent and
+// every sibling view, so a proxy marked dead by one client is skipped by all.
+// Each view has its own round-robin cursor used only for failover.
+//
+// This gives both wide coverage (every client prefers a distinct proxy, so the
+// whole list is exercised) and failover (a dead primary transparently routes
+// through a live backup, then returns to the primary once it recovers).
+func (pr *ProxyRotator) Pinned(idx int) *ProxyRotator {
+	if len(pr.proxies) > 0 {
+		idx = ((idx % len(pr.proxies)) + len(pr.proxies)) % len(pr.proxies)
+	} else {
+		idx = -1
+	}
+	return &ProxyRotator{
+		proxies:       pr.proxies,
+		cooldown:      pr.cooldown,
+		failThreshold: pr.failThreshold,
+		primaryIdx:    idx,
+	}
 }
 
 // NewProxyRotatorFromFile loads proxies from a file (one per line).
@@ -133,6 +164,15 @@ func (pr *ProxyRotator) Next() *url.URL {
 func (pr *ProxyRotator) NextEntry() *proxyEntry {
 	n := len(pr.proxies)
 	now := time.Now().UnixNano()
+
+	// Sticky primary: prefer the pinned proxy while it is alive. Once it enters
+	// cooldown we fall through to the round-robin sweep for a live backup, and
+	// when its cooldown expires this check picks it up again (re-probing it).
+	if pr.primaryIdx >= 0 && pr.primaryIdx < n {
+		if p := pr.proxies[pr.primaryIdx]; p.deadUntilNs.Load() <= now {
+			return p
+		}
+	}
 
 	// One full sweep: pick the first live proxy after our round-robin cursor.
 	for i := 0; i < n; i++ {

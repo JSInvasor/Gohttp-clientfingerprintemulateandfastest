@@ -104,6 +104,62 @@ func TestProxyRotatorAllDeadFallback(t *testing.T) {
 	}
 }
 
+func TestProxyRotatorPinnedFailover(t *testing.T) {
+	pr, err := NewProxyRotator([]string{
+		"1.1.1.1:8080",
+		"2.2.2.2:8080",
+		"3.3.3.3:8080",
+	})
+	if err != nil {
+		t.Fatalf("NewProxyRotator: %v", err)
+	}
+	pr.SetCooldown(50 * time.Millisecond)
+	pr.SetFailThreshold(2)
+
+	view := pr.Pinned(0) // sticky primary = 1.1.1.1
+
+	// While the primary is alive, the view must ALWAYS return it.
+	for i := 0; i < 10; i++ {
+		if got := view.Next().Host; got != "1.1.1.1:8080" {
+			t.Fatalf("sticky primary: iter %d returned %q, want primary", i, got)
+		}
+	}
+
+	// Kill the primary (2 failures -> dead) and confirm shared health: the kill
+	// happens through the view, the parent must see it too.
+	e := view.NextEntry()
+	view.MarkFailure(e)
+	view.MarkFailure(e)
+	if pr.LiveCount() != 2 {
+		t.Fatalf("shared health: parent LiveCount = %d, want 2", pr.LiveCount())
+	}
+
+	// With the primary dead, the view must fail over to a LIVE backup.
+	for i := 0; i < 10; i++ {
+		got := view.Next().Host
+		if got == "1.1.1.1:8080" {
+			t.Fatalf("failover: iter %d still returned dead primary", i)
+		}
+	}
+
+	// After cooldown the primary recovers and the view returns to it.
+	time.Sleep(70 * time.Millisecond)
+	if got := view.Next().Host; got != "1.1.1.1:8080" {
+		t.Fatalf("recovery: returned %q, want primary back", got)
+	}
+}
+
+func TestProxyRotatorPinnedDistinctPrimaries(t *testing.T) {
+	pr, _ := NewProxyRotator([]string{"1.1.1.1:8080", "2.2.2.2:8080", "3.3.3.3:8080"})
+	// Pinned indices wrap and each view prefers its own distinct primary.
+	want := []string{"1.1.1.1:8080", "2.2.2.2:8080", "3.3.3.3:8080", "1.1.1.1:8080"}
+	for i, w := range want {
+		if got := pr.Pinned(i).Next().Host; got != w {
+			t.Errorf("Pinned(%d).Next = %q, want %q", i, got, w)
+		}
+	}
+}
+
 func TestProxyRotatorSuccessClearsFailures(t *testing.T) {
 	pr, _ := NewProxyRotator([]string{"1.1.1.1:8080"})
 	pr.SetFailThreshold(3)

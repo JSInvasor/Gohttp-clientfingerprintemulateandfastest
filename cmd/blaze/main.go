@@ -623,13 +623,13 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		// --- Load-only mode: 3 browser profiles, optional proxy file -------
 		//
 		//   single proxy URL on cmdline -> WithProxy on every client
-		//   proxy file                  -> one client per proxy, pinned via
-		//                                  WithProxy. The shared rotator only
-		//                                  rotates at dial time, so H2 conn
-		//                                  reuse meant a 300-entry list often
-		//                                  saw only ~5 proxies; per-proxy
-		//                                  clients exercise every entry.
-		var proxyURLs []string
+		//   proxy file                  -> one sticky primary proxy per client,
+		//                                  backed by a SHARED rotator so a dead
+		//                                  proxy fails over to a live one (and
+		//                                  recovers after cooldown). Every client
+		//                                  still prefers a distinct primary, so
+		//                                  the whole list is exercised.
+		var rotator *gofire.ProxyRotator
 		if usingProxy {
 			if isProxyFile(proxyArg) {
 				pr, err := gofire.NewProxyRotatorFromFile(proxyArg)
@@ -637,20 +637,21 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 					fmt.Fprintf(os.Stderr, "%shata: proxy dosyasi yuklenemedi: %v%s\n", red, err, reset)
 					os.Exit(1)
 				}
-				proxyURLs = pr.ProxyURLs()
-				if len(proxyURLs) == 0 {
+				if pr.Count() == 0 {
 					fmt.Fprintf(os.Stderr, "%shata: proxy dosyasi bos%s\n", red, reset)
 					os.Exit(1)
 				}
+				pr.SetCooldown(15 * time.Second) // snappier recovery under load
+				rotator = pr
+				proxyCount = pr.Count()
 			} else {
 				baseOpts = append(baseOpts, gofire.WithProxy(proxyArg))
 			}
 		}
-		proxyCount = len(proxyURLs)
 
 		clientBudget := totalTargetClients
-		if len(proxyURLs) > 0 {
-			clientBudget = len(proxyURLs)
+		if rotator != nil {
+			clientBudget = rotator.Count()
 		}
 
 		safariClients := clientBudget * 4 / 10
@@ -686,7 +687,8 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 
 		// Global cursor so each client across browser groups gets a distinct
-		// proxy. With clientBudget == len(proxyURLs) the assignment is 1:1.
+		// sticky primary proxy. With clientBudget == proxy count the assignment
+		// is 1:1; failover to live backups is handled by the shared rotator.
 		proxyIdx := 0
 		groups = make([]*clientGroup, len(browsers))
 		for bi, bs := range browsers {
@@ -695,14 +697,14 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 				clientOpts := make([]gofire.Option, 0, len(baseOpts)+2)
 				clientOpts = append(clientOpts, baseOpts...)
 				clientOpts = append(clientOpts, gofire.WithReferer(browserReferers[bs.name]))
-				if len(proxyURLs) > 0 {
-					clientOpts = append(clientOpts, gofire.WithProxy(proxyURLs[proxyIdx%len(proxyURLs)]))
-					proxyIdx++
-				}
 				c, err := gofire.Emulate(bs.profile, clientOpts...)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "%shata: %s client olusturulamadi: %v%s\n", red, bs.name, err, reset)
 					os.Exit(1)
+				}
+				if rotator != nil {
+					c.SetProxyRotator(rotator.Pinned(proxyIdx))
+					proxyIdx++
 				}
 				tmpl, err := c.PrepareRequest(method, targetURL)
 				if err != nil {
