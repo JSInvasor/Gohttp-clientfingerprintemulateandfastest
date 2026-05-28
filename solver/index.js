@@ -18,7 +18,7 @@
 // previously-working targets because our overrides clashed with theirs
 // (double-defined props become a fingerprint instead of hiding one).
 // Only thing we do beyond connect() is pin the UA to match blaze's
-// emulated Chrome 147 — UAM binds cf_clearance to UA + JA4.
+// emulated Chrome 148 — UAM binds cf_clearance to UA + JA4.
 
 import { connect } from "puppeteer-real-browser";
 import { execSync } from "node:child_process";
@@ -29,7 +29,7 @@ const TIMEOUT_MS = timeoutSec * 1000;
 
 const TARGET_UA =
   process.env.SOLVER_UA ||
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
 
 if (!url) {
   console.error(

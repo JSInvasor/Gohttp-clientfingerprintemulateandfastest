@@ -31,12 +31,21 @@ const (
 )
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "fp" {
+		fpURL := "https://tls.peet.ws/api/all"
+		if len(os.Args) >= 3 {
+			fpURL = os.Args[2]
+		}
+		runFingerprintCheck(fpURL)
+		return
+	}
 	if len(os.Args) < 4 {
 		fmt.Println("kullanim: blaze <url> <sure_sn> <thread> [stream] [method] [proxy|proxy_dosya] [--solve] [--body=BOYUT]")
 		fmt.Println()
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 64 32")
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 40 40 GET --solve")
 		fmt.Println("ornek:    ./blaze https://hedef.com 60 40 40 POST --body=16k   (origin'e buyuk paket)")
+		fmt.Println("ornek:    ./blaze fp                        (her profilin canli JA3/JA4/H2'sini tls.peet.ws'ten basar)")
 		os.Exit(1)
 	}
 
@@ -191,6 +200,55 @@ func lastJSONLine(out []byte) []byte {
 		}
 	}
 	return nil
+}
+
+// runFingerprintCheck prints each browser profile's live JA3/JA4 + HTTP/2
+// (Akamai) fingerprint as observed by a fingerprint echo service. Use it to
+// confirm gofire's emulation matches a real browser (e.g. the one the solver
+// drives) before trusting a cf_clearance replay.
+func runFingerprintCheck(fpURL string) {
+	profiles := []struct {
+		name string
+		prof gofire.BrowserProfile
+	}{
+		{"Firefox151", gofire.Firefox151},
+		{"Chrome148", gofire.Chrome148},
+		{"SafariIOS18", gofire.SafariIOS18},
+	}
+	fmt.Printf("%sfingerprint kaynagi: %s%s\n", gray, fpURL, reset)
+	for _, pr := range profiles {
+		c, err := gofire.Emulate(pr.prof)
+		if err != nil {
+			fmt.Printf("%s%s: emulate hatasi: %v%s\n", red, pr.name, err, reset)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		resp, err := c.DoWithContext(ctx, "GET", fpURL, nil, nil)
+		cancel()
+		if err != nil {
+			fmt.Printf("%s%s: istek hatasi: %v%s\n", red, pr.name, err, reset)
+			c.Close()
+			continue
+		}
+		body, _ := resp.Text()
+		resp.Close()
+		c.Close()
+
+		var d struct {
+			TLS struct {
+				JA3Hash string `json:"ja3_hash"`
+				JA4     string `json:"ja4"`
+			} `json:"tls"`
+			HTTP2 struct {
+				Akamai string `json:"akamai_fingerprint"`
+			} `json:"http2"`
+		}
+		if errJSON := json.Unmarshal([]byte(body), &d); errJSON != nil {
+			fmt.Printf("%s%s: cikti parse edilemedi: %v (ham: %.120s)%s\n", red, pr.name, errJSON, body, reset)
+			continue
+		}
+		fmt.Printf("%s%s%s\n  ja4=%s\n  ja3_hash=%s\n  h2=%s\n", white, pr.name, reset, d.TLS.JA4, d.TLS.JA3Hash, d.HTTP2.Akamai)
+	}
 }
 
 func findSolver() string {
