@@ -467,6 +467,13 @@ type ClientConn struct {
 	werr error        // first write error that has occurred
 	hbuf bytes.Buffer // HPACK encoder writes into this
 	henc *hpack.Encoder
+
+	// hdrEmitted is a scratch set reused across encodeHeaders calls to track
+	// which ordered headers were already written, so the high-RPS hot path
+	// doesn't allocate a fresh map per request. Guarded by wmu (the same lock
+	// that serializes encodeHeaders and protects hbuf). Cleared on each use,
+	// so the emitted header order on the wire is byte-for-byte unchanged.
+	hdrEmitted map[string]bool
 }
 
 // clientStream is the state for a single HTTP/2 stream. One of these
@@ -2206,21 +2213,26 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 			m = http.MethodGet
 		}
 
-		// Build pseudo-header map for ordered emission
-		pseudoHeaders := map[string]string{
-			":authority": host,
-			":method":    m,
-		}
-		if !isNormalConnect(req) {
-			pseudoHeaders[":path"] = path
-			pseudoHeaders[":scheme"] = req.URL.Scheme
-		}
-
-		// Emit pseudo-headers in custom order if specified, otherwise default order
+		// Emit pseudo-headers in custom order if specified, otherwise default
+		// order. Resolve each name with a switch instead of building a
+		// per-request map: the emitted order (driven by PseudoHeaderOrder) and
+		// values are identical, but the hot path no longer allocates.
+		notConnect := !isNormalConnect(req)
 		if len(cc.t.PseudoHeaderOrder) > 0 {
 			for _, ph := range cc.t.PseudoHeaderOrder {
-				if val, ok := pseudoHeaders[ph]; ok {
-					f(ph, val)
+				switch ph {
+				case ":authority":
+					f(":authority", host)
+				case ":method":
+					f(":method", m)
+				case ":path":
+					if notConnect {
+						f(":path", path)
+					}
+				case ":scheme":
+					if notConnect {
+						f(":scheme", req.URL.Scheme)
+					}
 				}
 			}
 		} else {
@@ -2288,8 +2300,17 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 
 		// Emit regular headers in custom order if specified
 		if len(cc.t.HeaderOrder) > 0 {
-			// First pass: emit headers in the specified order
-			emitted := make(map[string]bool, len(cc.t.HeaderOrder))
+			// First pass: emit headers in the specified order. Reuse the
+			// per-conn scratch set (guarded by wmu) instead of allocating a
+			// map every request; clear() keeps the dedup semantics — and thus
+			// the wire output — identical.
+			emitted := cc.hdrEmitted
+			if emitted == nil {
+				emitted = make(map[string]bool, len(cc.t.HeaderOrder)+4)
+				cc.hdrEmitted = emitted
+			} else {
+				clear(emitted)
+			}
 			for _, orderedKey := range cc.t.HeaderOrder {
 				// Emit content-length in its correct position within the header order
 				if asciiEqualFold(orderedKey, "Content-Length") {
