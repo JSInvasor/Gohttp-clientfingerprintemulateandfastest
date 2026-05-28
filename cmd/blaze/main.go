@@ -140,8 +140,18 @@ func solveCFChallenge(targetURL string) (cookies string, userAgent string, err e
 		return "", "", fmt.Errorf("solver calistirilamadi: %w", errCmd)
 	}
 
+	// The solver prints its result as a single JSON line on stdout, but
+	// puppeteer / chrome-launcher and friends occasionally bleed non-JSON text
+	// onto stdout too (e.g. a launcher warning starting "Your ..."), which made
+	// a whole-buffer Unmarshal fail with a useless "invalid character 'Y'"
+	// instead of surfacing the real error. Parse the last JSON object line.
+	jsonLine := lastJSONLine(output)
+	if jsonLine == nil {
+		return "", "", fmt.Errorf("solver ciktisi okunamadi: cikti icinde JSON yok:\n%s", string(output))
+	}
+
 	var result solverResult
-	if errJSON := json.Unmarshal(output, &result); errJSON != nil {
+	if errJSON := json.Unmarshal(jsonLine, &result); errJSON != nil {
 		return "", "", fmt.Errorf("solver ciktisi okunamadi: %w", errJSON)
 	}
 
@@ -165,6 +175,22 @@ func solveCFChallenge(targetURL string) (cookies string, userAgent string, err e
 
 	fmt.Printf("%schallenge cozuldu!%s\n", white, reset)
 	return result.Cookies, result.UserAgent, nil
+}
+
+// lastJSONLine returns the last stdout line that is a valid JSON object,
+// tolerating dependency noise printed around the solver's single JSON result.
+func lastJSONLine(out []byte) []byte {
+	lines := bytes.Split(out, []byte("\n"))
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := bytes.TrimSpace(lines[i])
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		if json.Valid(line) {
+			return line
+		}
+	}
+	return nil
 }
 
 func findSolver() string {
