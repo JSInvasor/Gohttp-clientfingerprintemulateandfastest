@@ -9,6 +9,7 @@
 //     "user_agent": "<navigator.userAgent>",
 //     "cookies": "name=val; name=val; ...",
 //     "cookie_list": [{name, value, domain, expires}, ...],
+//     "fingerprint": { ja3, ja3_hash, ja4, akamai, ua_seen } | null,
 //     "error": "<message>" }
 //
 // Design: keep it bare. puppeteer-real-browser already ships stealth
@@ -261,11 +262,43 @@ async function solve() {
       .map((c) => `${c.name}=${c.value}`)
       .join("; ");
 
+    // Fingerprint diagnostic. cf_clearance is bound to the REAL Chromium's
+    // JA3/JA4 + UA; blaze replays the cookie with its *emulated* fingerprint,
+    // so the two must match or Cloudflare re-challenges at load. Read what this
+    // browser actually presents so blaze can be aligned to it. Best-effort: a
+    // failure here never costs us the clearance we just earned.
+    let fingerprint = null;
+    const fpURL = process.env.SOLVER_FP_URL || "https://tls.peet.ws/api/all";
+    try {
+      const fpPage = await browser.newPage();
+      await fpPage.setUserAgent(TARGET_UA);
+      const fpResp = await fpPage.goto(fpURL, {
+        waitUntil: "domcontentloaded",
+        timeout: 20_000,
+      });
+      const data = JSON.parse(await fpResp.text());
+      fingerprint = {
+        ja3: data?.tls?.ja3 ?? null,
+        ja3_hash: data?.tls?.ja3_hash ?? null,
+        ja4: data?.tls?.ja4 ?? null,
+        akamai: data?.http2?.akamai_fingerprint ?? null,
+        ua_seen: data?.user_agent ?? null,
+      };
+      await fpPage.close().catch(() => {});
+      log(
+        "fingerprint",
+        `ja4=${fingerprint.ja4} ja3_hash=${fingerprint.ja3_hash} h2=${fingerprint.akamai} ua=${fingerprint.ua_seen}`
+      );
+    } catch (err) {
+      log("fingerprint probe failed", err.message || String(err));
+    }
+
     const output = {
       status: cfClearance ? "ok" : "no_clearance",
       url: finalUrl,
       user_agent: userAgent,
       cookies: cookieHeader,
+      fingerprint,
       cookie_list: cookies.map((c) => ({
         name: c.name,
         value: c.value,
