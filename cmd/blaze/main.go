@@ -222,17 +222,31 @@ func runFingerprintCheck(fpURL string) {
 			fmt.Printf("%s%s: emulate hatasi: %v%s\n", red, pr.name, err, reset)
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		resp, err := c.DoWithContext(ctx, "GET", fpURL, nil, nil)
-		cancel()
-		if err != nil {
-			fmt.Printf("%s%s: istek hatasi: %v%s\n", red, pr.name, err, reset)
-			c.Close()
+		var body string
+		var status int
+		var lastErr error
+		for attempt := 0; attempt < 2; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			resp, errReq := c.DoWithContext(ctx, "GET", fpURL, nil, nil)
+			if errReq != nil {
+				cancel()
+				lastErr = errReq
+				continue
+			}
+			status = resp.StatusCode()
+			body, lastErr = resp.Text()
+			resp.Close()
+			cancel()
+			if lastErr == nil && body != "" {
+				break
+			}
+		}
+		c.Close()
+
+		if lastErr != nil {
+			fmt.Printf("%s%s: hata (status=%d): %v%s\n", red, pr.name, status, lastErr, reset)
 			continue
 		}
-		body, _ := resp.Text()
-		resp.Close()
-		c.Close()
 
 		var d struct {
 			TLS struct {
@@ -244,10 +258,10 @@ func runFingerprintCheck(fpURL string) {
 			} `json:"http2"`
 		}
 		if errJSON := json.Unmarshal([]byte(body), &d); errJSON != nil {
-			fmt.Printf("%s%s: cikti parse edilemedi: %v (ham: %.120s)%s\n", red, pr.name, errJSON, body, reset)
+			fmt.Printf("%s%s: parse edilemedi (status=%d, len=%d): %v | ham: %.160s%s\n", red, pr.name, status, len(body), errJSON, body, reset)
 			continue
 		}
-		fmt.Printf("%s%s%s\n  ja4=%s\n  ja3_hash=%s\n  h2=%s\n", white, pr.name, reset, d.TLS.JA4, d.TLS.JA3Hash, d.HTTP2.Akamai)
+		fmt.Printf("%s%s%s (status=%d)\n  ja4=%s\n  ja3_hash=%s\n  h2=%s\n", white, pr.name, reset, status, d.TLS.JA4, d.TLS.JA3Hash, d.HTTP2.Akamai)
 	}
 }
 
