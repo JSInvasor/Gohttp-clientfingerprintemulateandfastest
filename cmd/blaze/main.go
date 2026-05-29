@@ -218,7 +218,10 @@ func solveCFChallengeVia(targetURL string, proxyURL *url.URL) (cookies string, u
 		return "", "", fmt.Errorf("solver/index.js bulunamadi")
 	}
 	if _, errStat := os.Stat("solver/node_modules"); os.IsNotExist(errStat) {
-		return "", "", fmt.Errorf("solver/node_modules bulunamadi")
+		return "", "", fmt.Errorf("solver/node_modules bulunamadi (once: cd solver && npm install)")
+	}
+	if errEnv := checkSolverEnv(); errEnv != nil {
+		return "", "", errEnv
 	}
 
 	// 90s ceiling: human navigation + challenge solve can legitimately take
@@ -263,7 +266,7 @@ func solveCFChallengeVia(targetURL string, proxyURL *url.URL) (cookies string, u
 	cmd.WaitDelay = 5 * time.Second // grace window for graceful close after Cancel
 	output, errCmd := cmd.Output()
 	if errCmd != nil {
-		return "", "", fmt.Errorf("solver calistirilamadi: %w", errCmd)
+		return "", "", fmt.Errorf("solver calistirilamadi: %w%s", errCmd, chromiumHint(errCmd, output))
 	}
 
 	// The solver prints its result as a single JSON line on stdout, but
@@ -291,7 +294,7 @@ func solveCFChallengeVia(targetURL string, proxyURL *url.URL) (cookies string, u
 	case "no_clearance":
 		return "", "", fmt.Errorf("cf_clearance alinamadi (challenge gecilemedi — IP reputation / UAM). status=no_clearance")
 	case "error":
-		return "", "", fmt.Errorf("%s", result.Error)
+		return "", "", fmt.Errorf("%s%s", result.Error, chromiumHint(fmt.Errorf("%s", result.Error), nil))
 	default:
 		return "", "", fmt.Errorf("beklenmeyen solver durumu: %s", result.Status)
 	}
@@ -380,6 +383,71 @@ func runFingerprintCheck(fpURL string) {
 		}
 		fmt.Printf("%s%s%s (status=%d)\n  ja4=%s\n  ja3_hash=%s\n  h2=%s\n", white, pr.name, reset, status, d.TLS.JA4, d.TLS.JA3Hash, d.HTTP2.Akamai)
 	}
+}
+
+// checkSolverEnv verifies the external pieces the Node solver needs before we
+// pay the cost of launching it. The solver drives a *real* Chromium via
+// puppeteer-real-browser with headless:false + Xvfb, so on a headless VPS the
+// usual failure is a missing `node`, missing browser binary, or missing Xvfb -
+// all of which otherwise surface as an opaque "connect ECONNREFUSED
+// 127.0.0.1:<port>" (puppeteer failing to reach Chromium's DevTools port).
+func checkSolverEnv() error {
+	if _, err := exec.LookPath("node"); err != nil {
+		return fmt.Errorf("`node` bulunamadi - Node.js kurulu degil (kur: apt-get install -y nodejs)")
+	}
+	// Need a Chromium/Chrome binary somewhere. puppeteer-real-browser uses the
+	// system browser; accept any of the common names or a puppeteer cache.
+	if !chromeAvailable() {
+		return fmt.Errorf("chrome/chromium bulunamadi - kur: npx puppeteer browsers install chrome (veya apt-get install -y chromium)")
+	}
+	// Headful Chromium needs a display. On a headless box that means Xvfb,
+	// unless a real DISPLAY is already exported.
+	if runtime.GOOS == "linux" && os.Getenv("DISPLAY") == "" {
+		if _, err := exec.LookPath("Xvfb"); err != nil {
+			return fmt.Errorf("Xvfb bulunamadi ve DISPLAY bos - sanal ekran lazim (kur: apt-get install -y xvfb)")
+		}
+	}
+	return nil
+}
+
+// chromeAvailable reports whether a Chrome/Chromium binary the solver can drive
+// is present, either on PATH or in puppeteer's download cache.
+func chromeAvailable() bool {
+	for _, name := range []string{
+		"google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome",
+	} {
+		if _, err := exec.LookPath(name); err == nil {
+			return true
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if entries, err := os.ReadDir(home + "/.cache/puppeteer/chrome"); err == nil && len(entries) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// chromiumHint maps the opaque puppeteer connection failure to an actionable
+// message. When Chromium never starts (missing binary, missing libs, no
+// display) puppeteer reports "connect ECONNREFUSED 127.0.0.1:<port>" - the
+// DevTools/CDP port it tried to reach. Add the install hint so the user knows
+// it's a browser-launch problem, not a proxy or target problem.
+func chromiumHint(err error, output []byte) string {
+	hay := ""
+	if err != nil {
+		hay += err.Error()
+	}
+	if output != nil {
+		hay += " " + string(output)
+	}
+	if strings.Contains(hay, "ECONNREFUSED") {
+		return "\n  -> chromium ayaga kalkmadi (puppeteer DevTools portuna baglanamadi)." +
+			"\n     genelde: tarayici/Xvfb/sistem kutuphaneleri eksik." +
+			"\n     dene: npx puppeteer browsers install chrome" +
+			"\n           apt-get install -y xvfb libnss3 libgbm1 libatk1.0-0 libatk-bridge2.0-0 libasound2"
+	}
+	return ""
 }
 
 func findSolver() string {
