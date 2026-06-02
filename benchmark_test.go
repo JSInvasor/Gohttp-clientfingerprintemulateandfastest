@@ -11,9 +11,9 @@ import (
 )
 
 func TestEmulate(t *testing.T) {
-	client, err := Emulate(Firefox148)
+	client, err := Emulate(SafariIOS18)
 	if err != nil {
-		t.Fatalf("Emulate(Firefox148) error: %v", err)
+		t.Fatalf("Emulate(SafariIOS18) error: %v", err)
 	}
 	defer client.Close()
 
@@ -23,13 +23,13 @@ func TestEmulate(t *testing.T) {
 	if client.transport == nil {
 		t.Fatal("transport is nil")
 	}
-	if client.config.browser != Firefox148 {
-		t.Errorf("browser = %v, want Firefox148", client.config.browser)
+	if client.config.browser != SafariIOS18 {
+		t.Errorf("browser = %v, want SafariIOS18", client.config.browser)
 	}
 }
 
 func TestEmulateWithOptions(t *testing.T) {
-	client, err := Emulate(Firefox148,
+	client, err := Emulate(SafariIOS18,
 		WithTimeout(5*time.Second),
 		WithMaxIdleConnsPerHost(500),
 		WithInsecureSkipVerify(),
@@ -70,29 +70,36 @@ func TestNewClient(t *testing.T) {
 	}
 }
 
-func TestFirefoxHeaders(t *testing.T) {
+func TestSafariHeaders(t *testing.T) {
 	req, _ := http.NewRequest("GET", "https://example.com", nil)
-	applyFirefoxHeaders(req, "text/html", "en-US,en;q=0.5")
+	applySafariHeaders(req, "text/html", "en-US,en;q=0.9")
 
 	tests := []struct {
 		header string
 		want   string
 	}{
-		{"User-Agent", Firefox148UserAgent},
+		{"User-Agent", SafariIOS18UserAgent},
 		{"Accept", "text/html"},
-		{"Accept-Language", "en-US,en;q=0.5"},
-		{"Accept-Encoding", "gzip, deflate, br, zstd"},
+		{"Accept-Language", "en-US,en;q=0.9"},
+		{"Accept-Encoding", "gzip, deflate, br"},
 		{"Sec-Fetch-Dest", "document"},
 		{"Sec-Fetch-Mode", "navigate"},
 		{"Sec-Fetch-Site", "none"},
-		{"Sec-Fetch-User", "?1"},
 		{"Priority", "u=0, i"},
-		{"TE", "trailers"},
-		{"Upgrade-Insecure-Requests", "1"},
 	}
 
-	// Verify Firefox 148 does NOT send these headers
-	for _, h := range []string{"DNT", "Sec-GPC", "Connection"} {
+	// Verify Safari iOS 18 does NOT send these headers
+	for _, h := range []string{
+		"Upgrade-Insecure-Requests",
+		"TE",
+		"Sec-Fetch-User",
+		"Sec-Ch-Ua",
+		"Sec-Ch-Ua-Mobile",
+		"Sec-Ch-Ua-Platform",
+		"DNT",
+		"Sec-GPC",
+		"Connection",
+	} {
 		if got := req.Header.Get(h); got != "" {
 			t.Errorf("Header %s should NOT be set, got %q", h, got)
 		}
@@ -105,11 +112,11 @@ func TestFirefoxHeaders(t *testing.T) {
 	}
 }
 
-func TestFirefoxHeadersNoOverride(t *testing.T) {
+func TestSafariHeadersNoOverride(t *testing.T) {
 	req, _ := http.NewRequest("GET", "https://example.com", nil)
 	req.Header.Set("User-Agent", "custom-agent")
 	req.Header.Set("Accept", "application/json")
-	applyFirefoxHeaders(req, "text/html", "en-US")
+	applySafariHeaders(req, "text/html", "en-US")
 
 	if got := req.Header.Get("User-Agent"); got != "custom-agent" {
 		t.Errorf("User-Agent was overridden: got %q", got)
@@ -119,54 +126,29 @@ func TestFirefoxHeadersNoOverride(t *testing.T) {
 	}
 }
 
-func TestFirefox148Spec(t *testing.T) {
-	// Verify H2 settings are correct (Firefox 148 fingerprint)
-	s := Firefox148H2Settings()
-	if s.HeaderTableSize != 65536 {
-		t.Errorf("HeaderTableSize = %d, want 65536", s.HeaderTableSize)
+func TestSafariIOS18Spec(t *testing.T) {
+	s := SafariIOS18H2Settings()
+	if s.HeaderTableSize != 0 {
+		t.Errorf("HeaderTableSize = %d, want 0 (Safari omits)", s.HeaderTableSize)
 	}
 	if s.EnablePush != 0 {
 		t.Errorf("EnablePush = %d, want 0", s.EnablePush)
 	}
-	if s.InitialWindowSize != 131072 {
-		t.Errorf("InitialWindowSize = %d, want 131072", s.InitialWindowSize)
+	if s.MaxConcurrentStreams != 100 {
+		t.Errorf("MaxConcurrentStreams = %d, want 100", s.MaxConcurrentStreams)
 	}
-	if s.MaxFrameSize != 16384 {
-		t.Errorf("MaxFrameSize = %d, want 16384", s.MaxFrameSize)
+	if s.InitialWindowSize != 2097152 {
+		t.Errorf("InitialWindowSize = %d, want 2097152", s.InitialWindowSize)
 	}
-	if s.ConnectionWindowSize != 12517377 {
-		t.Errorf("ConnectionWindowSize = %d, want 12517377", s.ConnectionWindowSize)
+	if s.NoRFC7540Priorities != 1 {
+		t.Errorf("NoRFC7540Priorities = %d, want 1", s.NoRFC7540Priorities)
+	}
+	if s.ConnectionWindowSize != 10420225 {
+		t.Errorf("ConnectionWindowSize = %d, want 10420225", s.ConnectionWindowSize)
 	}
 
-	// Verify pseudo-header order
-	order := Firefox148PseudoHeaderOrder()
-	if len(order) != 4 {
-		t.Errorf("PseudoHeaderOrder len = %d, want 4", len(order))
-	}
-}
-
-func TestH2Settings(t *testing.T) {
-	s := Firefox148H2Settings()
-	if s.HeaderTableSize != 65536 {
-		t.Errorf("HeaderTableSize = %d, want 65536", s.HeaderTableSize)
-	}
-	if s.EnablePush != 0 {
-		t.Errorf("EnablePush = %d, want 0", s.EnablePush)
-	}
-	if s.InitialWindowSize != 131072 {
-		t.Errorf("InitialWindowSize = %d, want 131072", s.InitialWindowSize)
-	}
-	if s.MaxFrameSize != 16384 {
-		t.Errorf("MaxFrameSize = %d, want 16384", s.MaxFrameSize)
-	}
-	if s.ConnectionWindowSize != 12517377 {
-		t.Errorf("ConnectionWindowSize = %d, want 12517377", s.ConnectionWindowSize)
-	}
-}
-
-func TestPseudoHeaderOrder(t *testing.T) {
-	order := Firefox148PseudoHeaderOrder()
-	expected := []string{":method", ":path", ":authority", ":scheme"}
+	order := SafariIOS18PseudoHeaderOrder()
+	expected := []string{":method", ":scheme", ":authority", ":path"}
 	if len(order) != len(expected) {
 		t.Fatalf("PseudoHeaderOrder length = %d, want %d", len(order), len(expected))
 	}
@@ -216,40 +198,23 @@ func TestHeaderOrder(t *testing.T) {
 	if len(ordered) != 3 {
 		t.Fatalf("OrderHeaders returned %d headers, want 3", len(ordered))
 	}
-	// Firefox 148 header order: User-Agent first, then Accept
+	// Safari iOS 18 header order: User-Agent comes before Accept
+	// (Sec-Fetch-Dest is first overall, but not present here).
 	if ordered[0].Key != "User-Agent" {
 		t.Errorf("First header = %q, want 'User-Agent'", ordered[0].Key)
 	}
 	if ordered[1].Key != "Accept" {
 		t.Errorf("Second header = %q, want 'Accept'", ordered[1].Key)
 	}
-	// Custom headers come after known Firefox headers
+	// Custom headers come after known Safari headers
 	if ordered[2].Key != "Custom-Header" {
 		t.Errorf("Third header = %q, want 'Custom-Header'", ordered[2].Key)
 	}
 }
 
 func TestBrowserProfile(t *testing.T) {
-	// Firefox148/Firefox150/Chrome146/Chrome147 are backward-compatible aliases
-	// for Firefox151/Chrome148 (same TLS/H2 fingerprint, only UA changed), so
-	// String() reports the canonical current name.
-	if Firefox151.String() != "Firefox/151.0" {
-		t.Errorf("Firefox151.String() = %q, want 'Firefox/151.0'", Firefox151.String())
-	}
-	if Firefox150 != Firefox151 {
-		t.Errorf("Firefox150 should alias Firefox151")
-	}
-	if Firefox148 != Firefox151 {
-		t.Errorf("Firefox148 should alias Firefox151")
-	}
-	if Chrome148.String() != "Chrome/148.0" {
-		t.Errorf("Chrome148.String() = %q, want 'Chrome/148.0'", Chrome148.String())
-	}
-	if Chrome146 != Chrome148 {
-		t.Errorf("Chrome146 should alias Chrome148")
-	}
-	if Chrome147 != Chrome148 {
-		t.Errorf("Chrome147 should alias Chrome148")
+	if SafariIOS18.String() != "Safari/18.7" {
+		t.Errorf("SafariIOS18.String() = %q, want 'Safari/18.7'", SafariIOS18.String())
 	}
 }
 
@@ -260,7 +225,7 @@ func TestRequestBuilder(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(5*time.Second))
+	client, err := Emulate(SafariIOS18, WithForceHTTP1(), WithTimeout(5*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +262,7 @@ func TestResponseJSON(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := Emulate(Firefox148, WithForceHTTP1())
+	client, err := Emulate(SafariIOS18, WithForceHTTP1())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +294,7 @@ func TestFlood(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(10*time.Second))
+	client, err := Emulate(SafariIOS18, WithForceHTTP1(), WithTimeout(10*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +329,7 @@ func TestPipeline(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(10*time.Second))
+	client, err := Emulate(SafariIOS18, WithForceHTTP1(), WithTimeout(10*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,13 +341,11 @@ func TestPipeline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Send 200 requests through pipeline
 	results := make([]<-chan *PipelineResult, 200)
 	for i := 0; i < 200; i++ {
 		results[i] = pipeline.Send(ctx, "GET", server.URL, nil, nil)
 	}
 
-	// Collect results
 	successCount := 0
 	for _, ch := range results {
 		result := <-ch
@@ -411,7 +374,7 @@ func TestPipelineSpray(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(10*time.Second))
+	client, err := Emulate(SafariIOS18, WithForceHTTP1(), WithTimeout(10*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +403,7 @@ func TestPipelineFireAndForget(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(10*time.Second))
+	client, err := Emulate(SafariIOS18, WithForceHTTP1(), WithTimeout(10*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +434,7 @@ func TestPipelineCloseRace(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(5*time.Second))
+	client, err := Emulate(SafariIOS18, WithForceHTTP1(), WithTimeout(5*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +443,6 @@ func TestPipelineCloseRace(t *testing.T) {
 	pipeline := client.NewPipeline(32)
 	ctx := context.Background()
 
-	// Fire from many goroutines while another goroutine closes mid-burst.
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
@@ -492,7 +454,6 @@ func TestPipelineCloseRace(t *testing.T) {
 		}()
 	}
 
-	// Close while senders are still active. Must not panic.
 	time.Sleep(5 * time.Millisecond)
 	pipeline.Close()
 	wg.Wait()
@@ -557,7 +518,7 @@ func TestPreConnect(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(5*time.Second))
+	client, err := Emulate(SafariIOS18, WithForceHTTP1(), WithTimeout(5*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,7 +545,7 @@ func BenchmarkGet(b *testing.B) {
 	}))
 	defer server.Close()
 
-	client, err := Emulate(Firefox148, WithForceHTTP1(), WithTimeout(10*time.Second))
+	client, err := Emulate(SafariIOS18, WithForceHTTP1(), WithTimeout(10*time.Second))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -609,7 +570,7 @@ func BenchmarkGetConcurrent(b *testing.B) {
 	}))
 	defer server.Close()
 
-	client, err := Emulate(Firefox148,
+	client, err := Emulate(SafariIOS18,
 		WithForceHTTP1(),
 		WithTimeout(10*time.Second),
 		WithMaxIdleConnsPerHost(1000),
@@ -639,7 +600,7 @@ func BenchmarkPipeline(b *testing.B) {
 	}))
 	defer server.Close()
 
-	client, err := Emulate(Firefox148,
+	client, err := Emulate(SafariIOS18,
 		WithForceHTTP1(),
 		WithTimeout(10*time.Second),
 		WithMaxIdleConnsPerHost(1000),
@@ -666,17 +627,17 @@ func BenchmarkPipeline(b *testing.B) {
 	})
 }
 
-func BenchmarkFirefoxHeaders(b *testing.B) {
+func BenchmarkSafariHeaders(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		req, _ := http.NewRequest("GET", "https://example.com", nil)
-		applyFirefoxHeaders(req, "text/html", "en-US,en;q=0.5")
+		applySafariHeaders(req, "text/html", "en-US,en;q=0.9")
 	}
 }
 
-func BenchmarkFirefox148H2Settings(b *testing.B) {
+func BenchmarkSafariIOS18H2Settings(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = Firefox148H2Settings()
+		_ = SafariIOS18H2Settings()
 	}
 }

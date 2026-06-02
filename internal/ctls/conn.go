@@ -145,30 +145,30 @@ func (c *Conn) Close() error {
 	return c.Conn.Close()
 }
 
-// Dial creates a new TLS connection to addr with Firefox 148 fingerprint.
+// Dial creates a new TLS connection to addr with Safari iOS 18 fingerprint.
 // addr must be in host:port format. alpn specifies the ALPN protocols to offer.
 func Dial(ctx context.Context, network, addr string, alpn []string) (*Conn, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("split host port: %w", err)
 	}
-	return DialWithConfig(ctx, network, addr, host, alpn, false, nil, BrowserFirefox148)
+	return DialWithConfig(ctx, network, addr, host, alpn, false, nil)
 }
 
 // DialWithConfig creates a TLS connection with full configuration.
-func DialWithConfig(ctx context.Context, network, addr, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType) (*Conn, error) {
+func DialWithConfig(ctx context.Context, network, addr, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool) (*Conn, error) {
 	var d net.Dialer
 	rawConn, err := d.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial tcp: %w", err)
 	}
 
-	return WrapConn(ctx, rawConn, serverName, alpn, skipVerify, rootCAs, browser)
+	return WrapConn(ctx, rawConn, serverName, alpn, skipVerify, rootCAs)
 }
 
 // WrapConn performs the TLS 1.3 handshake over an existing net.Conn.
 // This is the main entry point for use with pre-dialed connections (proxies, etc.).
-func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType) (*Conn, error) {
+func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool) (*Conn, error) {
 	// Set deadline from context
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := rawConn.SetDeadline(deadline); err != nil {
@@ -177,7 +177,7 @@ func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []s
 		}
 	}
 
-	tlsConn, err := handshake(rawConn, serverName, alpn, skipVerify, rootCAs, browser)
+	tlsConn, err := handshake(rawConn, serverName, alpn, skipVerify, rootCAs)
 	if err != nil {
 		rawConn.Close()
 		return nil, fmt.Errorf("tls handshake: %w", err)

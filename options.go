@@ -29,11 +29,11 @@ type clientConfig struct {
 func defaultClientConfig() clientConfig {
 	return clientConfig{
 		transport:       defaultTransportConfig(),
-		browser:         Firefox148,
+		browser:         SafariIOS18,
 		followRedirects: true,
 		maxRedirects:    10,
 		timeout:         30 * time.Second,
-		acceptLanguage:  "en-US,en;q=0.5",
+		acceptLanguage:  "en-US,en;q=0.9",
 		accept:          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 	}
 }

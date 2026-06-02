@@ -9,7 +9,7 @@ import (
 )
 
 func main() {
-	client, err := gofire.Emulate(gofire.Firefox148,
+	client, err := gofire.Emulate(gofire.SafariIOS18,
 		gofire.WithTimeout(15*time.Second),
 	)
 	if err != nil {

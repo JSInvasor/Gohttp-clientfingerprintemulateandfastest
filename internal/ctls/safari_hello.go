@@ -5,6 +5,34 @@ import (
 	"encoding/binary"
 )
 
+// greaseSet holds the GREASE values used at the six positions Safari sprinkles
+// them into a single ClientHello. A fresh set is drawn per connection.
+type greaseSet struct {
+	cipher   uint16 // GREASE in cipher suite list
+	extFirst uint16 // GREASE as first extension
+	extLast  uint16 // GREASE as second-to-last extension
+	keyShare uint16 // GREASE in key_share
+	group    uint16 // GREASE in supported_groups
+	version  uint16 // GREASE in supported_versions
+}
+
+func randomGrease() uint16 {
+	var b [1]byte
+	rand.Read(b[:])
+	return greaseValues[int(b[0])%len(greaseValues)]
+}
+
+func newGreaseSet() greaseSet {
+	return greaseSet{
+		cipher:   randomGrease(),
+		extFirst: randomGrease(),
+		extLast:  randomGrease(),
+		keyShare: randomGrease(),
+		group:    randomGrease(),
+		version:  randomGrease(),
+	}
+}
+
 // Safari iOS 18.7 ClientHello builder.
 //
 // NOTE: JA3/JA4 below are stale — they were captured before the sigalg-dedup

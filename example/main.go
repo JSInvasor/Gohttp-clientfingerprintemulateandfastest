@@ -11,9 +11,9 @@ import (
 
 func main() {
 	// ============================================================
-	// 1. Create client with Firefox 148 emulation
+	// 1. Create client with Safari iOS 18 emulation
 	// ============================================================
-	client, err := gofire.Emulate(gofire.Firefox148,
+	client, err := gofire.Emulate(gofire.SafariIOS18,
 		gofire.WithTimeout(15*time.Second),
 		gofire.WithMaxIdleConnsPerHost(2000),
 		gofire.WithMaxIdleConns(20000),

@@ -22,16 +22,18 @@ import (
 	http2 "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/http2"
 )
 
-// Transport is a high-performance HTTP transport with full browser fingerprint emulation.
+// Transport is a high-performance HTTP transport with Safari iOS 18 fingerprint emulation.
 //
 // It emulates both TLS (JA3/JA4) and HTTP/2 (Akamai) fingerprints using a custom
 // TLS 1.3 implementation (internal/ctls) - no uTLS dependency:
 //
-//   - TLS: custom Firefox 148 ClientHello built at the byte level
-//   - HTTP/2 SETTINGS: HEADER_TABLE_SIZE, ENABLE_PUSH, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE
-//   - HTTP/2 WINDOW_UPDATE: Connection-level window increment matching Firefox
-//   - HTTP/2 Header Order: Exact Firefox 148 header order via HPACK
-//   - HTTP/2 Pseudo-header Order: :method, :path, :authority, :scheme (m,p,a,s)
+//   - TLS: custom Safari iOS 18 ClientHello built at the byte level (GREASE,
+//     padding to 512 bytes, X25519-only key share, zlib compress_certificate)
+//   - HTTP/2 SETTINGS: ENABLE_PUSH, MAX_CONCURRENT_STREAMS=100,
+//     INITIAL_WINDOW_SIZE=2097152, NO_RFC7540_PRIORITIES=1
+//   - HTTP/2 WINDOW_UPDATE: 10420225 connection-level window increment
+//   - HTTP/2 Header Order: Exact Safari iOS 18 header order via HPACK
+//   - HTTP/2 Pseudo-header Order: :method, :scheme, :authority, :path (m,s,a,p)
 type Transport struct {
 	h1Transport *http.Transport  // HTTP/1.1 fallback
 	h2Transport *http2.Transport // HTTP/2 with browser settings
@@ -101,18 +103,9 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		browser:    browser,
 	}
 
-	// Set browser-specific fingerprint
-	switch browser {
-	case Chrome148:
-		t.h2Settings = Chrome146H2Settings()
-		t.headerOrder = chrome146HeaderOrder
-	case SafariIOS18:
-		t.h2Settings = SafariIOS18H2Settings()
-		t.headerOrder = safariIOS18HeaderOrder
-	default:
-		t.h2Settings = Firefox148H2Settings()
-		t.headerOrder = firefox148HeaderOrder
-	}
+	// Safari iOS 18 fingerprint (only supported profile).
+	t.h2Settings = SafariIOS18H2Settings()
+	t.headerOrder = safariIOS18HeaderOrder
 
 	t.dialer = &net.Dialer{
 		Timeout:   cfg.DialTimeout,
@@ -153,18 +146,9 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	// HTTP/2 transport with browser-specific fingerprint
+	// HTTP/2 transport with Safari iOS 18 fingerprint.
 	if !cfg.ForceHTTP1 {
-		// Get browser-specific H2 profile
-		var h2p H2Profile
-		switch browser {
-		case Chrome148:
-			h2p = Chrome146H2Profile()
-		case SafariIOS18:
-			h2p = SafariIOS18H2Profile()
-		default:
-			h2p = Firefox148H2Profile()
-		}
+		h2p := SafariIOS18H2Profile()
 
 		// MaxReadFrameSize controls the framer's accept cap (NOT what we advertise).
 		// We advertise the browser's MAX_FRAME_SIZE via the custom Settings slice below,
@@ -256,15 +240,6 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 		port = "443"
 	}
 
-	// Map browser profile to ctls browser type once, outside the loop.
-	browserType := ctls.BrowserFirefox148
-	switch t.browser {
-	case Chrome148:
-		browserType = ctls.BrowserChrome146
-	case SafariIOS18:
-		browserType = ctls.BrowserSafariIOS18
-	}
-
 	// When a proxy rotator is configured, do exactly one TLS dial attempt:
 	// every retry calls dialRaw again which would consume another proxy from
 	// the rotator, meaning a single request could burn N proxies. User wants
@@ -303,7 +278,7 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 			continue
 		}
 
-		tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, browserType)
+		tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs)
 		if err != nil {
 			rawConn.Close()
 			// WrapConn already prefixes "tls handshake:"; don't double-wrap.
@@ -790,16 +765,10 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 		n = 10
 	}
 
-	// Use the browser profile's User-Agent so the pre-warm HEAD doesn't show
-	// up in logs/fingerprinters as a "Mozilla/5.0" mismatch against the FF/
-	// Chrome/Safari TLS handshake we just performed.
-	ua := Firefox151UserAgent
-	switch t.browser {
-	case Chrome148:
-		ua = Chrome148UserAgent
-	case SafariIOS18:
-		ua = SafariIOS18UserAgent
-	}
+	// Use the Safari iOS 18 User-Agent so the pre-warm HEAD doesn't show up
+	// in logs/fingerprinters as a "Mozilla/5.0" mismatch against the Safari
+	// TLS handshake we just performed.
+	ua := SafariIOS18UserAgent
 
 	var (
 		wg   sync.WaitGroup

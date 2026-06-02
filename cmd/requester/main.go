@@ -23,9 +23,9 @@ func main() {
 	fmt.Printf("Hedef: %s\n", targetURL)
 	fmt.Println(strings.Repeat("=", 60))
 
-	// Firefox 148 tarayıcı parmak izi ile client oluştur
+	// Safari iOS 18 tarayıcı parmak izi ile client oluştur
 	// Retry: 3 deneme, 500ms başlangıç gecikmesi, 429/502/503/504 kodlarında tekrar dene
-	client, err := gofire.Emulate(gofire.Firefox148,
+	client, err := gofire.Emulate(gofire.SafariIOS18,
 		gofire.WithTimeout(15*time.Second),
 		gofire.WithMaxIdleConnsPerHost(500),
 		gofire.WithMaxIdleConns(5000),

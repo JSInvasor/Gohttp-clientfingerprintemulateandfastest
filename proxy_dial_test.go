@@ -107,7 +107,7 @@ func TestHTTPConnectProxyNoAuth(t *testing.T) {
 	proxy, stopP := fakeHTTPProxy(t, target, false)
 	defer stopP()
 
-	tr := newTransport(defaultTransportConfig(), Firefox150)
+	tr := newTransport(defaultTransportConfig(), SafariIOS18)
 	defer tr.CloseIdleConnections()
 
 	pu, _ := url.Parse("http://" + proxy)
@@ -130,7 +130,7 @@ func TestHTTPConnectProxyAuthRequired(t *testing.T) {
 	proxy, stopP := fakeHTTPProxy(t, target, true)
 	defer stopP()
 
-	tr := newTransport(defaultTransportConfig(), Firefox150)
+	tr := newTransport(defaultTransportConfig(), SafariIOS18)
 	defer tr.CloseIdleConnections()
 
 	// First: no auth -> server returns 407.
@@ -265,7 +265,7 @@ func TestSocks5NoAuth(t *testing.T) {
 	socks, stopS := fakeSocks5Server(t, target, false)
 	defer stopS()
 
-	tr := newTransport(defaultTransportConfig(), Firefox150)
+	tr := newTransport(defaultTransportConfig(), SafariIOS18)
 	defer tr.CloseIdleConnections()
 
 	pu, _ := url.Parse("socks5://" + socks)
@@ -287,7 +287,7 @@ func TestSocks5UserPassAuth(t *testing.T) {
 	socks, stopS := fakeSocks5Server(t, target, true)
 	defer stopS()
 
-	tr := newTransport(defaultTransportConfig(), Firefox150)
+	tr := newTransport(defaultTransportConfig(), SafariIOS18)
 	defer tr.CloseIdleConnections()
 
 	pu, _ := url.Parse("socks5://u:p@" + socks)

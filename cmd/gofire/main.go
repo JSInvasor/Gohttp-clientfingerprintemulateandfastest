@@ -40,7 +40,7 @@ const (
 
 func usage() {
 	fmt.Printf("%s%s%s", colorCyan, banner, colorReset)
-	fmt.Printf("  %sGofire[v%s]%s | Custom TLS 1.3 Firefox 148 Fingerprint\n\n", colorBold, version, colorReset)
+	fmt.Printf("  %sGofire[v%s]%s | Custom TLS 1.3 Safari iOS 18 Fingerprint\n\n", colorBold, version, colorReset)
 	fmt.Printf("  %sUsage:%s  gofire <url> <duration_seconds> <threads> [streams_per_thread]\n", colorYellow, colorReset)
 	fmt.Printf("  %sExample:%s ./gofire https://example.com 60 64 32\n\n", colorYellow, colorReset)
 	fmt.Printf("  %sArguments:%s\n\n", colorGreen, colorReset)
@@ -53,9 +53,9 @@ func usage() {
 	fmt.Printf("    128 × 50 = 6400 eşzamanlı → 50ms latency = ~128,000 RPS\n\n")
 	fmt.Printf("  %sFeatures:%s\n", colorGreen, colorReset)
 	fmt.Printf("    • Custom TLS 1.3 implementation (no uTLS)\n")
-	fmt.Printf("    • Firefox 148 exact ClientHello fingerprint (JA3/JA4)\n")
-	fmt.Printf("    • X25519MLKEM768 post-quantum key share\n")
-	fmt.Printf("    • HTTP/2 Akamai fingerprint: 1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s\n")
+	fmt.Printf("    • Safari iOS 18 exact ClientHello fingerprint (JA3/JA4)\n")
+	fmt.Printf("    • X25519 key share with GREASE + 512-byte padded ClientHello\n")
+	fmt.Printf("    • HTTP/2 Akamai fingerprint: 2:0;3:100;4:2097152;9:1|10420225|0|m,s,a,p\n")
 	fmt.Printf("    • HTTP/2 stream multiplexing per worker\n")
 	fmt.Printf("    • Connection pre-warming + keep-alive pool\n\n")
 }
@@ -94,7 +94,7 @@ func main() {
 
 func run(targetURL string, durSec, threads, streams int) {
 	fmt.Printf("%s%s%s", colorCyan, banner, colorReset)
-	fmt.Printf("  %sGofire[v%s]%s | Custom TLS 1.3 | Firefox 148\n\n", colorBold, version, colorReset)
+	fmt.Printf("  %sGofire[v%s]%s | Custom TLS 1.3 | Safari iOS 18\n\n", colorBold, version, colorReset)
 
 	// Total concurrency = threads × streams
 	totalConcurrent := threads * streams
@@ -109,7 +109,7 @@ func run(targetURL string, durSec, threads, streams int) {
 		totalIdle = 512
 	}
 
-	client, err := gofire.Emulate(gofire.Firefox148,
+	client, err := gofire.Emulate(gofire.SafariIOS18,
 		gofire.WithTimeout(8*time.Second),
 		gofire.WithTLSHandshakeTimeout(8*time.Second),
 		gofire.WithMaxIdleConnsPerHost(idlePerHost),
