@@ -147,7 +147,14 @@ func (hs *handshakeState) run() (*Conn, error) {
 
 			switch msgType {
 			case handshakeTypeEncryptedExtensions:
-				// Update transcript
+				// In TLS 1.3 ALPN is delivered here, not in ServerHello.
+				// parseServerHello leaves negotiatedALPN empty for 1.3, so
+				// extracting it now is what lets the caller route h1-only
+				// servers to the HTTP/1.1 transport instead of pumping the
+				// h2 preface into them.
+				if alpn := parseEncryptedExtensionsALPN(msg[4 : 4+msgLen]); alpn != "" {
+					hs.negotiatedALPN = alpn
+				}
 				hs.transcript.Write(msg)
 
 			case handshakeTypeCertificate:
@@ -563,6 +570,45 @@ func decompressZlib(data []byte, maxLen int) ([]byte, error) {
 func decompressBrotli(data []byte, maxLen int) ([]byte, error) {
 	r := brotli.NewReader(bytes.NewReader(data))
 	return io.ReadAll(io.LimitReader(r, int64(maxLen)+1))
+}
+
+// parseEncryptedExtensionsALPN walks the EncryptedExtensions body and returns
+// the negotiated ALPN protocol, or "" if absent. Body layout:
+//
+//	extensions_length(2) + [ ext_type(2) + ext_length(2) + ext_data ]*
+//
+// For ALPN the data is protocol_name_list_length(2) + length(1) + name.
+// Returns "" on any parse error rather than failing the handshake — ALPN is
+// optional, and a missing/garbled value just means the dispatcher will treat
+// the conn as h2 (the default for our DialTLSContext path).
+func parseEncryptedExtensionsALPN(body []byte) string {
+	if len(body) < 2 {
+		return ""
+	}
+	extsLen := int(binary.BigEndian.Uint16(body[0:2]))
+	exts := body[2:]
+	if extsLen > len(exts) {
+		return ""
+	}
+	exts = exts[:extsLen]
+	for len(exts) >= 4 {
+		extType := binary.BigEndian.Uint16(exts[0:2])
+		extLen := int(binary.BigEndian.Uint16(exts[2:4]))
+		exts = exts[4:]
+		if extLen > len(exts) {
+			return ""
+		}
+		extData := exts[:extLen]
+		exts = exts[extLen:]
+
+		if extType == extALPN && len(extData) >= 3 {
+			protoLen := int(extData[2])
+			if 3+protoLen <= len(extData) {
+				return string(extData[3 : 3+protoLen])
+			}
+		}
+	}
+	return ""
 }
 
 

@@ -2,6 +2,7 @@ package gofire
 
 import (
 	"context"
+	cryptotls "crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -640,4 +641,55 @@ func BenchmarkSafariIOS18H2Settings(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = SafariIOS18H2Settings()
 	}
+}
+
+// TestALPNFallbackToHTTP1 verifies the dispatcher falls back to HTTP/1.1
+// when the server doesn't speak h2. Without the fallback, h2Transport would
+// pipe the h2 preface into an http/1.1 conn and every request to such hosts
+// would fail — producing the "site to site RPS varies wildly" symptom from
+// the multi-target benchmark.
+func TestALPNFallbackToHTTP1(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Proto", r.Proto)
+		w.WriteHeader(200)
+		w.Write([]byte("ok"))
+	}))
+	// Force http/1.1-only — emulates an origin that disables h2.
+	server.TLS = &cryptotls.Config{NextProtos: []string{"http/1.1"}}
+	server.StartTLS()
+	defer server.Close()
+
+	client, err := Emulate(SafariIOS18,
+		WithInsecureSkipVerify(),
+		WithTimeout(5*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// First request: h2 dial discovers the server only speaks http/1.1, falls
+	// back to h1Transport, and caches the protocol for the host.
+	resp, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	if resp.StatusCode() != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode())
+	}
+	if got := resp.GetHeader("X-Proto"); got != "HTTP/1.1" {
+		t.Errorf("X-Proto = %q, want HTTP/1.1", got)
+	}
+	resp.Close()
+
+	// Second request: hostProto cache routes directly to h1Transport,
+	// skipping the failed-h2 dial.
+	resp, err = client.Get(server.URL)
+	if err != nil {
+		t.Fatalf("cached-h1 request: %v", err)
+	}
+	if resp.StatusCode() != 200 {
+		t.Errorf("cached request status = %d, want 200", resp.StatusCode())
+	}
+	resp.Close()
 }

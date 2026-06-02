@@ -6,6 +6,7 @@ import (
 	cryptotls "crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -48,11 +49,22 @@ type Transport struct {
 	connCount   atomic.Int64
 	dialer      *net.Dialer
 
+	// hostProto records the ALPN protocol negotiated per host so subsequent
+	// requests skip the h2 attempt for hosts that only speak http/1.1. Without
+	// this cache every request to an h1-only host would dial twice (once for
+	// h2 to fail, once for h1) and h2Transport would also panic by feeding the
+	// h2 preface into an http/1.1 connection. Values: "h2" or "http/1.1".
+	hostProto sync.Map
+
 	// Proxy support - used directly in dialTLS to tunnel through proxies
 	proxyMu       sync.RWMutex
 	proxyFunc     func(*http.Request) (*url.URL, error) // nil = no proxy
 	proxyRotator  *ProxyRotator                         // nil unless SetProxyRotator was used
 }
+
+// errAlpnHTTP1 is the sentinel dialTLSForH2 returns when the server picked
+// http/1.1 over h2. RoundTrip catches it and routes to h1Transport instead.
+var errAlpnHTTP1 = errors.New("ctls: server negotiated http/1.1, not h2")
 
 // TransportConfig holds configuration for creating a Transport.
 type TransportConfig struct {
@@ -189,11 +201,26 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 }
 
 // RoundTrip implements http.RoundTripper with full fingerprint emulation.
+//
+// For HTTPS it tries the HTTP/2 transport first, but falls back to
+// HTTP/1.1 if the host has previously negotiated http/1.1 (cached via
+// hostProto) or if the h2 dial fails with errAlpnHTTP1. The cache means
+// h1-only hosts pay the dial-and-fallback cost exactly once.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme == "https" && !t.forceH1 && t.h2Transport != nil {
-		return t.h2Transport.RoundTrip(req)
+	if req.URL.Scheme != "https" || t.forceH1 || t.h2Transport == nil {
+		return t.h1Transport.RoundTrip(req)
 	}
-	return t.h1Transport.RoundTrip(req)
+
+	if proto, ok := t.hostProto.Load(req.URL.Host); ok && proto.(string) == "http/1.1" {
+		return t.h1Transport.RoundTrip(req)
+	}
+
+	resp, err := t.h2Transport.RoundTrip(req)
+	if err != nil && errors.Is(err, errAlpnHTTP1) {
+		// dialTLSForH2 already cached host->http/1.1; retry on h1.
+		return t.h1Transport.RoundTrip(req)
+	}
+	return resp, err
 }
 
 // dialWithDNSCache returns a DialContext function with DNS caching and round-robin.
@@ -220,9 +247,29 @@ func (t *Transport) dialTLSForH1() func(ctx context.Context, network, addr strin
 	}
 }
 
-// dialTLSForH2 creates ctls connections for HTTP/2 (ALPN: h2, http/1.1).
+// dialTLSForH2 creates ctls connections for HTTP/2 (ALPN: h2, http/1.1) and
+// rejects the conn if the server picked http/1.1. With a custom DialTLSContext
+// the http2 transport otherwise skips its own ALPN check (transport.go:826-843)
+// and pumps the h2 preface into an http/1.1 socket, which silently kills every
+// request to h1-only hosts. We surface errAlpnHTTP1 so RoundTrip can fall back
+// to h1Transport and cache the host as http/1.1 for future requests.
 func (t *Transport) dialTLSForH2(ctx context.Context, network, addr string) (net.Conn, error) {
-	return t.dialTLS(ctx, network, addr, []string{"h2", "http/1.1"})
+	conn, err := t.dialTLS(ctx, network, addr, []string{"h2", "http/1.1"})
+	if err != nil {
+		return nil, err
+	}
+	if alpnConn, ok := conn.(interface{ NegotiatedProtocol() string }); ok {
+		if proto := alpnConn.NegotiatedProtocol(); proto != "" && proto != "h2" {
+			host, _, splitErr := net.SplitHostPort(addr)
+			if splitErr != nil {
+				host = addr
+			}
+			t.hostProto.Store(host, "http/1.1")
+			conn.Close()
+			return nil, errAlpnHTTP1
+		}
+	}
+	return conn, nil
 }
 
 // dialTLS performs TLS handshake using our custom ctls package with browser-specific ClientHello.
