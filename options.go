@@ -187,6 +187,36 @@ func WithReadBufferSize(n int) Option {
 	}
 }
 
+// WithMaxStreamsPerConn sets how many HTTP/2 streams a single connection
+// handles before being cycled. Lower = more TLS handshakes (more fingerprint
+// noise but also more origin load). Higher = fewer handshakes, but a long
+// monotonic stream-ID sequence is a passive fingerprint signal. Default: 8000.
+// For pure throughput without fingerprint concerns, 50000+ is reasonable.
+func WithMaxStreamsPerConn(n int) Option {
+	return func(c *clientConfig) {
+		c.transport.MaxStreamsPerConn = n
+	}
+}
+
+// WithSocketBuffers sets the Linux SO_RCVBUF / SO_SNDBUF sizes in bytes.
+// Default 256KB is conservative; raise to 1-4MB on high-throughput links with
+// non-trivial RTT (large bandwidth-delay product). No-op on non-Linux.
+func WithSocketBuffers(rcv, snd int) Option {
+	return func(c *clientConfig) {
+		c.transport.SocketRcvBuf = rcv
+		c.transport.SocketSndBuf = snd
+	}
+}
+
+// WithWriteByteTimeout caps how long an HTTP/2 frame write may block.
+// Default 30s is browser-lenient; for high-RPS workloads with proxies that
+// occasionally stall, 5-10s prevents a slow peer from pinning a worker.
+func WithWriteByteTimeout(d time.Duration) Option {
+	return func(c *clientConfig) {
+		c.transport.WriteByteTimeout = d
+	}
+}
+
 // WithUserAgent sets a custom User-Agent header, overriding the browser profile default.
 func WithUserAgent(ua string) Option {
 	return func(c *clientConfig) {

@@ -84,6 +84,21 @@ type TransportConfig struct {
 	ResponseHeaderTimeout time.Duration
 	WriteBufferSize       int
 	ReadBufferSize        int
+	// MaxStreamsPerConn cycles the HTTP/2 connection after this many streams.
+	// Lower = more frequent TLS handshakes (fingerprint noise). Higher = fewer
+	// handshakes but a long monotonic stream-ID sequence is a passive
+	// fingerprint signal. Default: 8000 (browser-ish). Set to 50000+ for
+	// pure throughput when fingerprint sensitivity is low.
+	MaxStreamsPerConn int
+	// SocketRcvBuf / SocketSndBuf override the Linux SO_RCVBUF / SO_SNDBUF
+	// sizes (in bytes). Default 256KB is conservative; raise to 1-4MB for
+	// high-throughput links with non-trivial RTT (large BDP). 0 = default.
+	SocketRcvBuf int
+	SocketSndBuf int
+	// WriteByteTimeout caps how long an h2 frame write may block. Default 30s
+	// is browser-lenient; for high-RPS workloads with proxies that occasionally
+	// stall, 5-10s prevents a slow peer from pinning a worker.
+	WriteByteTimeout time.Duration
 }
 
 func defaultTransportConfig() TransportConfig {
@@ -102,6 +117,10 @@ func defaultTransportConfig() TransportConfig {
 		ResponseHeaderTimeout: 30 * time.Second,
 		WriteBufferSize:       64 * 1024,
 		ReadBufferSize:        64 * 1024,
+		MaxStreamsPerConn:     8000,
+		SocketRcvBuf:          256 * 1024,
+		SocketSndBuf:          256 * 1024,
+		WriteByteTimeout:      30 * time.Second,
 	}
 }
 
@@ -119,13 +138,21 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 	t.h2Settings = SafariIOS18H2Settings()
 	t.headerOrder = safariIOS18HeaderOrder
 
+	rcvBuf := cfg.SocketRcvBuf
+	if rcvBuf <= 0 {
+		rcvBuf = 256 * 1024
+	}
+	sndBuf := cfg.SocketSndBuf
+	if sndBuf <= 0 {
+		sndBuf = 256 * 1024
+	}
 	t.dialer = &net.Dialer{
 		Timeout:   cfg.DialTimeout,
 		KeepAlive: 30 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
 			var err error
 			c.Control(func(fd uintptr) {
-				err = setSocketOpts(fd)
+				err = setSocketOpts(fd, rcvBuf, sndBuf)
 			})
 			return err
 		},
@@ -189,11 +216,12 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 			StrictMaxConcurrentStreams: false,
 			ReadIdleTimeout:           15 * time.Second,
 			PingTimeout:               5 * time.Second,
-			WriteByteTimeout:          30 * time.Second,
-			// Cycle the H2 conn after ~8000 streams. Real browsers don't push
+			WriteByteTimeout:          cfg.WriteByteTimeout,
+			// Cycle the H2 conn after this many streams. Real browsers don't push
 			// 100k+ streams over a single connection; a long monotonic
-			// stream-ID sequence is a passive fingerprint signal.
-			MaxStreamsPerConn: 8000,
+			// stream-ID sequence is a passive fingerprint signal. Configurable
+			// via TransportConfig.MaxStreamsPerConn — raise for pure throughput.
+			MaxStreamsPerConn: uint32(cfg.MaxStreamsPerConn),
 		}
 	}
 
@@ -887,6 +915,28 @@ func (t *Transport) setProxyRotator(pr *ProxyRotator) {
 	t.proxyMu.Unlock()
 }
 
+// cachedNowNs is a coarse monotonic-ish unix-nano clock updated by a single
+// goroutine every ~50ms. The DNS cache's TTL check reads this instead of
+// calling time.Now().UnixNano() per request. time.Now() on Linux is vdso-fast
+// (~20ns) but at 200k+ RPS the integral cost is real, and DNS TTL accuracy
+// at 50ms granularity is more than enough (browser DNS TTLs are seconds-minutes).
+var cachedNowNs atomic.Int64
+
+func init() {
+	cachedNowNs.Store(time.Now().UnixNano())
+	go func() {
+		t := time.NewTicker(50 * time.Millisecond)
+		defer t.Stop()
+		for range t.C {
+			cachedNowNs.Store(time.Now().UnixNano())
+		}
+	}()
+}
+
+func runtimeNanoCached() int64 {
+	return cachedNowNs.Load()
+}
+
 // dnsCache provides a lock-free DNS cache with round-robin IP selection.
 // Uses sync.Map for the hot read path to eliminate RWMutex contention at high RPS.
 type dnsCache struct {
@@ -897,9 +947,10 @@ type dnsCache struct {
 }
 
 type dnsCacheEntry struct {
-	ips       []string
-	expiresAt time.Time
-	counter   atomic.Uint64
+	ips         []string
+	expiresAtNs int64 // unix nano, read atomically (immutable after store, no atomic needed for read)
+	counter     atomic.Uint64
+	ipsLen      uint64 // cached len(ips) so the hot path skips a slice header deref
 }
 
 func newDNSCache(ttl time.Duration) *dnsCache {
@@ -925,10 +976,10 @@ func (d *dnsCache) cleanupLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			now := time.Now()
+			nowNs := time.Now().UnixNano()
 			d.entries.Range(func(key, value interface{}) bool {
 				entry := value.(*dnsCacheEntry)
-				if now.After(entry.expiresAt) {
+				if nowNs > entry.expiresAtNs {
 					d.entries.Delete(key)
 				}
 				return true
@@ -952,12 +1003,15 @@ func (d *dnsCache) lookup(host string) (string, error) {
 		return host, nil
 	}
 
-	// Hot path: lock-free read from sync.Map
+	// Hot path: lock-free read from sync.Map. The cleanup goroutine deletes
+	// expired entries every 2*ttl, so a stale read is bounded to that window —
+	// acceptable in exchange for skipping time.Now() (a vdso syscall) on every
+	// request. nanotime is cheaper than full wall-clock read.
 	if val, ok := d.entries.Load(host); ok {
 		entry := val.(*dnsCacheEntry)
-		if time.Now().Before(entry.expiresAt) {
+		if runtimeNanoCached() <= entry.expiresAtNs {
 			idx := entry.counter.Add(1) - 1
-			return entry.ips[idx%uint64(len(entry.ips))], nil
+			return entry.ips[idx%entry.ipsLen], nil
 		}
 	}
 
@@ -980,7 +1034,7 @@ func (d *dnsCache) lookup(host string) (string, error) {
 		if val, ok := d.entries.Load(host); ok {
 			entry := val.(*dnsCacheEntry)
 			idx := entry.counter.Add(1) - 1
-			return entry.ips[idx%uint64(len(entry.ips))], nil
+			return entry.ips[idx%entry.ipsLen], nil
 		}
 		return res.ips[0], nil
 	}
@@ -999,8 +1053,9 @@ func (d *dnsCache) lookup(host string) (string, error) {
 	}
 
 	newEntry := &dnsCacheEntry{
-		ips:       ips,
-		expiresAt: time.Now().Add(d.ttl),
+		ips:         ips,
+		expiresAtNs: time.Now().Add(d.ttl).UnixNano(),
+		ipsLen:      uint64(len(ips)),
 	}
 
 	d.entries.Store(host, newEntry)

@@ -151,8 +151,12 @@ func (c *Client) Do(method, rawURL string, body []byte, headers map[string]strin
 // DoWithContext performs an HTTP request with context.
 // If retry is configured, automatically retries on network errors and specified status codes.
 func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body []byte, headers map[string]string) (*Response, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
+	// Parse once. http.NewRequestWithContext parses again internally, but if we
+	// hand it the already-validated string the second parse still runs — there's
+	// no public constructor that takes *url.URL directly without going through
+	// the string path. We at least surface a clean error here on a bad URL
+	// instead of letting NewRequestWithContext do it inside the retry loop.
+	if _, err := url.Parse(rawURL); err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
 
@@ -181,7 +185,7 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 			bodyReader = bytes.NewReader(body)
 		}
 
-		req, err := http.NewRequestWithContext(ctx, method, u.String(), bodyReader)
+		req, err := http.NewRequestWithContext(ctx, method, rawURL, bodyReader)
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
@@ -341,6 +345,13 @@ func (c *Client) PreConnect(ctx context.Context, rawURL string, n int) error {
 //	result := pipeline.Spray(ctx, "GET", "https://target.com", 100000)
 func (c *Client) NewPipeline(workers int) *Pipeline {
 	return newPipeline(c, workers)
+}
+
+// NewPipelineWithConfig creates a Pipeline with full control over worker
+// counts, drain pool size, and channel buffer multipliers. Use this when
+// the simple worker-only knob is too coarse.
+func (c *Client) NewPipelineWithConfig(cfg PipelineConfig) *Pipeline {
+	return newPipelineWithConfig(c, cfg)
 }
 
 // Close releases all resources held by the client.

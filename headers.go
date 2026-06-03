@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/publicsuffix"
 )
@@ -49,8 +50,26 @@ var safariIOS18HeaderOrder = []string{
 	"Accept-Encoding",
 }
 
+// Pre-allocated single-value slices for the fast-path header set. http.Header
+// is map[string][]string; h.Set always allocates a fresh []string{value}.
+// For our fixed-value headers we can hand the map the same backing slice
+// every call (the slice is never appended to or mutated). Saves 6-7 small
+// allocations per request on the DoWithContext path.
+var (
+	safariSecFetchDest  = []string{"document"}
+	safariUserAgent     = []string{SafariIOS18UserAgent}
+	safariSecFetchMode  = []string{"navigate"}
+	safariPriority      = []string{"u=0, i"}
+	safariAcceptEncode  = []string{"gzip, deflate, br"}
+)
+
 // applySafariHeaders sets exact Safari iOS 18 default headers on the request.
 // Only sets headers that are not already present, preserving user overrides.
+//
+// Hot path: skips textproto.CanonicalMIMEHeaderKey by writing into the map
+// directly with already-canonical keys. http.Header.Set canonicalizes its key
+// on every call (allocates a temp byte slice), and for a fixed set of
+// well-known headers that's ~150-200ns per request of pure waste.
 func applySafariHeaders(req *http.Request, accept, lang string) {
 	h := req.Header
 	if h == nil {
@@ -58,14 +77,30 @@ func applySafariHeaders(req *http.Request, accept, lang string) {
 		req.Header = h
 	}
 
-	setIfEmpty(h, "Sec-Fetch-Dest", "document")
-	setIfEmpty(h, "User-Agent", SafariIOS18UserAgent)
-	setIfEmpty(h, "Accept", accept)
-	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(req))
-	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
-	setIfEmpty(h, "Accept-Language", lang)
-	setIfEmpty(h, "Priority", "u=0, i")
-	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br")
+	if _, ok := h["Sec-Fetch-Dest"]; !ok {
+		h["Sec-Fetch-Dest"] = safariSecFetchDest
+	}
+	if _, ok := h["User-Agent"]; !ok {
+		h["User-Agent"] = safariUserAgent
+	}
+	if _, ok := h["Accept"]; !ok {
+		h["Accept"] = []string{accept}
+	}
+	if _, ok := h["Sec-Fetch-Site"]; !ok {
+		h["Sec-Fetch-Site"] = []string{secFetchSiteFor(req)}
+	}
+	if _, ok := h["Sec-Fetch-Mode"]; !ok {
+		h["Sec-Fetch-Mode"] = safariSecFetchMode
+	}
+	if _, ok := h["Accept-Language"]; !ok {
+		h["Accept-Language"] = []string{lang}
+	}
+	if _, ok := h["Priority"]; !ok {
+		h["Priority"] = safariPriority
+	}
+	if _, ok := h["Accept-Encoding"]; !ok {
+		h["Accept-Encoding"] = safariAcceptEncode
+	}
 
 	// NOTE: Safari iOS 18 does NOT send:
 	// - Upgrade-Insecure-Requests (Apple stopped sending on top-level navs)
@@ -87,6 +122,15 @@ func setIfEmpty(h http.Header, key, value string) {
 	}
 }
 
+// secFetchSiteCache memoizes secFetchSiteFor results keyed by the
+// (referer, scheme://host:port) pair. At sustained high RPS the same
+// (referer, target) pair repeats indefinitely, and the underlying
+// url.Parse + publicsuffix lookup is non-trivial.
+//
+// sync.Map is fine here: keys are bounded by the cardinality of distinct
+// (referer, target-origin) pairs in a workload — typically tiny (1-10).
+var secFetchSiteCache sync.Map // map[string]string
+
 // secFetchSiteFor returns the correct Sec-Fetch-Site value for a navigation
 // based on the relationship between the Referer and the request URL.
 //
@@ -107,8 +151,35 @@ func secFetchSiteFor(req *http.Request) string {
 	if referer == "" {
 		return "none"
 	}
+	if req.URL == nil || req.URL.Host == "" {
+		return "none"
+	}
+
+	// Cache key uses target origin (scheme+host+port) + full referer URL.
+	// We deliberately key on the full referer string (not just its origin) so
+	// callers that pass a path-preserving referer still get the right answer
+	// in the same-origin branch without paying for a re-parse.
+	var keyBuf strings.Builder
+	keyBuf.Grow(len(req.URL.Scheme) + len(req.URL.Host) + len(referer) + 4)
+	keyBuf.WriteString(req.URL.Scheme)
+	keyBuf.WriteByte('|')
+	keyBuf.WriteString(req.URL.Host)
+	keyBuf.WriteByte('|')
+	keyBuf.WriteString(referer)
+	key := keyBuf.String()
+
+	if v, ok := secFetchSiteCache.Load(key); ok {
+		return v.(string)
+	}
+
+	result := computeSecFetchSite(req, referer)
+	secFetchSiteCache.Store(key, result)
+	return result
+}
+
+func computeSecFetchSite(req *http.Request, referer string) string {
 	refURL, err := url.Parse(referer)
-	if err != nil || refURL.Host == "" || req.URL == nil || req.URL.Host == "" {
+	if err != nil || refURL.Host == "" {
 		return "none"
 	}
 

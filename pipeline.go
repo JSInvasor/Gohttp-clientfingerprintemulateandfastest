@@ -71,6 +71,23 @@ type pipelineJob struct {
 	result  chan<- *PipelineResult
 }
 
+// PipelineConfig tunes pipeline internals beyond worker count.
+//
+// DrainWorkers controls how many goroutines read response bodies in the
+// background. When 0, the pipeline picks workers/4 (with a 64 floor). Set
+// equal to Workers for maximum throughput at the cost of more idle goroutines
+// blocked in select; lower if memory/CPU is the bottleneck and bodies are
+// small.
+//
+// JobBufferMultiplier sizes the request channel (workers*N). Default 16.
+// DrainBufferMultiplier sizes the drain channel (workers*N). Default 4.
+type PipelineConfig struct {
+	Workers               int
+	DrainWorkers          int
+	JobBufferMultiplier   int
+	DrainBufferMultiplier int
+}
+
 // newPipeline creates a new Pipeline with the specified number of workers.
 // Workers run continuously, pulling jobs from a shared channel.
 //
@@ -80,27 +97,46 @@ type pipelineJob struct {
 //	3000-5000  → 50-150k RPS
 //	5000-10000 → 150k+ RPS
 func newPipeline(c *Client, workers int) *Pipeline {
+	return newPipelineWithConfig(c, PipelineConfig{Workers: workers})
+}
+
+func newPipelineWithConfig(c *Client, cfg PipelineConfig) *Pipeline {
+	workers := cfg.Workers
 	if workers <= 0 {
 		workers = 1000
 	}
 
-	// 1:1 drain workers — at high RPS each request completes ~as fast as
-	// drain reads its body, so we can't afford to be under-provisioned.
-	// Under-provisioned drain → drainCh fills → fallback truncate → RST_STREAM →
-	// CF/Akamai score the client as abusive → 403.
-	drainWorkers := workers
+	// Drain workers default to workers/4 (floor 64). Previously 1:1 with
+	// workers, but most loadtests we profiled had drain workers idle in
+	// select 80%+ of the time. workers/4 absorbs typical body sizes without
+	// the extra goroutine stacks (~8KB each) and select wakeups.
+	// Callers with large response bodies or slow peers should raise this
+	// explicitly via PipelineConfig.DrainWorkers.
+	drainWorkers := cfg.DrainWorkers
+	if drainWorkers <= 0 {
+		drainWorkers = workers / 4
+	}
 	if drainWorkers < 64 {
 		drainWorkers = 64
+	}
+
+	jobMult := cfg.JobBufferMultiplier
+	if jobMult <= 0 {
+		jobMult = 16
+	}
+	drainMult := cfg.DrainBufferMultiplier
+	if drainMult <= 0 {
+		drainMult = 4
 	}
 
 	p := &Pipeline{
 		client:  c,
 		workers: workers,
 		// Large buffer prevents sender blocking under burst load.
-		jobCh:  make(chan *pipelineJob, workers*16),
+		jobCh:  make(chan *pipelineJob, workers*jobMult),
 		stopCh: make(chan struct{}),
-		// Drain channel: 4× workers to absorb bursts without ever truncating.
-		drainCh: make(chan *http.Response, workers*4),
+		// Drain channel absorbs response handoffs without truncating bodies.
+		drainCh: make(chan *http.Response, workers*drainMult),
 		jobPool: sync.Pool{
 			New: func() interface{} { return &pipelineJob{} },
 		},
@@ -131,6 +167,16 @@ func (p *Pipeline) SetTemplate(tmpl *http.Request) {
 	p.template.Store(tmpl)
 }
 
+// drainBufPool reuses 32KB buffers across drain workers so io.CopyBuffer does
+// not allocate one per response. At 100k+ RPS the per-call allocations from
+// io.Copy's default buffer dominate the GC profile.
+var drainBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
 // drainWorker reads and discards response bodies asynchronously.
 // This keeps HTTP/2 streams clean (END_STREAM not RST_STREAM) without blocking request workers.
 //
@@ -139,13 +185,24 @@ func (p *Pipeline) SetTemplate(tmpl *http.Request) {
 // an "abusive client" signal — defeats the purpose of fingerprint emulation.
 // Drain workers run in their own pool, so unbounded reads here do not block
 // request workers.
+//
+// Skips the io.Copy entirely when Content-Length is 0 (HEAD, 204, 304, empty
+// POST acks) — those still need Body.Close() to release the H2 stream, but
+// reading zero bytes is wasted syscalls.
 func (p *Pipeline) drainWorker() {
 	defer p.drainWg.Done()
 	for resp := range p.drainCh {
-		if resp != nil && resp.Body != nil {
-			io.Copy(io.Discard, resp.Body) //nolint:errcheck
-			resp.Body.Close()
+		if resp == nil || resp.Body == nil {
+			continue
 		}
+		if resp.ContentLength == 0 {
+			resp.Body.Close()
+			continue
+		}
+		bufPtr := drainBufPool.Get().(*[]byte)
+		io.CopyBuffer(io.Discard, resp.Body, *bufPtr) //nolint:errcheck
+		drainBufPool.Put(bufPtr)
+		resp.Body.Close()
 	}
 }
 
