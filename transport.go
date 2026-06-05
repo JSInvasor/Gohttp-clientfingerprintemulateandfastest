@@ -324,18 +324,26 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 	hasRotator := t.proxyRotator != nil
 	t.proxyMu.RUnlock()
 
-	maxAttempts := 2
+	// Retry budget:
+	//   - rotator: 1 attempt (each retry would burn another proxy from the
+	//     rotation; user contract is 1 request = 1 proxy).
+	//   - direct:  3 attempts with tight jittered backoff (5-15ms, 10-30ms).
+	//     Under heavy concurrent dialing the edge LB occasionally drops a
+	//     handshake mid-flight; recovering in ~10ms instead of ~100ms is the
+	//     difference between a worker resuming this second vs next second,
+	//     which is a real RPS hit when thousands of workers are racing.
+	maxAttempts := 3
 	if hasRotator {
 		maxAttempts = 1
 	}
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			// Jittered backoff: ~50-150ms on the only retry. Keep the
-			// formula attempt-driven so bumping maxAttempts adds longer
-			// later windows (~150-400ms, ...) without rewriting the math.
-			minMs := 50 * attempt
-			maxMs := 50 + 100*attempt
+			// Tight jittered backoff for the direct path. Attempt 1: 5-15ms,
+			// attempt 2: 10-30ms. The window stays attempt-scaled so future
+			// maxAttempts bumps extend it naturally without rewriting the math.
+			minMs := 5 * attempt
+			maxMs := 10 + 10*attempt
 			delay := time.Duration(minMs+secureRandIntn(maxMs-minMs)) * time.Millisecond
 			select {
 			case <-ctx.Done():
