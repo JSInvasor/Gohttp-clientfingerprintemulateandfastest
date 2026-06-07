@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,10 +24,13 @@ import (
 )
 
 const (
-	white = "\033[37m"
-	gray  = "\033[38;5;245m"
-	red   = "\033[31m"
-	reset = "\033[0m"
+	white  = "\033[37m"
+	gray   = "\033[38;5;245m"
+	red    = "\033[31m"
+	green  = "\033[32m"
+	yellow = "\033[33m"
+	cyan   = "\033[36m"
+	reset  = "\033[0m"
 )
 
 func main() {
@@ -79,9 +84,6 @@ func main() {
 		proxyArg = posArgs[2]
 	}
 
-	// A body only ships on methods that carry one. Promote GET → POST if the
-	// user asked for a body but left the method at GET, so the bytes actually
-	// reach the origin.
 	if bodySize > 0 && method == "GET" {
 		method = "POST"
 	}
@@ -90,8 +92,7 @@ func main() {
 }
 
 // runFingerprintCheck prints Safari iOS 18's live JA3/JA4 + HTTP/2 (Akamai)
-// fingerprint as observed by a fingerprint echo service. Use it to confirm
-// gofire's emulation matches a real Safari device.
+// fingerprint as observed by a fingerprint echo service.
 func runFingerprintCheck(fpURL string) {
 	fmt.Printf("%sfingerprint kaynagi: %s%s\n", gray, fpURL, reset)
 
@@ -159,10 +160,6 @@ func (cg *clientGroup) Close() {
 }
 
 // classifyErr turns a raw error string into a short, actionable reason.
-// Handshake failures get broken down by *why* they failed — the generic
-// "tls handshake failed" hid whether the cause was a slow proxy (timeout),
-// a proxy dropping the tunnel (reset/EOF), a MITM proxy (cert), or a
-// non-tunneling proxy (CONNECT failed).
 func classifyErr(errMsg string) string {
 	lc := strings.ToLower(errMsg)
 	switch {
@@ -202,11 +199,92 @@ func formatTestResult(statusCode int, err error) string {
 	return fmt.Sprintf("%sImpersonate Safari iOS 18 %s>%s %s%d%s", white, gray, reset, white, statusCode, reset)
 }
 
-func run(targetURL string, durSec, threads, streams int, method, proxyArg string, bodySize int) {
-	runtime.GOMAXPROCS(runtime.NumCPU())
+// statusBucket bins status codes for live distribution display. We track the
+// four codes that almost always matter for loadtesting (200 = success, 403 =
+// blocked, 429 = rate-limited, 503 = origin overload) plus an "other" bucket.
+type statusBucket struct {
+	ok        atomic.Int64
+	r403      atomic.Int64
+	r429      atomic.Int64
+	r503      atomic.Int64
+	other     atomic.Int64
+	otherCode atomic.Int32 // last seen "other" code so we can hint at it
+}
 
-	// Pre-build the POST body once. The same buffer is shared (read-only) by
-	// every client's template via GetBody, so there's no per-request alloc.
+func (s *statusBucket) record(code int) {
+	switch {
+	case code >= 200 && code < 300:
+		s.ok.Add(1)
+	case code == 403:
+		s.r403.Add(1)
+	case code == 429:
+		s.r429.Add(1)
+	case code == 503:
+		s.r503.Add(1)
+	default:
+		s.other.Add(1)
+		s.otherCode.Store(int32(code))
+	}
+}
+
+func (s *statusBucket) total() int64 {
+	return s.ok.Load() + s.r403.Load() + s.r429.Load() + s.r503.Load() + s.other.Load()
+}
+
+// latencyTracker keeps a tiny lock-free histogram for p50 / p99 reporting.
+// Each request samples into one of 32 power-of-two ms buckets via an atomic
+// counter increment. p99 from log-scale buckets is approximate (~30% bucket
+// width) but the order-of-magnitude is honest, which is what you want during
+// a loadtest — exact percentiles need HDR histograms and aren't worth the
+// allocations on every request.
+type latencyTracker struct {
+	buckets [32]atomic.Int64 // bucket i ≈ 2^i ms .. 2^(i+1) ms
+}
+
+func (lt *latencyTracker) record(d time.Duration) {
+	ms := d.Milliseconds()
+	if ms < 1 {
+		ms = 1
+	}
+	b := 0
+	for ms > 1 && b < 31 {
+		ms >>= 1
+		b++
+	}
+	lt.buckets[b].Add(1)
+}
+
+func (lt *latencyTracker) percentile(p float64) time.Duration {
+	var total int64
+	var counts [32]int64
+	for i := range lt.buckets {
+		c := lt.buckets[i].Load()
+		counts[i] = c
+		total += c
+	}
+	if total == 0 {
+		return 0
+	}
+	target := int64(float64(total) * p)
+	var seen int64
+	for i := 0; i < 32; i++ {
+		seen += counts[i]
+		if seen >= target {
+			// Mid-bucket estimate: 2^i .. 2^(i+1) ms → return 1.5 * 2^i
+			return time.Duration((int64(1)<<i)*3/2) * time.Millisecond
+		}
+	}
+	return 0
+}
+
+func run(targetURL string, durSec, threads, streams int, method, proxyArg string, bodySize int) {
+	// GOGC=500 means the GC waits until heap is 5x live size before collecting.
+	// At sustained 100k+ RPS this trades a few hundred MB of heap for roughly
+	// half the GC CPU time. For a short-lived loadtest the memory tradeoff is
+	// trivial; the CPU saved goes straight to RPS.
+	debug.SetGCPercent(500)
+	_ = runtime.GOMAXPROCS(runtime.NumCPU())
+
 	var bodyBytes []byte
 	if bodySize > 0 {
 		bodyBytes = make([]byte, bodySize)
@@ -254,10 +332,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		gofire.WithMaxRedirects(3),
 		gofire.WithWriteBufferSize(128 * 1024),
 		gofire.WithReadBufferSize(128 * 1024),
-		// Throughput-oriented defaults from the perf commit. MaxStreamsPerConn
-		// is bumped well above the browser-fidelity 8000 so the h2 conn doesn't
-		// cycle mid-loadtest. Socket buffers raised to 2MB for fat-pipe BDP.
-		// WriteByteTimeout tightened so a slow proxy can't pin a worker for 30s.
 		gofire.WithMaxStreamsPerConn(50000),
 		gofire.WithSocketBuffers(2*1024*1024, 2*1024*1024),
 		gofire.WithWriteByteTimeout(8 * time.Second),
@@ -265,9 +339,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 
 	referer := "https://www.google.com/search?client=safari&channel=iphone_bm"
 
-	// Proxy setup: single URL → WithProxy on every client; file → shared
-	// rotator with sticky-primary failover so a dead proxy fails over to a
-	// live one and the whole list is exercised.
 	var rotator *gofire.ProxyRotator
 	proxyCount := 0
 	if usingProxy {
@@ -302,6 +373,9 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		workersPerClient = 1
 	}
 
+	fmt.Printf("%sconfig:%s url=%s method=%s sure=%ds threads=%d streams=%d clients=%d workers/client=%d proxy=%d\n",
+		gray, reset, targetURL, method, durSec, threads, streams, clientBudget, workersPerClient, proxyCount)
+
 	cg := &clientGroup{}
 	proxyIdx := 0
 	for i := 0; i < clientBudget; i++ {
@@ -333,9 +407,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	}
 	defer cg.Close()
 
-	// Connectivity probe — single GET to confirm we can reach + TLS-handshake
-	// the target with the Safari fingerprint. With a proxy file in use this
-	// only samples one of N proxies; one bad probe doesn't mean the run fails.
 	if proxyCount > 0 {
 		rest := proxyCount - 1
 		if rest < 0 {
@@ -360,9 +431,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}
 
-	// When the load ships a body, probe the actual POST+body request once.
-	// A failure here (while the GET line above is green) means the target
-	// rejects the POST itself — not a client problem.
 	if bodyBytes != nil && len(cg.templates) > 0 {
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), testTimeout)
 		resp, probeErr := cg.clients[0].FastDo(probeCtx, cg.templates[0])
@@ -377,12 +445,23 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}
 
-	// Pre-warm silently to kill cold-start latency on the first second of load.
-	warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Pre-warm — 16 conns/client, all clients in parallel. Cold-start TLS
+	// handshakes used to eat the first 1-2 seconds of the loadtest; this
+	// front-loads them so the RPS curve climbs to peak in <1s.
+	fmt.Printf("%spre-warm...%s ", gray, reset)
+	warmStart := time.Now()
+	warmCtx, warmCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	var warmWg sync.WaitGroup
 	for _, c := range cg.clients {
-		_ = c.PreConnect(warmCtx, targetURL, 4)
+		warmWg.Add(1)
+		go func(c *gofire.Client) {
+			defer warmWg.Done()
+			_ = c.PreConnect(warmCtx, targetURL, 16)
+		}(c)
 	}
+	warmWg.Wait()
 	warmCancel()
+	fmt.Printf("%s%v%s\n", gray, time.Since(warmStart).Round(time.Millisecond), reset)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(durSec)*time.Second)
 	defer cancel()
@@ -397,13 +476,16 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	var (
 		totalSent   atomic.Int64
 		totalFailed atomic.Int64
-		errMu       sync.Mutex
-		recentErrs  []string
-		errCountMap sync.Map
+		latencySum  atomic.Int64 // ns
+		errCountMap sync.Map     // map[string]*atomic.Int64
+		statusDist  statusBucket
+		latTracker  latencyTracker
 	)
 
 	onResult := func(resp *gofire.Response, err error, latency time.Duration) {
 		totalSent.Add(1)
+		latencySum.Add(int64(latency))
+		latTracker.record(latency)
 		if err != nil {
 			totalFailed.Add(1)
 			errStr := err.Error()
@@ -413,16 +495,12 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 			if len(errStr) > 200 {
 				errStr = errStr[:200]
 			}
-			if _, loaded := errCountMap.LoadOrStore(errStr, &atomic.Int64{}); !loaded {
-				errMu.Lock()
-				if len(recentErrs) < 10 {
-					recentErrs = append(recentErrs, errStr)
-				}
-				errMu.Unlock()
-			}
-			if val, ok := errCountMap.Load(errStr); ok {
-				val.(*atomic.Int64).Add(1)
-			}
+			val, _ := errCountMap.LoadOrStore(errStr, &atomic.Int64{})
+			val.(*atomic.Int64).Add(1)
+			return
+		}
+		if resp != nil {
+			statusDist.record(resp.StatusCode())
 		}
 	}
 
@@ -443,7 +521,6 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 		}
 	}
 
-	// Scale feeders with worker count so the job channel never starves.
 	feedersPerPipeline := workersPerClient / 8
 	if feedersPerPipeline < 4 {
 		feedersPerPipeline = 4
@@ -456,7 +533,12 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 	}
 
 	startTime := time.Now()
+
+	// Live stats: one line, refreshed every 1s. Shows current rps, peak,
+	// status code distribution (200/403/429/503), p50/p99, error rate.
+	statsDone := make(chan struct{})
 	go func() {
+		defer close(statsDone)
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		var lastSent int64
@@ -468,33 +550,160 @@ func run(targetURL string, durSec, threads, streams int, method, proxyArg string
 				return
 			case <-ticker.C:
 				sent := totalSent.Load()
+				failed := totalFailed.Load()
 				elapsed := time.Since(startTime).Seconds()
 				rps := sent - lastSent
 				lastSent = sent
 				if rps > peakRPS {
 					peakRPS = rps
 				}
-				fmt.Printf("\r%ssent:%d rps:%d peak:%d %.0fs%s   ",
-					white, sent, rps, peakRPS, elapsed, reset)
+
+				ok := statusDist.ok.Load()
+				r403 := statusDist.r403.Load()
+				r429 := statusDist.r429.Load()
+				r503 := statusDist.r503.Load()
+				other := statusDist.other.Load()
+
+				p50 := latTracker.percentile(0.50)
+				p99 := latTracker.percentile(0.99)
+
+				// Colorize status counts so spike in 403/429/503 jumps out.
+				okC := colorIf(ok > 0, green)
+				c403 := colorIf(r403 > 0, red)
+				c429 := colorIf(r429 > 0, yellow)
+				c503 := colorIf(r503 > 0, red)
+
+				errPart := ""
+				if failed > 0 {
+					errPart = fmt.Sprintf(" %serr:%d%s", red, failed, reset)
+				}
+				otherPart := ""
+				if other > 0 {
+					otherPart = fmt.Sprintf(" %sother(%d):%d%s", gray, statusDist.otherCode.Load(), other, reset)
+				}
+
+				fmt.Printf("\r%ssent:%d rps:%d peak:%d %.0fs%s  %s200:%d%s %s403:%d%s %s429:%d%s %s503:%d%s%s  %sp50:%v p99:%v%s%s    ",
+					white, sent, rps, peakRPS, elapsed, reset,
+					okC, ok, reset,
+					c403, r403, reset,
+					c429, r429, reset,
+					c503, r503, reset,
+					otherPart,
+					gray, p50.Round(time.Millisecond), p99.Round(time.Millisecond), reset,
+					errPart)
+			}
+		}
+	}()
+
+	// Error sampler: every 10s print the top 3 unique errors. Real-time
+	// signal so you don't wait until the run ends to see a proxy meltdown.
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				type ec struct {
+					msg   string
+					count int64
+				}
+				var errs []ec
+				errCountMap.Range(func(k, v interface{}) bool {
+					errs = append(errs, ec{k.(string), v.(*atomic.Int64).Load()})
+					return true
+				})
+				if len(errs) == 0 {
+					continue
+				}
+				sort.Slice(errs, func(i, j int) bool { return errs[i].count > errs[j].count })
+				if len(errs) > 3 {
+					errs = errs[:3]
+				}
+				fmt.Printf("\n%s[%s]%s ", gray, time.Now().Format("15:04:05"), reset)
+				for i, e := range errs {
+					if i > 0 {
+						fmt.Print(gray + " | " + reset)
+					}
+					msg := e.msg
+					if len(msg) > 60 {
+						msg = msg[:60] + "..."
+					}
+					fmt.Printf("%s[%dx]%s %s", red, e.count, reset, msg)
+				}
+				fmt.Println()
 			}
 		}
 	}()
 
 	feedWg.Wait()
+	<-statsDone
 	fmt.Println()
 
-	errMu.Lock()
-	if len(recentErrs) > 0 {
-		fmt.Println()
-		for _, e := range recentErrs {
-			count := int64(0)
-			if val, ok := errCountMap.Load(e); ok {
-				count = val.(*atomic.Int64).Load()
-			}
-			fmt.Printf("%s[%dx] %s%s\n", red, count, e, reset)
+	// Final summary — clean recap so you don't have to scroll the live log.
+	elapsed := time.Since(startTime)
+	sent := totalSent.Load()
+	failed := totalFailed.Load()
+	avgRPS := float64(sent) / elapsed.Seconds()
+	avgLat := time.Duration(0)
+	if sent > 0 {
+		avgLat = time.Duration(latencySum.Load() / sent)
+	}
+	p50 := latTracker.percentile(0.50)
+	p99 := latTracker.percentile(0.99)
+
+	fmt.Println()
+	fmt.Printf("%s=== ozet ===%s\n", cyan, reset)
+	fmt.Printf("  sure:        %v\n", elapsed.Round(time.Millisecond))
+	fmt.Printf("  toplam:      %d istek\n", sent)
+	fmt.Printf("  hata:        %d (%.1f%%)\n", failed, pct(failed, sent))
+	fmt.Printf("  ortRPS:      %.0f\n", avgRPS)
+	fmt.Printf("  latency:     avg=%v p50=%v p99=%v\n",
+		avgLat.Round(time.Millisecond),
+		p50.Round(time.Millisecond),
+		p99.Round(time.Millisecond))
+	fmt.Printf("  status:      200=%d 403=%d 429=%d 503=%d other=%d\n",
+		statusDist.ok.Load(),
+		statusDist.r403.Load(),
+		statusDist.r429.Load(),
+		statusDist.r503.Load(),
+		statusDist.other.Load())
+
+	// Top errors with counts. Capped at 10 to keep the output sane.
+	type ec struct {
+		msg   string
+		count int64
+	}
+	var errs []ec
+	errCountMap.Range(func(k, v interface{}) bool {
+		errs = append(errs, ec{k.(string), v.(*atomic.Int64).Load()})
+		return true
+	})
+	if len(errs) > 0 {
+		sort.Slice(errs, func(i, j int) bool { return errs[i].count > errs[j].count })
+		if len(errs) > 10 {
+			errs = errs[:10]
+		}
+		fmt.Printf("\n%s=== en sik hatalar ===%s\n", cyan, reset)
+		for _, e := range errs {
+			fmt.Printf("  %s[%dx]%s %s\n", red, e.count, reset, e.msg)
 		}
 	}
-	errMu.Unlock()
+}
+
+func pct(n, total int64) float64 {
+	if total == 0 {
+		return 0
+	}
+	return float64(n) * 100 / float64(total)
+}
+
+func colorIf(cond bool, col string) string {
+	if cond {
+		return col
+	}
+	return gray
 }
 
 func isProxyFile(s string) bool {
@@ -516,7 +725,6 @@ func mustInt(s, name string) int {
 	return v
 }
 
-// mustBytes parses a size like "512", "16k", "2m" into a byte count.
 func mustBytes(s string) int {
 	s = strings.TrimSpace(strings.ToLower(s))
 	mult := 1
@@ -538,10 +746,7 @@ func mustBytes(s string) int {
 
 // attachBody wires a fixed body into a template request so FastDo can replay
 // it. GetBody hands a fresh reader to every send (the shallow template copy
-// shares one Body that would otherwise EOF after the first request). The
-// Content-Type, Content-Length and Origin headers a real browser sends on a
-// form POST are also set — all already have ordered slots in the Safari
-// HeaderOrder, so the fingerprint stays valid.
+// shares one Body that would otherwise EOF after the first request).
 func attachBody(tmpl *http.Request, body []byte, targetURL string) {
 	tmpl.Body = io.NopCloser(bytes.NewReader(body))
 	tmpl.ContentLength = int64(len(body))
