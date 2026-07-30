@@ -424,12 +424,24 @@ func TestPipelineFireAndForget(t *testing.T) {
 		pipeline.FireAndForget(ctx, "GET", server.URL, nil, nil)
 	}
 
-	pipeline.Close() // waits for all workers
-
-	if count.Load() == 0 {
-		t.Error("no requests completed in fire-and-forget mode")
+	// Close() discards whatever is still buffered in jobCh — that is its
+	// documented contract for a fire-and-forget pipeline, and workers check
+	// stopCh before jobCh so shutdown is prompt. Calling it immediately and
+	// then asserting on the count is therefore a race against the workers,
+	// which is exactly what this test used to do. Wait (bounded) for the
+	// pipeline to have dispatched something, then shut down.
+	deadline := time.Now().Add(5 * time.Second)
+	for count.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	t.Logf("FireAndForget: %d/100 completed", count.Load())
+	dispatched := count.Load()
+
+	pipeline.Close()
+
+	if dispatched == 0 {
+		t.Error("no requests dispatched in fire-and-forget mode within 5s")
+	}
+	t.Logf("FireAndForget: %d/100 dispatched before shutdown", dispatched)
 }
 
 // TestPipelineCloseRace ensures Close() does not panic when a flood of
