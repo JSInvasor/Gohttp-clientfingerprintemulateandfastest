@@ -28,6 +28,7 @@ type Conn struct {
 	// application data, so the live connection is what turns them into
 	// reusable sessions.
 	didResume  bool
+	hsBuf      []byte // partial post-handshake message awaiting more records
 	suite      uint16
 	resMaster  []byte
 	sessions   *SessionCache
@@ -148,15 +149,21 @@ func (c *Conn) absorbPostHandshake(plaintext []byte) {
 	if c.sessions == nil || len(c.resMaster) == 0 {
 		return
 	}
-	remaining := plaintext
-	for len(remaining) >= 4 {
-		msgType := remaining[0]
-		msgLen := int(remaining[1])<<16 | int(remaining[2])<<8 | int(remaining[3])
-		if 4+msgLen > len(remaining) {
-			return
+	// Post-handshake messages span records just as the flight does, so a
+	// partial NewSessionTicket has to wait for the rest rather than be dropped.
+	c.hsBuf = append(c.hsBuf, plaintext...)
+	if len(c.hsBuf) > maxHandshakeBuffer {
+		c.hsBuf = nil
+		return
+	}
+	for len(c.hsBuf) >= 4 {
+		msgType := c.hsBuf[0]
+		msgLen := int(c.hsBuf[1])<<16 | int(c.hsBuf[2])<<8 | int(c.hsBuf[3])
+		if 4+msgLen > len(c.hsBuf) {
+			return // wait for more records
 		}
-		body := remaining[4 : 4+msgLen]
-		remaining = remaining[4+msgLen:]
+		body := c.hsBuf[4 : 4+msgLen]
+		c.hsBuf = c.hsBuf[4+msgLen:]
 
 		if msgType != handshakeTypeNewSessionTicket {
 			continue

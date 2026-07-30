@@ -93,6 +93,14 @@ func dialRogue(t *testing.T, host string, pool *x509.CertPool, leafDER []byte, s
 // client decides whether to trust the peer. Everything is correct except the
 // CertificateVerify signature, which is random.
 func rogueServerHandshake(conn net.Conn, leafDER []byte, signer *ecdsa.PrivateKey) {
+	rogueServerHandshakeFragmented(conn, leafDER, signer, 0)
+}
+
+// rogueServerHandshakeFragmented is rogueServerHandshake with control over how
+// the server's handshake flight is split across TLS records. fragment <= 0
+// sends it as one record, which is what most servers do; a positive value
+// splits the flight there, which servers are equally free to do.
+func rogueServerHandshakeFragmented(conn net.Conn, leafDER []byte, signer *ecdsa.PrivateKey, fragment int) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
 
@@ -223,11 +231,22 @@ func rogueServerHandshake(conn net.Conn, leafDER []byte, signer *ecdsa.PrivateKe
 	blob = append(blob, cvMsg...)
 	blob = append(blob, finMsg...)
 
-	ct, err := er.encrypt(blob, recordTypeHandshake)
-	if err != nil {
-		return
+	// Split the flight into records. RFC 8446 §5.1 lets a handshake message
+	// span records and lets one record hold several messages, so a client must
+	// reassemble rather than assume one record is one flight.
+	chunks := [][]byte{blob}
+	if fragment > 0 && fragment < len(blob) {
+		chunks = [][]byte{blob[:fragment], blob[fragment:]}
 	}
-	writeRawRecord(conn, recordTypeApplicationData, ct)
+	for _, chunk := range chunks {
+		ct, err := er.encrypt(chunk, recordTypeHandshake)
+		if err != nil {
+			return
+		}
+		if err := writeRawRecord(conn, recordTypeApplicationData, ct); err != nil {
+			return
+		}
+	}
 
 	// Drain whatever the client sends back (CCS + client Finished) so its
 	// writes don't block on a full socket buffer.

@@ -158,3 +158,52 @@ func TestCloseNotifyReportsEOF(t *testing.T) {
 		t.Fatalf("close_notify surfaced as %v (%T), want io.EOF", err, err)
 	}
 }
+
+// TestHandshakeMessageSpanningRecords covers reassembly across TLS records.
+//
+// RFC 8446 §5.1 is explicit that record boundaries carry no meaning for
+// handshake messages: one message may span several records, and one record may
+// hold several messages. Servers exercise this freely — a certificate chain
+// large enough to pass the 16 KiB record limit forces it — so a client that
+// treats each record as a self-contained flight works against most servers and
+// fails against the rest, which is far harder to diagnose than failing against
+// all of them.
+func TestHandshakeMessageSpanningRecords(t *testing.T) {
+	const host = "example.com"
+	pool, leafDER, leafKey := testCertChain(t, host)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		// Split partway through the Certificate message: EncryptedExtensions is
+		// a handful of bytes, so 40 lands inside the certificate.
+		rogueServerHandshakeFragmented(c, leafDER, leafKey, 40)
+	}()
+
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer raw.Close()
+	raw.SetDeadline(time.Now().Add(15 * time.Second))
+
+	conn, err := handshake(raw, &Config{
+		ServerName: host,
+		ALPN:       []string{"h2"},
+		RootCAs:    pool,
+		Browser:    BrowserSafari,
+	})
+	if err != nil {
+		t.Fatalf("handshake failed when the server split its flight across "+
+			"records, which RFC 8446 §5.1 permits: %v", err)
+	}
+	conn.Close()
+}

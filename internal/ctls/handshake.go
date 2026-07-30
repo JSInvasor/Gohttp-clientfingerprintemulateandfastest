@@ -23,6 +23,11 @@ import (
 	mlkem "github.com/cloudflare/circl/kem/mlkem/mlkem768"
 )
 
+// maxHandshakeBuffer bounds the bytes held while reassembling a handshake
+// flight. Real flights are a few kilobytes; the cap stops a peer from pinning
+// memory by dribbling a message it never completes.
+const maxHandshakeBuffer = 512 * 1024
+
 // handshakeState manages the TLS 1.3 handshake.
 type handshakeState struct {
 	conn       net.Conn
@@ -150,6 +155,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 	var serverCerts []*x509.Certificate
 	var serverFinishedMAC []byte
 	var sawCertVerify bool
+	var hsBuf []byte
 
 	// Drain ChangeCipherSpec if present (TLS 1.3 middlebox compat)
 	for {
@@ -184,16 +190,28 @@ func (hs *handshakeState) run() (*Conn, error) {
 			return nil, fmt.Errorf("expected handshake inner type, got %d", innerType)
 		}
 
-		// Process handshake messages - may contain multiple messages
-		remaining := plaintext
-		for len(remaining) >= 4 {
-			msgType := remaining[0]
-			msgLen := int(remaining[1])<<16 | int(remaining[2])<<8 | int(remaining[3])
-			if 4+msgLen > len(remaining) {
-				return nil, fmt.Errorf("truncated handshake message type %d", msgType)
+		// Reassemble across records. RFC 8446 §5.1: record boundaries carry no
+		// meaning for handshake messages — one message may span several records
+		// and one record may hold several messages. Treating each record as a
+		// self-contained flight works against servers that happen to send the
+		// flight whole and fails against the rest, which is harder to diagnose
+		// than failing against all of them. A chain past the 16 KiB record
+		// limit forces the split.
+		hsBuf = append(hsBuf, plaintext...)
+		if len(hsBuf) > maxHandshakeBuffer {
+			return nil, fmt.Errorf("handshake flight exceeds %d bytes", maxHandshakeBuffer)
+		}
+		for len(hsBuf) >= 4 {
+			msgType := hsBuf[0]
+			msgLen := int(hsBuf[1])<<16 | int(hsBuf[2])<<8 | int(hsBuf[3])
+			if 4+msgLen > len(hsBuf) {
+				break // wait for the rest to arrive in a later record
 			}
-			msg := remaining[:4+msgLen]
-			remaining = remaining[4+msgLen:]
+			// Copy: x509.ParseCertificate keeps a reference to its input in
+			// Certificate.Raw, and the buffer's backing array is reused as
+			// later records are appended.
+			msg := append([]byte(nil), hsBuf[:4+msgLen]...)
+			hsBuf = hsBuf[4+msgLen:]
 
 			switch msgType {
 			case handshakeTypeEncryptedExtensions:
