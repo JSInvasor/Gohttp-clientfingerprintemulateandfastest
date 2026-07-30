@@ -10,13 +10,13 @@ const (
 
 // TLS handshake message types
 const (
-	handshakeTypeClientHello             = 1
-	handshakeTypeServerHello             = 2
-	handshakeTypeEncryptedExtensions     = 8
-	handshakeTypeCertificate             = 11
-	handshakeTypeCertificateVerify       = 15
-	handshakeTypeFinished                = 20
-	handshakeTypeCompressedCertificate   = 25
+	handshakeTypeClientHello           = 1
+	handshakeTypeServerHello           = 2
+	handshakeTypeEncryptedExtensions   = 8
+	handshakeTypeCertificate           = 11
+	handshakeTypeCertificateVerify     = 15
+	handshakeTypeFinished              = 20
+	handshakeTypeCompressedCertificate = 25
 )
 
 // TLS versions
@@ -68,23 +68,43 @@ const (
 
 // Cipher suites used by the Safari iOS 18 and Chrome 146 profiles
 const (
-	cipherTLS_AES_128_GCM_SHA256                     = 0x1301
-	cipherTLS_CHACHA20_POLY1305_SHA256               = 0x1303
-	cipherTLS_AES_256_GCM_SHA384                     = 0x1302
-	cipherTLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256    = 0xC02B
-	cipherTLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256      = 0xC02F
-	cipherTLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305     = 0xCCA9
-	cipherTLS_ECDHE_RSA_WITH_CHACHA20_POLY1305       = 0xCCA8
-	cipherTLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384    = 0xC02C
-	cipherTLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384      = 0xC030
-	cipherTLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA       = 0xC00A
-	cipherTLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA       = 0xC009
-	cipherTLS_ECDHE_RSA_WITH_AES_128_CBC_SHA         = 0xC013
-	cipherTLS_ECDHE_RSA_WITH_AES_256_CBC_SHA         = 0xC014
-	cipherTLS_RSA_WITH_AES_128_GCM_SHA256            = 0x009C
-	cipherTLS_RSA_WITH_AES_256_GCM_SHA384            = 0x009D
-	cipherTLS_RSA_WITH_AES_128_CBC_SHA               = 0x002F
-	cipherTLS_RSA_WITH_AES_256_CBC_SHA               = 0x0035
+	cipherTLS_AES_128_GCM_SHA256                  = 0x1301
+	cipherTLS_CHACHA20_POLY1305_SHA256            = 0x1303
+	cipherTLS_AES_256_GCM_SHA384                  = 0x1302
+	cipherTLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 = 0xC02B
+	cipherTLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256   = 0xC02F
+	cipherTLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305  = 0xCCA9
+	cipherTLS_ECDHE_RSA_WITH_CHACHA20_POLY1305    = 0xCCA8
+	cipherTLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 = 0xC02C
+	cipherTLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384   = 0xC030
+	cipherTLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA    = 0xC00A
+	cipherTLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA    = 0xC009
+	cipherTLS_ECDHE_RSA_WITH_AES_128_CBC_SHA      = 0xC013
+	cipherTLS_ECDHE_RSA_WITH_AES_256_CBC_SHA      = 0xC014
+	cipherTLS_RSA_WITH_AES_128_GCM_SHA256         = 0x009C
+	cipherTLS_RSA_WITH_AES_256_GCM_SHA384         = 0x009D
+	cipherTLS_RSA_WITH_AES_128_CBC_SHA            = 0x002F
+	cipherTLS_RSA_WITH_AES_256_CBC_SHA            = 0x0035
+)
+
+// Signature schemes (RFC 8446 §4.2.3) accepted in server CertificateVerify.
+//
+// RSASSA-PKCS1-v1_5 schemes are deliberately absent: RFC 8446 §4.4.3 forbids
+// them in CertificateVerify (they remain valid for certificate signatures, which
+// x509.Verify handles). ML-DSA (0x0904-0x0906) is advertised by the Chrome
+// profile but has no verifier in the standard library, so it is also absent and
+// fails closed.
+const (
+	sigECDSAP256SHA256  = 0x0403
+	sigECDSAP384SHA384  = 0x0503
+	sigECDSAP521SHA512  = 0x0603
+	sigRSAPSSRSAeSHA256 = 0x0804
+	sigRSAPSSRSAeSHA384 = 0x0805
+	sigRSAPSSRSAeSHA512 = 0x0806
+	sigEd25519          = 0x0807
+	sigRSAPSSPSSSHA256  = 0x0809
+	sigRSAPSSPSSSHA384  = 0x080A
+	sigRSAPSSPSSSHA512  = 0x080B
 )
 
 // Certificate compression algorithms
@@ -153,8 +173,8 @@ const (
 	alertLevelWarning = 1
 	alertLevelFatal   = 2
 
-	alertCloseNotify    = 0
-	alertUnexpectedMsg  = 10
+	alertCloseNotify      = 0
+	alertUnexpectedMsg    = 10
 	alertHandshakeFailure = 40
-	alertDecryptError   = 51
+	alertDecryptError     = 51
 )

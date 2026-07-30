@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"time"
 )
@@ -14,10 +16,10 @@ import (
 type Conn struct {
 	net.Conn // underlying TCP connection
 
-	serverName      string
-	negotiatedALPN  string
-	serverReader    *encryptedRecord // server → client application data
-	clientWriter    *encryptedRecord // client → server application data
+	serverName     string
+	negotiatedALPN string
+	serverReader   *encryptedRecord // server → client application data
+	clientWriter   *encryptedRecord // client → server application data
 
 	readBuf []byte // decrypted application data buffer
 	readErr error  // stored read error
@@ -32,11 +34,11 @@ func (c *Conn) NegotiatedProtocol() string {
 // The http2 transport uses this to check the negotiated ALPN protocol.
 func (c *Conn) ConnectionState() tls.ConnectionState {
 	return tls.ConnectionState{
-		Version:                     tls.VersionTLS13,
-		HandshakeComplete:           true,
-		ServerName:                  c.serverName,
-		NegotiatedProtocol:          c.negotiatedALPN,
-		NegotiatedProtocolIsMutual:  true,
+		Version:                    tls.VersionTLS13,
+		HandshakeComplete:          true,
+		ServerName:                 c.serverName,
+		NegotiatedProtocol:         c.negotiatedALPN,
+		NegotiatedProtocolIsMutual: true,
 	}
 }
 
@@ -56,6 +58,13 @@ func (c *Conn) Read(b []byte) (int, error) {
 	for {
 		rec, err := readRawRecord(c.Conn)
 		if err != nil {
+			// A clean close at a record boundary ends the stream. Hand back a
+			// bare io.EOF rather than the wrapped form so callers comparing
+			// against io.EOF see a normal end of data. io.ErrUnexpectedEOF —
+			// a close mid-record — deliberately stays an error.
+			if errors.Is(err, io.EOF) {
+				err = io.EOF
+			}
 			c.readErr = err
 			return 0, err
 		}
@@ -88,12 +97,17 @@ func (c *Conn) Read(b []byte) (int, error) {
 
 		case recordTypeAlert:
 			if len(plaintext) >= 2 {
+				// close_notify is an orderly shutdown, not a failure, and is
+				// checked before the level: TLS 1.3 peers send it at either
+				// level and treating it as a generic error would turn every
+				// correctly terminated response whose length is delimited by
+				// connection close into a failed request.
+				if plaintext[1] == alertCloseNotify {
+					c.readErr = io.EOF
+					return 0, io.EOF
+				}
 				if plaintext[0] == alertLevelFatal {
 					c.readErr = fmt.Errorf("tls alert: %d", plaintext[1])
-					return 0, c.readErr
-				}
-				if plaintext[1] == alertCloseNotify {
-					c.readErr = fmt.Errorf("connection closed")
 					return 0, c.readErr
 				}
 			}
@@ -192,13 +206,19 @@ func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []s
 	return tlsConn, nil
 }
 
-
 // SetReadDeadline sets the read deadline.
+//
+// It must not collapse to SetDeadline: that also moves the write deadline, and
+// the read and write sides of an HTTP/2 connection run in separate goroutines.
+// The write path arms a deadline before each frame and clears it afterwards, so
+// aliasing the two lets a write time out an idle read and lets a completed
+// write silently clear the caller's read deadline.
 func (c *Conn) SetReadDeadline(t time.Time) error {
-	return c.Conn.SetDeadline(t)
+	return c.Conn.SetReadDeadline(t)
 }
 
-// SetWriteDeadline sets the write deadline.
+// SetWriteDeadline sets the write deadline. See SetReadDeadline for why this
+// does not delegate to SetDeadline.
 func (c *Conn) SetWriteDeadline(t time.Time) error {
-	return c.Conn.SetDeadline(t)
+	return c.Conn.SetWriteDeadline(t)
 }

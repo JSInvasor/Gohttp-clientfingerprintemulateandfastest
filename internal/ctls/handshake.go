@@ -3,7 +3,14 @@ package ctls
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto"
 	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
@@ -109,6 +116,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 	// Read encrypted handshake messages: EncryptedExtensions, Certificate, CertVerify, Finished
 	var serverCerts []*x509.Certificate
 	var serverFinishedMAC []byte
+	var sawCertVerify bool
 
 	// Drain ChangeCipherSpec if present (TLS 1.3 middlebox compat)
 	for {
@@ -185,8 +193,30 @@ func (hs *handshakeState) run() (*Conn, error) {
 				serverCerts = certs
 
 			case handshakeTypeCertificateVerify:
-				// Update transcript with this message
+				// RFC 8446 §4.4.3: the signature covers the transcript up to
+				// and including Certificate, so snapshot the hash before
+				// folding this message in.
+				cvTranscript := hs.transcript.Sum(nil)
 				hs.transcript.Write(msg)
+				sawCertVerify = true
+
+				if !hs.skipVerify {
+					cvBody := msg[4 : 4+msgLen]
+					if len(cvBody) < 4 {
+						return nil, fmt.Errorf("certificate verify message too short")
+					}
+					sigAlg := binary.BigEndian.Uint16(cvBody[0:2])
+					sigLen := int(binary.BigEndian.Uint16(cvBody[2:4]))
+					if 4+sigLen > len(cvBody) {
+						return nil, fmt.Errorf("certificate verify signature truncated")
+					}
+					if len(serverCerts) == 0 {
+						return nil, fmt.Errorf("certificate verify arrived before any certificate")
+					}
+					if err := verifyCertVerifySignature(serverCerts[0], sigAlg, cvBody[4:4+sigLen], cvTranscript); err != nil {
+						return nil, fmt.Errorf("certificate verify: %w", err)
+					}
+				}
 
 			case handshakeTypeFinished:
 				// DO NOT update transcript yet - verify first
@@ -209,10 +239,20 @@ func (hs *handshakeState) run() (*Conn, error) {
 		}
 	}
 
-	// Verify server certificate
-	if !hs.skipVerify && len(serverCerts) > 0 {
+	// Verify server certificate. Both the chain and the CertificateVerify
+	// signature are mandatory: the previous `len(serverCerts) > 0` guard meant a
+	// server that simply omitted its Certificate message skipped validation
+	// entirely, and a missing CertificateVerify would leave the peer
+	// unauthenticated. Absence of either is a failure, not a reason to skip.
+	if !hs.skipVerify {
+		if len(serverCerts) == 0 {
+			return nil, fmt.Errorf("server sent no certificate")
+		}
+		if !sawCertVerify {
+			return nil, fmt.Errorf("server sent no CertificateVerify message")
+		}
 		if err := verifyCertificate(serverCerts, hs.serverName, hs.rootCAs); err != nil {
-			return nil, fmt.Errorf("certificate verify: %w", err)
+			return nil, fmt.Errorf("certificate chain verify: %w", err)
 		}
 	}
 
@@ -287,6 +327,10 @@ func (hs *handshakeState) parseServerHello(data []byte) (suite uint16, dhe []byt
 		return 0, nil, nil, "", fmt.Errorf("expected ServerHello (2), got %d", msgType)
 	}
 
+	if 4+msgLen > len(data) {
+		return 0, nil, nil, "", fmt.Errorf("server hello truncated: declares %d bytes, record holds %d", msgLen, len(data)-4)
+	}
+
 	rawMsg = data[:4+msgLen]
 	body := data[4 : 4+msgLen]
 
@@ -318,6 +362,12 @@ func (hs *handshakeState) parseServerHello(data []byte) (suite uint16, dhe []byt
 	}
 	extsLen := int(binary.BigEndian.Uint16(body[offset:]))
 	offset += 2
+	// Length fields here are attacker-controlled: this parser runs on every
+	// dial, against whatever bytes the peer sends, so an unchecked slice would
+	// be a remotely triggerable panic that takes down the calling process.
+	if offset+extsLen > len(body) {
+		return 0, nil, nil, "", fmt.Errorf("server hello extensions overrun message: %d > %d", extsLen, len(body)-offset)
+	}
 	exts := body[offset : offset+extsLen]
 
 	// Check if TLS 1.3 via supported_versions extension
@@ -327,6 +377,9 @@ func (hs *handshakeState) parseServerHello(data []byte) (suite uint16, dhe []byt
 		extType := binary.BigEndian.Uint16(exts[eOffset:])
 		extLen := int(binary.BigEndian.Uint16(exts[eOffset+2:]))
 		eOffset += 4
+		if eOffset+extLen > len(exts) {
+			return 0, nil, nil, "", fmt.Errorf("server hello extension 0x%04x overruns block", extType)
+		}
 		extData := exts[eOffset : eOffset+extLen]
 		eOffset += extLen
 
@@ -358,6 +411,9 @@ func (hs *handshakeState) parseServerHello(data []byte) (suite uint16, dhe []byt
 		extType := binary.BigEndian.Uint16(exts[eOffset:])
 		extLen := int(binary.BigEndian.Uint16(exts[eOffset+2:]))
 		eOffset += 4
+		if eOffset+extLen > len(exts) {
+			return 0, nil, nil, "", fmt.Errorf("server hello extension 0x%04x overruns block", extType)
+		}
 		extData := exts[eOffset : eOffset+extLen]
 		eOffset += extLen
 
@@ -394,6 +450,9 @@ func (hs *handshakeState) processServerKeyShare(data []byte) ([]byte, error) {
 
 	group := binary.BigEndian.Uint16(data[0:])
 	keyLen := int(binary.BigEndian.Uint16(data[2:]))
+	if 4+keyLen > len(data) {
+		return nil, fmt.Errorf("key_share entry overruns extension: declares %d bytes, have %d", keyLen, len(data)-4)
+	}
 	keyData := data[4 : 4+keyLen]
 
 	switch group {
@@ -505,6 +564,102 @@ func parseCertificate(data []byte) ([]*x509.Certificate, error) {
 	return certs, nil
 }
 
+// certVerifyContext is the RFC 8446 §4.4.3 context string for a server
+// CertificateVerify signature.
+const certVerifyContext = "TLS 1.3, server CertificateVerify"
+
+// certVerifyPayload builds the octet string the server signs in
+// CertificateVerify: 64 spaces, the context string, a zero separator, then the
+// transcript hash up to and including the Certificate message.
+func certVerifyPayload(transcriptHash []byte) []byte {
+	b := make([]byte, 0, 64+len(certVerifyContext)+1+len(transcriptHash))
+	for i := 0; i < 64; i++ {
+		b = append(b, 0x20)
+	}
+	b = append(b, certVerifyContext...)
+	b = append(b, 0x00)
+	b = append(b, transcriptHash...)
+	return b
+}
+
+// verifyCertVerifySignature checks the server's CertificateVerify signature
+// against the leaf certificate's public key.
+//
+// This is the step that actually authenticates the peer. A certificate chain
+// alone proves nothing — certificates are public and anyone can replay one — so
+// without this check any party able to route the traffic can impersonate any
+// host whose chain they can fetch. Unsupported or forbidden algorithms fail
+// closed: a signature we cannot verify is not an authenticated server.
+func verifyCertVerifySignature(leaf *x509.Certificate, sigAlg uint16, sig, transcriptHash []byte) error {
+	payload := certVerifyPayload(transcriptHash)
+
+	switch sigAlg {
+	case sigECDSAP256SHA256, sigECDSAP384SHA384, sigECDSAP521SHA512:
+		pub, ok := leaf.PublicKey.(*ecdsa.PublicKey)
+		if !ok {
+			return fmt.Errorf("scheme 0x%04x needs an ECDSA key, certificate has %T", sigAlg, leaf.PublicKey)
+		}
+		var digest []byte
+		var want elliptic.Curve
+		switch sigAlg {
+		case sigECDSAP256SHA256:
+			s := sha256.Sum256(payload)
+			digest, want = s[:], elliptic.P256()
+		case sigECDSAP384SHA384:
+			s := sha512.Sum384(payload)
+			digest, want = s[:], elliptic.P384()
+		default:
+			s := sha512.Sum512(payload)
+			digest, want = s[:], elliptic.P521()
+		}
+		if pub.Curve != want {
+			return fmt.Errorf("scheme 0x%04x does not match certificate curve %s", sigAlg, pub.Curve.Params().Name)
+		}
+		if !ecdsa.VerifyASN1(pub, digest, sig) {
+			return fmt.Errorf("ECDSA signature does not verify")
+		}
+		return nil
+
+	case sigRSAPSSRSAeSHA256, sigRSAPSSRSAeSHA384, sigRSAPSSRSAeSHA512,
+		sigRSAPSSPSSSHA256, sigRSAPSSPSSSHA384, sigRSAPSSPSSSHA512:
+		pub, ok := leaf.PublicKey.(*rsa.PublicKey)
+		if !ok {
+			return fmt.Errorf("scheme 0x%04x needs an RSA key, certificate has %T", sigAlg, leaf.PublicKey)
+		}
+		var digest []byte
+		var h crypto.Hash
+		switch sigAlg {
+		case sigRSAPSSRSAeSHA256, sigRSAPSSPSSSHA256:
+			s := sha256.Sum256(payload)
+			digest, h = s[:], crypto.SHA256
+		case sigRSAPSSRSAeSHA384, sigRSAPSSPSSSHA384:
+			s := sha512.Sum384(payload)
+			digest, h = s[:], crypto.SHA384
+		default:
+			s := sha512.Sum512(payload)
+			digest, h = s[:], crypto.SHA512
+		}
+		// RFC 8446 §4.2.3 mandates a salt length equal to the digest length.
+		if err := rsa.VerifyPSS(pub, h, digest, sig, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash}); err != nil {
+			return fmt.Errorf("RSA-PSS signature does not verify: %w", err)
+		}
+		return nil
+
+	case sigEd25519:
+		pub, ok := leaf.PublicKey.(ed25519.PublicKey)
+		if !ok {
+			return fmt.Errorf("scheme 0x%04x needs an Ed25519 key, certificate has %T", sigAlg, leaf.PublicKey)
+		}
+		if !ed25519.Verify(pub, payload, sig) {
+			return fmt.Errorf("Ed25519 signature does not verify")
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unsupported CertificateVerify scheme 0x%04x", sigAlg)
+	}
+}
+
 // verifyCertificate verifies the server certificate chain.
 func verifyCertificate(certs []*x509.Certificate, serverName string, rootCAs *x509.CertPool) error {
 	if len(certs) == 0 {
@@ -513,8 +668,8 @@ func verifyCertificate(certs []*x509.Certificate, serverName string, rootCAs *x5
 
 	leaf := certs[0]
 	opts := x509.VerifyOptions{
-		DNSName:   serverName,
-		Roots:     rootCAs,
+		DNSName:     serverName,
+		Roots:       rootCAs,
 		CurrentTime: time.Now(),
 	}
 
@@ -619,5 +774,3 @@ func parseEncryptedExtensionsALPN(body []byte) string {
 	}
 	return ""
 }
-
-
