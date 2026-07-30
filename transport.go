@@ -23,18 +23,24 @@ import (
 	http2 "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/http2"
 )
 
-// Transport is a high-performance HTTP transport with Safari iOS 18 fingerprint emulation.
+// Transport is a high-performance HTTP transport with browser fingerprint
+// emulation. Safari iOS 18 and Chrome 147 are supported.
 //
 // It emulates both TLS (JA3/JA4) and HTTP/2 (Akamai) fingerprints using a custom
-// TLS 1.3 implementation (internal/ctls) - no uTLS dependency:
+// TLS 1.3 implementation (internal/ctls) - no uTLS dependency. Everything below
+// is selected from the BrowserProfile passed to newTransport:
 //
-//   - TLS: custom Safari iOS 18 ClientHello built at the byte level (GREASE,
-//     padding to 512 bytes, X25519-only key share, zlib compress_certificate)
-//   - HTTP/2 SETTINGS: ENABLE_PUSH, MAX_CONCURRENT_STREAMS=100,
-//     INITIAL_WINDOW_SIZE=2097152, NO_RFC7540_PRIORITIES=1
-//   - HTTP/2 WINDOW_UPDATE: 10420225 connection-level window increment
-//   - HTTP/2 Header Order: Exact Safari iOS 18 header order via HPACK
-//   - HTTP/2 Pseudo-header Order: :method, :scheme, :authority, :path (m,s,a,p)
+//   - TLS: ClientHello built at the byte level. Safari: GREASE, padding to 512
+//     bytes, X25519-only key share, zlib compress_certificate. Chrome: GREASE,
+//     per-connection extension shuffle, MLKEM768+X25519 key shares, ALPS, ECH
+//     GREASE, brotli compress_certificate.
+//   - HTTP/2 SETTINGS: Safari sends ENABLE_PUSH, MAX_CONCURRENT_STREAMS=100,
+//     INITIAL_WINDOW_SIZE=2097152, NO_RFC7540_PRIORITIES=1. Chrome sends
+//     HEADER_TABLE_SIZE=65536, ENABLE_PUSH, INITIAL_WINDOW_SIZE=6291456,
+//     MAX_HEADER_LIST_SIZE=262144.
+//   - HTTP/2 WINDOW_UPDATE: Safari 10420225, Chrome 15663105.
+//   - HTTP/2 Header Order: exact per-browser header order via HPACK.
+//   - HTTP/2 Pseudo-header Order: Safari m,s,a,p - Chrome m,a,s,p.
 type Transport struct {
 	h1Transport *http.Transport  // HTTP/1.1 fallback
 	h2Transport *http2.Transport // HTTP/2 with browser settings
@@ -45,6 +51,7 @@ type Transport struct {
 	rootCAs     *x509.CertPool
 	skipVerify  bool
 	browser     BrowserProfile
+	ctlsBrowser ctls.BrowserType // which ClientHello the TLS layer builds
 	dnscache    *dnsCache
 	connCount   atomic.Int64
 	dialer      *net.Dialer
@@ -57,9 +64,9 @@ type Transport struct {
 	hostProto sync.Map
 
 	// Proxy support - used directly in dialTLS to tunnel through proxies
-	proxyMu       sync.RWMutex
-	proxyFunc     func(*http.Request) (*url.URL, error) // nil = no proxy
-	proxyRotator  *ProxyRotator                         // nil unless SetProxyRotator was used
+	proxyMu      sync.RWMutex
+	proxyFunc    func(*http.Request) (*url.URL, error) // nil = no proxy
+	proxyRotator *ProxyRotator                         // nil unless SetProxyRotator was used
 }
 
 // errAlpnHTTP1 is the sentinel dialTLSForH2 returns when the server picked
@@ -134,9 +141,17 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		browser:    browser,
 	}
 
-	// Safari iOS 18 fingerprint (only supported profile).
-	t.h2Settings = SafariIOS18H2Settings()
-	t.headerOrder = safariIOS18HeaderOrder
+	// Per-browser fingerprint tables.
+	switch browser {
+	case Chrome147:
+		t.h2Settings = Chrome146H2Settings()
+		t.headerOrder = chrome146HeaderOrder
+		t.ctlsBrowser = ctls.BrowserChrome146
+	default:
+		t.h2Settings = SafariIOS18H2Settings()
+		t.headerOrder = safariIOS18HeaderOrder
+		t.ctlsBrowser = ctls.BrowserSafariIOS18
+	}
 
 	rcvBuf := cfg.SocketRcvBuf
 	if rcvBuf <= 0 {
@@ -185,9 +200,12 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	// HTTP/2 transport with Safari iOS 18 fingerprint.
+	// HTTP/2 transport with the selected browser's fingerprint.
 	if !cfg.ForceHTTP1 {
 		h2p := SafariIOS18H2Profile()
+		if browser == Chrome147 {
+			h2p = Chrome146H2Profile()
+		}
 
 		// MaxReadFrameSize controls the framer's accept cap (NOT what we advertise).
 		// We advertise the browser's MAX_FRAME_SIZE via the custom Settings slice below,
@@ -214,9 +232,9 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 				Exclusive: h2p.PriorityExclusive,
 			},
 			StrictMaxConcurrentStreams: false,
-			ReadIdleTimeout:           15 * time.Second,
-			PingTimeout:               5 * time.Second,
-			WriteByteTimeout:          cfg.WriteByteTimeout,
+			ReadIdleTimeout:            15 * time.Second,
+			PingTimeout:                5 * time.Second,
+			WriteByteTimeout:           cfg.WriteByteTimeout,
 			// Cycle the H2 conn after this many streams. Real browsers don't push
 			// 100k+ streams over a single connection; a long monotonic
 			// stream-ID sequence is a passive fingerprint signal. Configurable
@@ -361,7 +379,7 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 			continue
 		}
 
-		tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs)
+		tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, t.ctlsBrowser)
 		if err != nil {
 			rawConn.Close()
 			// WrapConn already prefixes "tls handshake:"; don't double-wrap.

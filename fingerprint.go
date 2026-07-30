@@ -4,15 +4,15 @@ import (
 	http2 "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/http2"
 )
 
-// H2Settings defines HTTP/2 connection settings for Safari iOS 18 fingerprinting.
+// H2Settings defines HTTP/2 connection settings for browser fingerprinting.
 type H2Settings struct {
 	HeaderTableSize      uint32
 	EnablePush           uint32
-	MaxConcurrentStreams uint32 // 0 = not sent (Safari sends 100)
+	MaxConcurrentStreams uint32 // 0 = not sent (Safari sends 100, Chrome doesn't)
 	InitialWindowSize    uint32
-	MaxFrameSize         uint32 // 0 = not sent (Safari does not send)
-	MaxHeaderListSize    uint32 // 0 = not sent (Safari does not send)
-	NoRFC7540Priorities  uint32 // 0 = not sent (Safari sends 1)
+	MaxFrameSize         uint32 // 0 = not sent (neither Safari nor Chrome send it)
+	MaxHeaderListSize    uint32 // 0 = not sent (Chrome sends 262144, Safari doesn't)
+	NoRFC7540Priorities  uint32 // 0 = not sent (Safari sends 1, Chrome doesn't)
 	ConnectionWindowSize uint32
 }
 
@@ -54,8 +54,38 @@ func SafariIOS18H2Profile() H2Profile {
 	}
 }
 
+// ========== Chrome 146/147 ==========
+//
+// Chrome 146 HTTP/2 fingerprint.
+//
+// Akamai HTTP/2 fingerprint: 1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
+// Akamai hash: 52d84b11737d980aef856699f885ca86
+
+func Chrome146H2Settings() H2Settings {
+	return H2Settings{
+		HeaderTableSize:      65536,
+		EnablePush:           0,
+		InitialWindowSize:    6291456,
+		MaxHeaderListSize:    262144,
+		ConnectionWindowSize: 15663105,
+	}
+}
+
+func Chrome146PseudoHeaderOrder() []string {
+	return []string{":method", ":authority", ":scheme", ":path"}
+}
+
+func Chrome146H2Profile() H2Profile {
+	return H2Profile{
+		Settings:          Chrome146H2Settings(),
+		PseudoHeaders:     Chrome146PseudoHeaderOrder(),
+		PriorityWeight:    255, // weight 256 is encoded as 255
+		PriorityExclusive: true,
+	}
+}
+
 // buildH2Settings converts H2Settings into the ordered []http2.Setting slice.
-// The order matches what Safari iOS 18 sends (critical for Akamai fingerprinting).
+// The order matches what each browser sends (critical for Akamai fingerprinting).
 func buildH2Settings(s H2Settings) []http2.Setting {
 	var settings []http2.Setting
 

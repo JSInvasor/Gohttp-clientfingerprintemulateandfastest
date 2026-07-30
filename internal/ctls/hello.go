@@ -55,6 +55,34 @@ func generateKeyMaterial() (*keyMaterial, error) {
 	}, nil
 }
 
+// greaseSet holds the GREASE values used at the six positions Safari and Chrome
+// sprinkle them into a single ClientHello. A fresh set is drawn per connection.
+type greaseSet struct {
+	cipher   uint16 // GREASE in cipher suite list
+	extFirst uint16 // GREASE as first extension
+	extLast  uint16 // GREASE as second-to-last extension
+	keyShare uint16 // GREASE in key_share
+	group    uint16 // GREASE in supported_groups
+	version  uint16 // GREASE in supported_versions
+}
+
+func randomGrease() uint16 {
+	var b [1]byte
+	rand.Read(b[:])
+	return greaseValues[int(b[0])%len(greaseValues)]
+}
+
+func newGreaseSet() greaseSet {
+	return greaseSet{
+		cipher:   randomGrease(),
+		extFirst: randomGrease(),
+		extLast:  randomGrease(),
+		keyShare: randomGrease(),
+		group:    randomGrease(),
+		version:  randomGrease(),
+	}
+}
+
 func buildSNI(serverName string) []byte {
 	nameBytes := []byte(serverName)
 	data := make([]byte, 2+1+2+len(nameBytes))
@@ -87,6 +115,55 @@ func buildStatusRequest() []byte {
 		0x00, 0x00, // responder_id_list length: 0
 		0x00, 0x00, // request_extensions length: 0
 	}
+}
+
+// buildECHGrease builds a random ECH GREASE extension. Chrome always sends
+// encrypted_client_hello; omitting it is a strong "not really Chrome" signal,
+// and because we have no real ECHConfig for the target we send the GREASE form
+// that a Chrome client emits when the server publishes no HTTPS RR.
+func buildECHGrease() ([]byte, error) {
+	// ECH ClientHello outer structure (GREASE form):
+	// client_hello_type (1) = outer(0)
+	// cipher_suite: kdf_id (2) = HKDF-SHA256, aead_id (2) = AES-128-GCM
+	// config_id (1) = random
+	// enc_len (2) + enc (random X25519 HPKE public key, 32 bytes)
+	// payload_len (2) + payload (random)
+	var configID [1]byte
+	if _, err := rand.Read(configID[:]); err != nil {
+		return nil, err
+	}
+
+	var enc [32]byte
+	if _, err := rand.Read(enc[:]); err != nil {
+		return nil, err
+	}
+
+	// Chrome alternates between the two payload lengths.
+	payloadLen := 128
+	var randByte [1]byte
+	if _, err := rand.Read(randByte[:]); err != nil {
+		return nil, err
+	}
+	if randByte[0]&1 == 1 {
+		payloadLen = 223
+	}
+
+	payload := make([]byte, payloadLen)
+	if _, err := rand.Read(payload); err != nil {
+		return nil, err
+	}
+
+	var data []byte
+	data = append(data, 0x00)         // client_hello_type = outer
+	data = appendUint16(data, 0x0001) // kdf_id = HKDF-SHA256
+	data = appendUint16(data, 0x0001) // aead_id = AES-128-GCM
+	data = append(data, configID[0])
+	data = appendUint16(data, uint16(len(enc)))
+	data = append(data, enc[:]...)
+	data = appendUint16(data, uint16(payloadLen))
+	data = append(data, payload...)
+
+	return data, nil
 }
 
 // appendExt appends an extension (type + length + data) to buf.
