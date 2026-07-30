@@ -72,11 +72,37 @@ func randomGrease() uint16 {
 	return greaseValues[int(b[0])%len(greaseValues)]
 }
 
+// randomGreaseExcept returns a GREASE value that is not excl.
+func randomGreaseExcept(excl uint16) uint16 {
+	for {
+		if v := randomGrease(); v != excl {
+			return v
+		}
+	}
+}
+
 func newGreaseSet() greaseSet {
+	// extFirst and extLast must differ. They become the types of two real
+	// extensions in the same ClientHello, and RFC 8446 §4.2 forbids sending
+	// two extensions of the same type — a strict server answers a duplicate
+	// with a decode_error alert rather than a ServerHello.
+	//
+	// Drawing both independently collided 1 in 16 times, so roughly 6% of all
+	// connections emitted a malformed ClientHello. Go's crypto/tls server
+	// rejects those outright, which is what made TestALPNFallbackToHTTP1 fail
+	// intermittently; lenient servers accept them but no real browser ever
+	// sends one, so it also stands out as a non-browser signal. Both captures
+	// on record show two distinct values (Safari 0x6a6a/0x5a5a, Chrome
+	// 0xfafa/0xeaea).
+	//
+	// The other positions may legitimately coincide with each other — they
+	// live in separate namespaces (a cipher, a named group, a version), so a
+	// repeat there is not a protocol violation.
+	extFirst := randomGrease()
 	return greaseSet{
 		cipher:   randomGrease(),
-		extFirst: randomGrease(),
-		extLast:  randomGrease(),
+		extFirst: extFirst,
+		extLast:  randomGreaseExcept(extFirst),
 		keyShare: randomGrease(),
 		group:    randomGrease(),
 		version:  randomGrease(),
