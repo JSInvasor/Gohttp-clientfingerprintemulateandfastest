@@ -311,20 +311,55 @@ func parseProxyString(s string) (*url.URL, error) {
 		return u, nil
 	}
 
+	// A bracketed IPv6 literal has colons of its own, so peel the address off
+	// before the shorthand splits on them. Without this, [2001:db8::1]:1080 is
+	// torn into a host that cannot be dialled.
+	if strings.HasPrefix(s, "[") {
+		end := strings.Index(s, "]")
+		if end < 0 {
+			return nil, fmt.Errorf("missing ']' in IPv6 proxy %q", s)
+		}
+		addr := s[:end+1]
+		rest := strings.TrimPrefix(s[end+1:], ":")
+		if rest == "" || rest == s[end+1:] {
+			return nil, fmt.Errorf("expected [addr]:port in %q", s)
+		}
+		// port[:user:pass] — the limit keeps a ':' inside the password.
+		parts := strings.SplitN(rest, ":", 3)
+		switch len(parts) {
+		case 1:
+			return shorthandProxyURL(addr+":"+parts[0], "", ""), nil
+		case 3:
+			return shorthandProxyURL(addr+":"+parts[0], parts[1], parts[2]), nil
+		default:
+			return nil, fmt.Errorf("expected [addr]:port or [addr]:port:user:pass, got %q", s)
+		}
+	}
+
 	// Shorthand: split only on the first three colons so passwords containing
 	// ':' don't get mangled. Real format is host:port[:user:pass].
 	parts := strings.SplitN(s, ":", 4)
 	switch len(parts) {
 	case 2:
-		return url.Parse("http://" + s)
+		return shorthandProxyURL(s, "", ""), nil
 	case 4:
-		host := parts[0] + ":" + parts[1]
-		user := url.QueryEscape(parts[2])
-		pass := url.QueryEscape(parts[3])
-		return url.Parse(fmt.Sprintf("http://%s:%s@%s", user, pass, host))
+		return shorthandProxyURL(parts[0]+":"+parts[1], parts[2], parts[3]), nil
 	default:
 		return nil, fmt.Errorf("expected ip:port or ip:port:user:pass, got %q", s)
 	}
+}
+
+// shorthandProxyURL builds the URL for a shorthand proxy entry.
+//
+// Credentials go through url.UserPassword rather than being escaped into a
+// formatted string: it is the encoding url.Parse expects to read back, so a
+// password containing ':', '@', '/' or a space survives the round trip.
+func shorthandProxyURL(host, user, pass string) *url.URL {
+	u := &url.URL{Scheme: "http", Host: host}
+	if user != "" || pass != "" {
+		u.User = url.UserPassword(user, pass)
+	}
+	return u
 }
 
 // SetProxyRotator configures the client to use rotating proxies with health

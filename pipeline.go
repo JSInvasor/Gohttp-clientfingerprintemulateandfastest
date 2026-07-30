@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,10 +20,13 @@ type PipelineResult struct {
 
 // PipelineStats holds real-time statistics for a pipeline.
 type PipelineStats struct {
-	TotalSent   atomic.Int64
-	TotalOK     atomic.Int64
-	TotalErr    atomic.Int64
-	TotalBytes  atomic.Int64
+	TotalSent atomic.Int64
+	TotalOK   atomic.Int64
+	TotalErr  atomic.Int64
+	// TotalBytes counts response body bytes read by the drain pool. Bodies the
+	// caller consumes itself — Send/Spray results, or an OnResult callback that
+	// reads before the drain sees EOF — are not counted here.
+	TotalBytes atomic.Int64
 }
 
 // Pipeline provides maximum throughput request sending with a fixed worker pool.
@@ -37,9 +41,16 @@ type Pipeline struct {
 	// stopCh is closed by Close() to signal senders to abandon their writes
 	// to jobCh. Senders select on stopCh alongside jobCh so a concurrent
 	// Close() can never cause a "send on closed channel" panic.
-	stopCh  chan struct{}
-	Stats   PipelineStats
-	closed  atomic.Bool
+	stopCh chan struct{}
+	Stats  PipelineStats
+	closed atomic.Bool
+
+	// sendInflight counts callers inside Send between its closed check and its
+	// write to jobCh. Close waits for it to reach zero before draining the
+	// queue, so a job queued by a racing Send is still answered rather than
+	// dropped. Only Send participates: FireAndForget hands back no channel, so
+	// nobody is left waiting on its jobs, and the hot path stays untouched.
+	sendInflight atomic.Int64
 
 	// OnResult is called for every completed request (both success and error).
 	// When set, FireAndForget will invoke this callback instead of discarding results.
@@ -200,8 +211,9 @@ func (p *Pipeline) drainWorker() {
 			continue
 		}
 		bufPtr := drainBufPool.Get().(*[]byte)
-		io.CopyBuffer(io.Discard, resp.Body, *bufPtr) //nolint:errcheck
+		n, _ := io.CopyBuffer(io.Discard, resp.Body, *bufPtr)
 		drainBufPool.Put(bufPtr)
+		p.Stats.TotalBytes.Add(n)
 		resp.Body.Close()
 	}
 }
@@ -312,6 +324,16 @@ func (p *Pipeline) worker() {
 func (p *Pipeline) Send(ctx context.Context, method, url string, body []byte, headers map[string]string) <-chan *PipelineResult {
 	ch := make(chan *PipelineResult, 1)
 
+	if p.closed.Load() {
+		ch <- &PipelineResult{Err: ErrPipelineClosed}
+		return ch
+	}
+
+	p.sendInflight.Add(1)
+	defer p.sendInflight.Add(-1)
+
+	// Re-check under the in-flight count: a Close that started before the
+	// increment could otherwise drain the queue after this job lands in it.
 	if p.closed.Load() {
 		ch <- &PipelineResult{Err: ErrPipelineClosed}
 		return ch
@@ -500,10 +522,53 @@ type SprayResult struct {
 func (p *Pipeline) Close() {
 	if p.closed.CompareAndSwap(false, true) {
 		close(p.stopCh)
+
+		// Let any Send already past its closed check finish enqueueing. It
+		// cannot block: stopCh is closed, so its select always has a ready
+		// case.
+		for p.sendInflight.Load() > 0 {
+			runtime.Gosched()
+		}
+
 		p.wg.Wait()
+		p.drainQueue()
+
 		// Close drain pool after all workers are done
 		close(p.drainCh)
 		p.drainWg.Wait()
+	}
+}
+
+// drainQueue answers every job still sitting in jobCh when the workers stopped.
+//
+// Workers exit on stopCh without emptying jobCh, so without this a caller
+// blocked on the channel Send returned waits forever for a job that will never
+// run — and Spray, which blocks on every channel it created, hangs entirely on
+// a single dropped job. Callers must always learn the outcome, even when the
+// outcome is that the pipeline shut down first.
+//
+// Safe to read jobCh here: workers have exited and Close has waited for
+// in-flight senders, so nothing else touches the queue.
+func (p *Pipeline) drainQueue() {
+	for {
+		select {
+		case job := <-p.jobCh:
+			if job == nil {
+				continue
+			}
+			if job.result != nil {
+				job.result <- &PipelineResult{Err: ErrPipelineClosed}
+			}
+			job.ctx = nil
+			job.method = ""
+			job.url = ""
+			job.body = nil
+			job.headers = nil
+			job.result = nil
+			p.jobPool.Put(job)
+		default:
+			return
+		}
 	}
 }
 
