@@ -95,16 +95,20 @@ func newGreaseSet() greaseSet {
 	// on record show two distinct values (Safari 0x6a6a/0x5a5a, Chrome
 	// 0xfafa/0xeaea).
 	//
-	// The other positions may legitimately coincide with each other — they
-	// live in separate namespaces (a cipher, a named group, a version), so a
-	// repeat there is not a protocol violation.
+	// keyShare and group must be the same value. RFC 8446 §4.2.8 requires
+	// every group in key_share to also appear in supported_groups. Using
+	// independent draws means the GREASE key_share entry referenced a group
+	// absent from supported_groups on ~94% of connections (15/16 chance the
+	// two independent draws differ), which strict servers treat as a handshake
+	// error. Real browsers always put the same GREASE value in both positions.
 	extFirst := randomGrease()
+	keyShareGrease := randomGrease()
 	return greaseSet{
 		cipher:   randomGrease(),
 		extFirst: extFirst,
 		extLast:  randomGreaseExcept(extFirst),
-		keyShare: randomGrease(),
-		group:    randomGrease(),
+		keyShare: keyShareGrease,
+		group:    keyShareGrease,
 		version:  randomGrease(),
 	}
 }

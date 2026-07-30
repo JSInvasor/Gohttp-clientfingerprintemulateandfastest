@@ -58,6 +58,21 @@ func TestNoDuplicateExtensionTypes(t *testing.T) {
 	}
 }
 
+// TestGreaseKeyShareMatchesGroup asserts that the GREASE group placed in
+// key_share always equals the one placed in supported_groups. RFC 8446 §4.2.8
+// requires every group in key_share to appear in supported_groups; using
+// independent draws violated this on ~94% of connections.
+func TestGreaseKeyShareMatchesGroup(t *testing.T) {
+	for i := 0; i < 20000; i++ {
+		gs := newGreaseSet()
+		if gs.keyShare != gs.group {
+			t.Fatalf("draw %d: keyShare=0x%04x != group=0x%04x; "+
+				"RFC 8446 §4.2.8 requires key_share groups to be in supported_groups",
+				i, gs.keyShare, gs.group)
+		}
+	}
+}
+
 // TestGreaseValuesAreValid keeps every drawn value inside the RFC 8701 set.
 // A non-GREASE value in any of these slots would land in a real code point's
 // namespace and could be interpreted rather than ignored.

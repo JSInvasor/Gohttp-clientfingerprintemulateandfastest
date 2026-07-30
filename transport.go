@@ -257,7 +257,15 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return t.h1Transport.RoundTrip(req)
 	}
 
-	if proto, ok := t.hostProto.Load(req.URL.Host); ok && proto.(string) == "http/1.1" {
+	// Normalize the lookup key to bare hostname: dialTLSForH2 strips the port
+	// before storing, but req.URL.Host includes the port for non-standard ports
+	// (e.g. "127.0.0.1:42035"). Without this strip the cache never hits for
+	// non-standard-port hosts and every request re-dials the h2 TLS handshake.
+	lookupHost := req.URL.Host
+	if h, _, err := net.SplitHostPort(lookupHost); err == nil {
+		lookupHost = h
+	}
+	if proto, ok := t.hostProto.Load(lookupHost); ok && proto.(string) == "http/1.1" {
 		return t.h1Transport.RoundTrip(req)
 	}
 
