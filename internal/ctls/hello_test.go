@@ -62,6 +62,9 @@ func TestNoDuplicateExtensionTypes(t *testing.T) {
 // key_share always equals the one placed in supported_groups. RFC 8446 §4.2.8
 // requires every group in key_share to appear in supported_groups; using
 // independent draws violated this on ~94% of connections.
+//
+// A real iPhone 13 / Safari 26.5.2 capture shows the same: GREASE 0x4a4a leads
+// supported_groups and 0x4a4a is also the key_share GREASE entry.
 func TestGreaseKeyShareMatchesGroup(t *testing.T) {
 	for i := 0; i < 20000; i++ {
 		gs := newGreaseSet()

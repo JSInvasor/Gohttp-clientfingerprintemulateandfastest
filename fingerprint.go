@@ -47,9 +47,18 @@ func SafariIOS18PseudoHeaderOrder() []string {
 
 func SafariIOS18H2Profile() H2Profile {
 	return H2Profile{
-		Settings:          SafariIOS18H2Settings(),
-		PseudoHeaders:     SafariIOS18PseudoHeaderOrder(),
-		PriorityWeight:    255, // weight 256 is encoded as 255
+		Settings:      SafariIOS18H2Settings(),
+		PseudoHeaders: SafariIOS18PseudoHeaderOrder(),
+		// No HEADERS priority. Safari advertises NO_RFC7540_PRIORITIES=1 and
+		// then uses the RFC 9218 "priority: u=0, i" header field instead, so
+		// emitting RFC 7540 stream dependency and weight would contradict the
+		// setting in the same connection — a combination no real client sends.
+		//
+		// Verified against an iPhone 13 / Safari 26.5.2 capture: its HEADERS
+		// frame carries EndStream and EndHeaders only, with no Priority flag.
+		// A non-zero weight here sets that flag (PriorityParam.IsZero drives it),
+		// which is what an earlier revision did.
+		PriorityWeight:    0,
 		PriorityExclusive: false,
 	}
 }

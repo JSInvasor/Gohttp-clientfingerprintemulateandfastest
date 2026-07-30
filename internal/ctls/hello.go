@@ -100,7 +100,10 @@ func newGreaseSet() greaseSet {
 	// independent draws means the GREASE key_share entry referenced a group
 	// absent from supported_groups on ~94% of connections (15/16 chance the
 	// two independent draws differ), which strict servers treat as a handshake
-	// error. Real browsers always put the same GREASE value in both positions.
+	// error.
+	//
+	// Confirmed against an iPhone 13 / Safari 26.5.2 capture: supported_groups
+	// leads with GREASE 0x4a4a and key_share's GREASE entry is 0x4a4a too.
 	extFirst := randomGrease()
 	keyShareGrease := randomGrease()
 	return greaseSet{
