@@ -7,12 +7,23 @@ import (
 )
 
 // Chrome 146 ClientHello builder.
-// Verified against real Chrome 146 via tls.peet.ws.
 //
-// JA3: 771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,
-//      45-11-51-27-23-43-18-65281-16-0-10-17613-13-65037-5-35-41,4588-29-23-24,0
-// JA3 Hash: 9271bc66017f8920fe4549ad9e47e63b
-// JA4: t13d1517h2_8daaf6152771_b6f405a00624
+// JA4: t13d1516h2_8daaf6152771_d8a2da3f94cd
+//
+// There is deliberately no reference JA3 here. Chrome permutes its extension
+// order on every connection (see buildChromeExtensions), and JA3 hashes the
+// extension list in wire order, so a Chrome JA3 is a different value per
+// connection by design. JA4 sorts before hashing and is therefore stable.
+//
+// An earlier revision documented t13d1517h2_8daaf6152771_b6f405a00624. That
+// value was read off a capture of a RESUMED session, which carries
+// pre_shared_key (0x0029) as a 17th counted extension. This builder never
+// sends PSK (see the trailing-GREASE note in buildChromeExtensions), so it
+// emits 16 counted extensions and can never produce that hash. Re-deriving
+// the JA4_c input with 0x0029 removed gives d8a2da3f94cd.
+//
+// The cipher-list component (8daaf6152771) is unaffected and was verified
+// against real Chrome.
 //
 // Key differences from Safari iOS 18:
 //   - 15 cipher suites, no 3DES and no ECDSA-CBC legacy suites

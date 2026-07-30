@@ -216,15 +216,35 @@ pipeline := client.NewPipeline(5000)
 ## Safari iOS 18 Fingerprint Details
 
 ### TLS (JA3/JA4)
+
+Verified against a real iPhone 13 on iOS 26.5.2 via tls.peet.ws, and pinned by
+`internal/ctls/safari_hello_test.go`:
+
+- JA3 hash: `ecdf4f49dd59effc439639da29186671`
+- JA4: `t13d2013h2_a09f3c656075_7f0f34a4126d`
+- peetprint hash: `62b834de729e78a9f0ebd1dd099314a7`
+
+Structure:
+
 - TLS 1.3 with TLS 1.2 fallback (TLS 1.0/1.1 removed — Apple dropped them in iOS 13)
-- 20 cipher suites + GREASE prefix (includes 3DES legacy ciphers)
+- 20 cipher suites + GREASE prefix (includes 3DES legacy ciphers). The TLS 1.3
+  suites lead with AES-256-GCM (`0x1302`), not AES-128-GCM — JA3 is order-sensitive
 - GREASE values at 6 positions: ciphers, first/last extension, key_share, supported_groups, supported_versions
-- 16 extensions: SNI, extended_master_secret, renegotiation_info, supported_groups, ec_point_formats, ALPN(h2,http/1.1), status_request, signature_algorithms, SCT, key_share, psk_key_exchange_modes, supported_versions, compress_certificate(zlib), padding
-- Supported groups: GREASE + X25519 + P-256 + P-384 + P-521 (no post-quantum, no FFDHE)
-- Only X25519 key share (no MLKEM, no P-256 key share)
-- 9 unique signature algorithms (incl. rsa_pkcs1_sha1 for legacy compat)
-- ClientHello padded to ~512 bytes
-- No ALPS, no ECH, no delegated_credentials, no record_size_limit
+- 15 extensions on the wire (13 counted by JA4): SNI, extended_master_secret, renegotiation_info, supported_groups, ec_point_formats, ALPN(h2,http/1.1), status_request, signature_algorithms, SCT, key_share, psk_key_exchange_modes, supported_versions, compress_certificate(zlib), + 2 GREASE
+- Supported groups: GREASE + X25519MLKEM768 + X25519 + P-256 + P-384 + P-521
+- key_share: GREASE + X25519MLKEM768 + X25519 (Apple ships post-quantum)
+- 10 signature algorithms — `rsa_pss_rsae_sha384` (`0x0805`) genuinely appears
+  twice on the wire; do not deduplicate it
+- No padding extension (the 1216-byte MLKEM key share puts the ClientHello well
+  past the range BoringSSL pads)
+- No ALPS, no ECH, no session_ticket, no delegated_credentials, no record_size_limit
+
+Extension order is fixed — Apple does not permute it, unlike Chrome.
+
+> Every browser on iOS emits this same TLS fingerprint. Chrome (`CriOS`) and the
+> Google app (`GSA`) were captured byte-identical to Safari, because iOS forces
+> all of them onto Apple's networking stack; only the User-Agent differs. Use the
+> `Chrome147` profile only for desktop Chrome.
 
 ### HTTP/2 (Akamai)
 - ENABLE_PUSH: 0
@@ -237,11 +257,13 @@ pipeline := client.NewPipeline(5000)
 - Akamai hash: `c52879e43202aeb92740be6e8c86ea96`
 
 ### Headers
-- Exact Safari iOS 18 header order
-- `User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7.5 Mobile/15E148 Safari/604.1`
+- Exact Safari header order
+- `User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5.2 Mobile/15E148 Safari/604.1`
+  — the `iPhone OS 18_7` token is frozen by Apple and is correct even on iOS 26;
+  only `Version/` tracks the real release
 - `sec-fetch-dest` before `user-agent` (unique to Safari)
 - `accept-encoding` LAST (Firefox/Chrome place it earlier)
-- `accept-encoding: gzip, deflate, br` (no zstd — Safari only supports these three)
+- `accept-encoding: gzip, deflate, br, zstd`
 - No `Upgrade-Insecure-Requests`, no `Sec-Fetch-User`, no `Sec-Ch-Ua`, no `TE`
 
 ## License

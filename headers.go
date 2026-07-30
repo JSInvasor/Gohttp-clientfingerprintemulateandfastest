@@ -9,11 +9,19 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
-// SafariIOS18UserAgent is the User-Agent string sent by Safari on iPhone with iOS 18.7.5.
-const SafariIOS18UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7.5 Mobile/15E148 Safari/604.1"
+// SafariIOS18UserAgent is the User-Agent string sent by Safari on iPhone.
+//
+// The "iPhone OS 18_7" token is NOT stale — Apple freezes the OS token in
+// Safari's UA while the Version/ token tracks the real release. A real iPhone 13
+// on iOS 26.5.2 reports exactly this: OS 18_7 paired with Version/26.5.2.
+// Bumping the OS token to match the true OS version is a fake-Safari signal.
+//
+// (Other iOS apps do not freeze it — the Google app reports "iPhone OS 26_5_2"
+// in its own UA — but this constant is Safari's.)
+const SafariIOS18UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5.2 Mobile/15E148 Safari/604.1"
 
 // safariIOS18HeaderOrder defines the exact header order Safari iOS 18 sends.
-// Verified against a real Safari iOS 18.7.5 capture from tls.peet.ws:
+// Verified against a real iPhone 13 / Safari 26.5.2 capture from tls.peet.ws:
 //
 //	:method, :scheme, :authority, :path (pseudo-headers)
 //	sec-fetch-dest
@@ -60,7 +68,7 @@ var (
 	safariUserAgent     = []string{SafariIOS18UserAgent}
 	safariSecFetchMode  = []string{"navigate"}
 	safariPriority      = []string{"u=0, i"}
-	safariAcceptEncode  = []string{"gzip, deflate, br"}
+	safariAcceptEncode  = []string{"gzip, deflate, br, zstd"}
 )
 
 // applySafariHeaders sets exact Safari iOS 18 default headers on the request.
@@ -102,12 +110,16 @@ func applySafariHeaders(req *http.Request, accept, lang string) {
 		h["Accept-Encoding"] = safariAcceptEncode
 	}
 
-	// NOTE: Safari iOS 18 does NOT send:
+	// NOTE: Safari on iPhone does NOT send:
 	// - Upgrade-Insecure-Requests (Apple stopped sending on top-level navs)
 	// - TE: trailers (Firefox-only)
 	// - Sec-Fetch-User (Chrome/Firefox send ?1)
 	// - Sec-Ch-Ua headers (Chrome-only)
-	// - zstd in Accept-Encoding (Safari only supports gzip, deflate, br)
+	//
+	// It DOES send zstd in Accept-Encoding. An earlier revision omitted it on
+	// the belief that Safari supports only gzip/deflate/br; the iOS 26.5.2
+	// capture sends "gzip, deflate, br, zstd". response.go decodes zstd, so
+	// advertising it is safe.
 }
 
 // ========== Chrome 146/147 Headers ==========

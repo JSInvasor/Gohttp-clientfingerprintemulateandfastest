@@ -82,7 +82,7 @@ func TestSafariHeaders(t *testing.T) {
 		{"User-Agent", SafariIOS18UserAgent},
 		{"Accept", "text/html"},
 		{"Accept-Language", "en-US,en;q=0.9"},
-		{"Accept-Encoding", "gzip, deflate, br"},
+		{"Accept-Encoding", "gzip, deflate, br, zstd"},
 		{"Sec-Fetch-Dest", "document"},
 		{"Sec-Fetch-Mode", "navigate"},
 		{"Sec-Fetch-Site", "none"},
