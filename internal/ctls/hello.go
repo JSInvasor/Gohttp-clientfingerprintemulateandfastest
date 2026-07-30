@@ -102,8 +102,9 @@ func newGreaseSet() greaseSet {
 	// two independent draws differ), which strict servers treat as a handshake
 	// error.
 	//
-	// Confirmed against an iPhone 13 / Safari 26.5.2 capture: supported_groups
-	// leads with GREASE 0x4a4a and key_share's GREASE entry is 0x4a4a too.
+	// Confirmed against two real captures. iPhone 13 / Safari 26.5.2:
+	// supported_groups leads with GREASE 0x4a4a and key_share's GREASE entry is
+	// 0x4a4a. Chrome 150 / Windows: both are 0xbaba.
 	extFirst := randomGrease()
 	keyShareGrease := randomGrease()
 	return greaseSet{
@@ -176,6 +177,17 @@ func buildECHGrease() ([]byte, error) {
 	// not a coin flip. A real Chrome 150 capture against tls.peet.ws carries 144
 	// bytes, so use that rather than the arbitrary 128/223 alternation an earlier
 	// revision picked (neither of which was ever observed).
+	//
+	// The whole GREASE structure was re-checked against that capture and matches
+	// byte for byte: outer type, HKDF-SHA256, AES-128-GCM, a 32-byte enc, and a
+	// 144-byte payload.
+	//
+	// What the capture does not settle is whether 144 travels. ECH pads the inner
+	// hello in steps driven by the SNI length, and both captures on record used
+	// the same 11-character host, so a longer hostname may well land on a
+	// different multiple. Resolving that needs captures against two or three
+	// hosts of clearly different name lengths; until then a single confirmed
+	// constant beats a formula guessed from one data point.
 	const payloadLen = 144
 
 	payload := make([]byte, payloadLen)

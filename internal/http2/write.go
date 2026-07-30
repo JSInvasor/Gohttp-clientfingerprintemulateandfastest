@@ -11,8 +11,8 @@ import (
 	"net/http"
 	"net/url"
 
-	"golang.org/x/net/http/httpguts"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/http2/hpack"
+	"golang.org/x/net/http/httpguts"
 )
 
 // writeFramer is implemented by any type that is used to write frames.

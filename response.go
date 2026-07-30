@@ -16,10 +16,10 @@ import (
 type Response struct {
 	*http.Response
 
-	bodyRead     bool
-	bodyData     []byte
-	bodyErr      error
-	maxBodySize  int64 // 0 = unlimited
+	bodyRead    bool
+	bodyData    []byte
+	bodyErr     error
+	maxBodySize int64 // 0 = unlimited
 }
 
 // StatusCode returns the HTTP status code.

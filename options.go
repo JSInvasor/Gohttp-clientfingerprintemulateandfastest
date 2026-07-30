@@ -18,12 +18,12 @@ type clientConfig struct {
 	timeout          time.Duration
 	acceptLanguage   string
 	accept           string
-	userAgent        string // custom override, empty = use browser default
-	referer          string // default Referer header, empty = don't send
-	maxResponseBody  int64  // max response body size in bytes, 0 = unlimited
-	retryCount       int    // number of retries, 0 = no retry
+	userAgent        string        // custom override, empty = use browser default
+	referer          string        // default Referer header, empty = don't send
+	maxResponseBody  int64         // max response body size in bytes, 0 = unlimited
+	retryCount       int           // number of retries, 0 = no retry
 	retryBaseDelay   time.Duration // base delay for exponential backoff
-	retryStatusCodes []int  // HTTP status codes to retry on (e.g. 429, 502, 503, 504)
+	retryStatusCodes []int         // HTTP status codes to retry on (e.g. 429, 502, 503, 504)
 }
 
 func defaultClientConfig() clientConfig {

@@ -60,3 +60,39 @@ func TestSafariHeadersCarryNoPriorityFlag(t *testing.T) {
 			"device does, and its Akamai fingerprint pins 9:1")
 	}
 }
+
+// TestChromeHeadersCarryCapturedPriority pins the other direction.
+//
+// Chrome does not advertise NO_RFC7540_PRIORITIES, and a real Chrome 150 on
+// Windows does send the HEADERS priority flag: weight 256, depends_on 0,
+// exclusive. Nothing else in the suite covers these values, so without this a
+// change that zeroed them — the same edit Safari legitimately needed — would
+// pass silently and drop a field real Chrome sends on every request.
+//
+// The wire encoding is weight-minus-one (RFC 7540 §5.3.2), so the captured
+// weight of 256 is stored as 255.
+func TestChromeHeadersCarryCapturedPriority(t *testing.T) {
+	p := Chrome146H2Profile()
+
+	param := http2.PriorityParam{
+		Weight:    p.PriorityWeight,
+		Exclusive: p.PriorityExclusive,
+	}
+	if param.IsZero() {
+		t.Fatal("Chrome HEADERS would carry no Priority flag; the real device " +
+			"sends weight 256, depends_on 0, exclusive")
+	}
+	if p.PriorityWeight != 255 {
+		t.Errorf("PriorityWeight = %d, want 255 (wire encoding of weight 256)", p.PriorityWeight)
+	}
+	if !p.PriorityExclusive {
+		t.Error("PriorityExclusive = false; the captured frame sets exclusive=1")
+	}
+	if param.StreamDep != 0 {
+		t.Errorf("StreamDep = %d, want 0 (captured depends_on)", param.StreamDep)
+	}
+	if p.Settings.NoRFC7540Priorities != 0 {
+		t.Error("Chrome advertises NO_RFC7540_PRIORITIES; the real device does not, " +
+			"and doing so would contradict the priority it sends in every HEADERS frame")
+	}
+}

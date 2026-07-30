@@ -64,11 +64,11 @@ var safariIOS18HeaderOrder = []string{
 // every call (the slice is never appended to or mutated). Saves 6-7 small
 // allocations per request on the DoWithContext path.
 var (
-	safariSecFetchDest  = []string{"document"}
-	safariUserAgent     = []string{SafariIOS18UserAgent}
-	safariSecFetchMode  = []string{"navigate"}
-	safariPriority      = []string{"u=0, i"}
-	safariAcceptEncode  = []string{"gzip, deflate, br, zstd"}
+	safariSecFetchDest = []string{"document"}
+	safariUserAgent    = []string{SafariIOS18UserAgent}
+	safariSecFetchMode = []string{"navigate"}
+	safariPriority     = []string{"u=0, i"}
+	safariAcceptEncode = []string{"gzip, deflate, br, zstd"}
 )
 
 // applySafariHeaders sets exact Safari iOS 18 default headers on the request.
