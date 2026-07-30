@@ -451,6 +451,7 @@ func TestPipelineCloseRace(t *testing.T) {
 	pipeline := client.NewPipeline(32)
 	ctx := context.Background()
 
+	// Fire from many goroutines while another goroutine closes mid-burst.
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
@@ -462,6 +463,7 @@ func TestPipelineCloseRace(t *testing.T) {
 		}()
 	}
 
+	// Close while senders are still active. Must not panic.
 	time.Sleep(5 * time.Millisecond)
 	pipeline.Close()
 	wg.Wait()

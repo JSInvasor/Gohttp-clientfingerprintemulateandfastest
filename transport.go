@@ -866,10 +866,13 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 		n = 10
 	}
 
-	// Use the Safari iOS 18 User-Agent so the pre-warm HEAD doesn't show up
-	// in logs/fingerprinters as a "Mozilla/5.0" mismatch against the Safari
-	// TLS handshake we just performed.
+	// Use the browser profile's User-Agent so the pre-warm HEAD doesn't show
+	// up in logs/fingerprinters as a "Mozilla/5.0" mismatch against the
+	// Chrome/Safari TLS handshake we just performed.
 	ua := SafariIOS18UserAgent
+	if t.browser == Chrome150 {
+		ua = Chrome150UserAgent
+	}
 
 	var (
 		wg   sync.WaitGroup
