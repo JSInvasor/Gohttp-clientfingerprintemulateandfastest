@@ -76,7 +76,12 @@ func dialRogue(t *testing.T, host string, pool *x509.CertPool, leafDER []byte, s
 	}
 	raw.SetDeadline(time.Now().Add(15 * time.Second))
 
-	conn, err := handshake(raw, host, []string{"h2", "http/1.1"}, false, pool, BrowserSafari)
+	conn, err := handshake(raw, &Config{
+		ServerName: host,
+		ALPN:       []string{"h2", "http/1.1"},
+		RootCAs:    pool,
+		Browser:    BrowserSafari,
+	})
 	if err != nil {
 		raw.Close()
 		return nil, err

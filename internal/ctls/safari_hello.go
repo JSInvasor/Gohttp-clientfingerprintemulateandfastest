@@ -3,6 +3,7 @@ package ctls
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"time"
 )
 
 // Safari (iPhone) ClientHello builder.
@@ -104,10 +105,10 @@ var safariIOS18SigAlgs = []uint16{
 }
 
 // buildSafariClientHello builds the Safari iOS 18 ClientHello handshake message.
-func buildSafariClientHello(serverName string, alpn []string, km *keyMaterial) ([]byte, error) {
+func buildSafariClientHello(serverName string, alpn []string, km *keyMaterial, sess *Session) ([]byte, error) {
 	gs := newGreaseSet()
 
-	exts, err := buildSafariExtensions(serverName, alpn, km, gs)
+	exts, err := buildSafariExtensions(serverName, alpn, km, gs, sess)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +182,7 @@ func buildSafariClientHello(serverName string, alpn []string, km *keyMaterial) (
 // 15. GREASE
 //
 // Unlike Chrome this order is fixed — Apple does not permute extensions.
-func buildSafariExtensions(serverName string, alpn []string, km *keyMaterial, gs greaseSet) ([]byte, error) {
+func buildSafariExtensions(serverName string, alpn []string, km *keyMaterial, gs greaseSet, sess *Session) ([]byte, error) {
 	var out []byte
 
 	// 1. GREASE extension (empty)
@@ -232,6 +233,12 @@ func buildSafariExtensions(serverName string, alpn []string, km *keyMaterial, gs
 
 	// 15. GREASE extension (empty) — final extension, no padding follows.
 	out = appendExt(out, gs.extLast, nil)
+
+	// 16. pre_shared_key (41), resumption only. RFC 8446 §4.2.11 requires this
+	// to be the last extension in the ClientHello, after the trailing GREASE.
+	if sess != nil {
+		out = appendExt(out, extPreSharedKey, buildPSKExtension(sess, time.Now()))
+	}
 
 	return out, nil
 }

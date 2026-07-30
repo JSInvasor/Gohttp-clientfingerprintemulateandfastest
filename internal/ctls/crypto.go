@@ -111,31 +111,60 @@ func deriveSecret(h func() hash.Hash, secret []byte, label string, transcriptHas
 
 // tlsKeySchedule holds the TLS 1.3 key schedule state.
 type tlsKeySchedule struct {
-	suite         uint16
-	h             func() hash.Hash
-	earlySecret   []byte
+	suite           uint16
+	h               func() hash.Hash
+	earlySecret     []byte
 	handshakeSecret []byte
-	masterSecret  []byte
+	masterSecret    []byte
 
-	clientHSTraffic []byte
-	serverHSTraffic []byte
+	clientHSTraffic  []byte
+	serverHSTraffic  []byte
 	clientAppTraffic []byte
 	serverAppTraffic []byte
 }
 
 // newKeySchedule initializes the TLS 1.3 key schedule with no PSK.
 func newKeySchedule(suite uint16) *tlsKeySchedule {
+	return newKeyScheduleWithPSK(suite, nil)
+}
+
+// newKeyScheduleWithPSK initializes the key schedule from a resumption PSK.
+// A nil psk means a full handshake, where the extract uses an all-zero key.
+func newKeyScheduleWithPSK(suite uint16, psk []byte) *tlsKeySchedule {
 	h := hashForCipher(suite)
 	hl := h().Size()
 
-	// Early secret = HKDF-Extract(0..0, 0..0)
-	earlySecret := hkdfExtract(h, make([]byte, hl), make([]byte, hl))
+	if psk == nil {
+		psk = make([]byte, hl)
+	}
+
+	// Early secret = HKDF-Extract(salt=0..0, ikm=PSK)
+	earlySecret := hkdfExtract(h, make([]byte, hl), psk)
 
 	return &tlsKeySchedule{
 		suite:       suite,
 		h:           h,
 		earlySecret: earlySecret,
 	}
+}
+
+// binderKey derives the key that authenticates a PSK binder (RFC 8446 §7.1).
+// Its transcript context is the empty string, not the ClientHello.
+func (ks *tlsKeySchedule) binderKey() []byte {
+	empty := ks.h()
+	return deriveSecret(ks.h, ks.earlySecret, "res binder", empty.Sum(nil))
+}
+
+// resumptionMasterSecret derives the secret that future tickets hang off.
+// transcriptHash must cover ClientHello through the *client's* Finished.
+func (ks *tlsKeySchedule) resumptionMasterSecret(transcriptHash []byte) []byte {
+	return deriveSecret(ks.h, ks.masterSecret, "res master", transcriptHash)
+}
+
+// deriveResumptionPSK computes the PSK a NewSessionTicket stands for:
+// HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, L).
+func deriveResumptionPSK(h func() hash.Hash, resMaster, nonce []byte) []byte {
+	return hkdfExpandLabel(h, resMaster, "resumption", nonce, h().Size())
 }
 
 // deriveHandshakeSecrets derives handshake traffic secrets from DHE result.

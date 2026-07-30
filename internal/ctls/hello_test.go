@@ -30,7 +30,7 @@ func TestNoDuplicateExtensionTypes(t *testing.T) {
 		t.Fatalf("generateKeyMaterial: %v", err)
 	}
 
-	builders := map[string]func(string, []string, *keyMaterial) ([]byte, error){
+	builders := map[string]func(string, []string, *keyMaterial, *Session) ([]byte, error){
 		"safari": buildSafariClientHello,
 		"chrome": buildChromeClientHello,
 	}
@@ -38,7 +38,7 @@ func TestNoDuplicateExtensionTypes(t *testing.T) {
 	for name, build := range builders {
 		t.Run(name, func(t *testing.T) {
 			for i := 0; i < 3000; i++ {
-				raw, err := build("example.com", []string{"h2", "http/1.1"}, km)
+				raw, err := build("example.com", []string{"h2", "http/1.1"}, km, nil)
 				if err != nil {
 					t.Fatalf("build %d: %v", i, err)
 				}

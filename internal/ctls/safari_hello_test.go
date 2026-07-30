@@ -30,7 +30,7 @@ func TestSafariClientHelloMatchesRealDevice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generateKeyMaterial: %v", err)
 	}
-	raw, err := buildSafariClientHello("tls.peet.ws", []string{"h2", "http/1.1"}, km)
+	raw, err := buildSafariClientHello("tls.peet.ws", []string{"h2", "http/1.1"}, km, nil)
 	if err != nil {
 		t.Fatalf("buildSafariClientHello: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestSafariClientHelloStableAcrossConnections(t *testing.T) {
 		if err != nil {
 			t.Fatalf("generateKeyMaterial: %v", err)
 		}
-		raw, err := buildSafariClientHello("tls.peet.ws", []string{"h2", "http/1.1"}, km)
+		raw, err := buildSafariClientHello("tls.peet.ws", []string{"h2", "http/1.1"}, km, nil)
 		if err != nil {
 			t.Fatalf("buildSafariClientHello: %v", err)
 		}
@@ -105,7 +105,7 @@ func TestSafariSendsNoPadding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generateKeyMaterial: %v", err)
 	}
-	raw, err := buildSafariClientHello("tls.peet.ws", []string{"h2", "http/1.1"}, km)
+	raw, err := buildSafariClientHello("tls.peet.ws", []string{"h2", "http/1.1"}, km, nil)
 	if err != nil {
 		t.Fatalf("buildSafariClientHello: %v", err)
 	}

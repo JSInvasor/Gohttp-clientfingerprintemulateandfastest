@@ -56,6 +56,12 @@ type Transport struct {
 	connCount   atomic.Int64
 	dialer      *net.Dialer
 
+	// sessions holds TLS 1.3 resumption tickets. It is per-Transport, never
+	// global: a ticket presented on two connections proves to the server that
+	// both are the same client, so sharing one across Clients would silently
+	// link them.
+	sessions *ctls.SessionCache
+
 	// hostProto records the ALPN protocol negotiated per host so subsequent
 	// requests skip the h2 attempt for hosts that only speak http/1.1. Without
 	// this cache every request to an h1-only host would dial twice (once for
@@ -139,6 +145,7 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		skipVerify: cfg.InsecureSkipVerify,
 		dnscache:   newDNSCache(cfg.DNSCacheTTL),
 		browser:    browser,
+		sessions:   ctls.NewSessionCache(),
 	}
 
 	// Per-browser fingerprint tables.
@@ -378,7 +385,7 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 			}
 		}
 
-		rawConn, err := t.dialRaw(ctx, network, host, port)
+		rawConn, exitScope, err := t.dialRaw(ctx, network, host, port)
 		if err != nil {
 			lastErr = err
 			if !isTransientDialErr(err) {
@@ -387,7 +394,15 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 			continue
 		}
 
-		tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, t.ctlsBrowser)
+		tlsConn, err := ctls.WrapConnConfig(ctx, rawConn, &ctls.Config{
+			ServerName: host,
+			ALPN:       alpn,
+			SkipVerify: t.skipVerify,
+			RootCAs:    t.rootCAs,
+			Browser:    t.ctlsBrowser,
+			Sessions:   t.sessions,
+			SessionKey: host + "|" + exitScope,
+		})
 		if err != nil {
 			rawConn.Close()
 			// WrapConn already prefixes "tls handshake:"; don't double-wrap.
@@ -446,7 +461,12 @@ func secureRandIntn(n int) int {
 // proxyDialAttempts times against different rotator entries before giving up.
 // This keeps a few dead members of a large proxy list from translating into
 // per-request failures.
-func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (net.Conn, error) {
+// The returned scope identifies the network exit actually used ("" for a direct
+// connection). Resumption tickets are keyed by it: replaying a ticket proves to
+// the server that two connections are the same client, so a ticket obtained
+// through one proxy must never be offered through another — that would hand the
+// server exactly the link that rotating proxies exists to break.
+func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (net.Conn, string, error) {
 	t.proxyMu.RLock()
 	proxyFunc := t.proxyFunc
 	rotator := t.proxyRotator
@@ -470,12 +490,12 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 			conn, err := t.dialViaProxy(ctx, network, targetAddr, proxyURL)
 			if err == nil {
 				rotator.MarkSuccess(entry)
-				return conn, nil
+				return conn, proxyURL.Host, nil
 			}
 			rotator.MarkFailure(entry)
 			lastErr = err
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return nil, "", ctx.Err()
 			}
 		}
 		// A configured rotator MUST NOT silently fall through to a direct
@@ -483,17 +503,21 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 		// Surface the failure (or an explicit "no proxies" error if the rotator
 		// is empty) instead of leaking the client's real IP.
 		if lastErr != nil {
-			return nil, lastErr
+			return nil, "", lastErr
 		}
-		return nil, fmt.Errorf("proxy rotator: no usable proxies")
+		return nil, "", fmt.Errorf("proxy rotator: no usable proxies")
 	} else if proxyFunc != nil {
 		dummyReq := &http.Request{URL: &url.URL{Scheme: "https", Host: targetAddr}}
 		proxyURL, err := proxyFunc(dummyReq)
 		if err != nil {
-			return nil, fmt.Errorf("proxy func: %w", err)
+			return nil, "", fmt.Errorf("proxy func: %w", err)
 		}
 		if proxyURL != nil {
-			return t.dialViaProxy(ctx, network, targetAddr, proxyURL)
+			conn, err := t.dialViaProxy(ctx, network, targetAddr, proxyURL)
+			if err != nil {
+				return nil, "", err
+			}
+			return conn, proxyURL.Host, nil
 		}
 	}
 
@@ -510,9 +534,9 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 
 	conn, err := t.dialer.DialContext(ctx, network, dialAddr)
 	if err != nil {
-		return nil, fmt.Errorf("dial tcp: %w", err)
+		return nil, "", fmt.Errorf("dial tcp: %w", err)
 	}
-	return conn, nil
+	return conn, "", nil
 }
 
 // dialViaProxy connects through a proxy. Supports HTTP CONNECT, HTTPS CONNECT

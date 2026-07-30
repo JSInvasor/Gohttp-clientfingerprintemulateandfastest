@@ -15,6 +15,7 @@ const (
 	handshakeTypeEncryptedExtensions   = 8
 	handshakeTypeCertificate           = 11
 	handshakeTypeCertificateVerify     = 15
+	handshakeTypeNewSessionTicket      = 4
 	handshakeTypeFinished              = 20
 	handshakeTypeCompressedCertificate = 25
 )
@@ -49,6 +50,7 @@ const (
 	extExtendedMasterSecret = 0x0017
 	extCompressCertificate  = 0x001B
 	extSessionTicket        = 0x0023
+	extPreSharedKey         = 0x0029
 	extKeyShare             = 0x0033
 	extSupportedVersions    = 0x002B
 	extPSKKeyExchangeModes  = 0x002D

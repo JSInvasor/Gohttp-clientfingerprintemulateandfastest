@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"math/big"
+	"time"
 )
 
 // Chrome ClientHello builder.
@@ -20,12 +21,15 @@ import (
 // extension list in wire order, so a Chrome JA3 is a different value per
 // connection by design. JA4 sorts before hashing and is therefore stable.
 //
-// An earlier revision documented t13d1517h2_8daaf6152771_b6f405a00624. That
-// value was read off a capture of a RESUMED session, which carries
-// pre_shared_key (0x0029) as a 17th counted extension. This builder never
-// sends PSK (see the trailing-GREASE note in buildChromeExtensions), so it
-// emits 16 counted extensions and can never produce that hash — and the
-// device confirms 16.
+// A fresh connection emits 16 counted extensions; the device confirms 16.
+// A resumed one carries pre_shared_key (0x0029) as a 17th and hashes to
+// t13d1517h2_8daaf6152771_a87ad97598a9 — see TestResumedChromeHelloAddsOnlyPSK,
+// which derives that value rather than assuming it.
+//
+// An earlier revision documented the resumed hash as
+// t13d1517h2_8daaf6152771_b6f405a00624. That capture predates the ML-DSA
+// signature algorithms: it is this same extension set resumed, hashed with the
+// Chrome 146 sig-alg list, and it no longer describes this profile.
 //
 // Key differences from Safari on iPhone:
 //   - 15 cipher suites, no 3DES and no ECDSA-CBC legacy suites, and the TLS 1.3
@@ -41,10 +45,10 @@ import (
 // Both profiles carry an X25519MLKEM768 + X25519 key_share and send no padding.
 
 // buildChromeClientHello builds the Chrome ClientHello handshake message.
-func buildChromeClientHello(serverName string, alpn []string, km *keyMaterial) ([]byte, error) {
+func buildChromeClientHello(serverName string, alpn []string, km *keyMaterial, sess *Session) ([]byte, error) {
 	gs := newGreaseSet()
 
-	exts, err := buildChromeExtensions(serverName, alpn, km, gs)
+	exts, err := buildChromeExtensions(serverName, alpn, km, gs, sess)
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +115,7 @@ type chromeExt struct {
 // different JA3 hash. A fixed order produces zero JA3 entropy across
 // connections, which Cloudflare/Akamai score as a strong bot signal. JA4 is
 // unaffected — it sorts extensions before hashing.
-func buildChromeExtensions(serverName string, alpn []string, km *keyMaterial, gs greaseSet) ([]byte, error) {
+func buildChromeExtensions(serverName string, alpn []string, km *keyMaterial, gs greaseSet, sess *Session) ([]byte, error) {
 	keyShareData, err := buildChromeKeyShare(km, gs)
 	if err != nil {
 		return nil, err
@@ -149,10 +153,14 @@ func buildChromeExtensions(serverName string, alpn []string, km *keyMaterial, gs
 	for _, e := range middle {
 		out = appendExt(out, e.typ, e.data)
 	}
-	// Last GREASE: pinned at the end. (pre_shared_key would have to come after
-	// this on a resumed session per RFC 8446, but we don't send PSK on initial
-	// connections, so the trailing GREASE is the final extension.)
+	// Last GREASE: pinned at the end — except on a resumed session, where
+	// RFC 8446 §4.2.11 requires pre_shared_key to be the final extension and
+	// it therefore follows the GREASE.
 	out = appendExt(out, gs.extLast, []byte{0x00})
+
+	if sess != nil {
+		out = appendExt(out, extPreSharedKey, buildPSKExtension(sess, time.Now()))
+	}
 
 	return out, nil
 }
@@ -240,7 +248,7 @@ func buildChromeSupportedGroups(gs greaseSet) []byte {
 // buildChromeSupportedVersions: GREASE + TLS 1.3 + TLS 1.2
 func buildChromeSupportedVersions(gs greaseSet) []byte {
 	return []byte{
-		0x06, // list length: 6 bytes (3 versions)
+		0x06,                                    // list length: 6 bytes (3 versions)
 		byte(gs.version >> 8), byte(gs.version), // GREASE
 		0x03, 0x04, // TLS 1.3
 		0x03, 0x03, // TLS 1.2

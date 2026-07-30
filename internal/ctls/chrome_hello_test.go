@@ -22,7 +22,7 @@ func TestChromeExtensionsShuffle(t *testing.T) {
 
 	for i := 0; i < iterations; i++ {
 		gs := newGreaseSet()
-		exts, err := buildChromeExtensions("example.com", []string{"h2", "http/1.1"}, km, gs)
+		exts, err := buildChromeExtensions("example.com", []string{"h2", "http/1.1"}, km, gs, nil)
 		if err != nil {
 			t.Fatalf("buildChromeExtensions iter %d: %v", i, err)
 		}
@@ -69,7 +69,7 @@ func TestChromeClientHelloJA4(t *testing.T) {
 
 	// Run several times: the shuffle must not move JA4.
 	for i := 0; i < 8; i++ {
-		raw, err := buildChromeClientHello("tls.peet.ws", []string{"h2", "http/1.1"}, km)
+		raw, err := buildChromeClientHello("tls.peet.ws", []string{"h2", "http/1.1"}, km, nil)
 		if err != nil {
 			t.Fatalf("buildChromeClientHello: %v", err)
 		}
@@ -125,7 +125,7 @@ func TestChromeALPSOffersOnlyH2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generateKeyMaterial: %v", err)
 	}
-	raw, err := buildChromeClientHello("tls.peet.ws", []string{"h2", "http/1.1"}, km)
+	raw, err := buildChromeClientHello("tls.peet.ws", []string{"h2", "http/1.1"}, km, nil)
 	if err != nil {
 		t.Fatalf("buildChromeClientHello: %v", err)
 	}

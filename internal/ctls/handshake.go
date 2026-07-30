@@ -38,11 +38,18 @@ type handshakeState struct {
 	transcript     hash.Hash
 	negotiatedALPN string
 
+	// Resumption state. offered is the ticket we put in the ClientHello;
+	// pskAccepted records whether the ServerHello actually selected it.
+	sessions    *SessionCache
+	sessionKey  string
+	offered     *Session
+	pskAccepted bool
+
 	clientHelloMsg []byte
 }
 
 // handshake performs the full TLS 1.3 handshake and returns a *Conn.
-func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType) (*Conn, error) {
+func handshake(conn net.Conn, cfg *Config) (*Conn, error) {
 	km, err := generateKeyMaterial()
 	if err != nil {
 		return nil, fmt.Errorf("generate keys: %w", err)
@@ -50,28 +57,42 @@ func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool,
 
 	hs := &handshakeState{
 		conn:       conn,
-		serverName: serverName,
-		alpn:       alpn,
-		skipVerify: skipVerify,
-		rootCAs:    rootCAs,
-		browser:    browser,
+		serverName: cfg.ServerName,
+		alpn:       cfg.ALPN,
+		skipVerify: cfg.SkipVerify,
+		rootCAs:    cfg.RootCAs,
+		browser:    cfg.Browser,
 		km:         km,
+		sessions:   cfg.Sessions,
+		sessionKey: cfg.SessionKey,
 	}
 
 	return hs.run()
 }
 
 func (hs *handshakeState) run() (*Conn, error) {
+	// A cached ticket turns this into a resumption attempt. If the server
+	// declines it the handshake simply proceeds in full, so this is safe to
+	// try whenever one is available.
+	hs.offered = hs.sessions.Get(hs.sessionKey)
+
 	var chMsg []byte
 	var err error
 	switch hs.browser {
 	case BrowserChrome:
-		chMsg, err = buildChromeClientHello(hs.serverName, hs.alpn, hs.km)
+		chMsg, err = buildChromeClientHello(hs.serverName, hs.alpn, hs.km, hs.offered)
 	default:
-		chMsg, err = buildSafariClientHello(hs.serverName, hs.alpn, hs.km)
+		chMsg, err = buildSafariClientHello(hs.serverName, hs.alpn, hs.km, hs.offered)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("build client hello: %w", err)
+	}
+	// The binder is an HMAC over the ClientHello up to the binder itself, so it
+	// can only be filled in once the message is fully assembled.
+	if hs.offered != nil {
+		if err := finalizePSKBinder(chMsg, hs.offered); err != nil {
+			return nil, fmt.Errorf("psk binder: %w", err)
+		}
 	}
 	hs.clientHelloMsg = chMsg
 
@@ -95,7 +116,19 @@ func (hs *handshakeState) run() (*Conn, error) {
 	hs.negotiatedALPN = negotiatedALPN
 
 	hs.suite = suite
-	hs.ks = newKeySchedule(suite)
+	resumed := false
+	if hs.pskAccepted && hs.offered != nil {
+		// The PSK is bound to the hash of the suite it was issued under; a
+		// server that selects a suite with a different hash cannot be talking
+		// about our ticket.
+		if hashLen(suite) != hashLen(hs.offered.suite) {
+			return nil, fmt.Errorf("server accepted psk under suite 0x%04x whose hash differs from the ticket's", suite)
+		}
+		hs.ks = newKeyScheduleWithPSK(suite, hs.offered.psk)
+		resumed = true
+	} else {
+		hs.ks = newKeySchedule(suite)
+	}
 
 	// Initialize transcript with SHA-256 or SHA-384
 	hs.transcript = hs.ks.h()
@@ -244,7 +277,12 @@ func (hs *handshakeState) run() (*Conn, error) {
 	// server that simply omitted its Certificate message skipped validation
 	// entirely, and a missing CertificateVerify would leave the peer
 	// unauthenticated. Absence of either is a failure, not a reason to skip.
-	if !hs.skipVerify {
+	//
+	// A resumed handshake is the documented exception: the server sends no
+	// Certificate at all, and proves its identity by producing a Finished MAC
+	// over a transcript keyed by the PSK — which only the server that
+	// authenticated on the original connection can do.
+	if !hs.skipVerify && !resumed {
 		if len(serverCerts) == 0 {
 			return nil, fmt.Errorf("server sent no certificate")
 		}
@@ -293,6 +331,12 @@ func (hs *handshakeState) run() (*Conn, error) {
 		return nil, fmt.Errorf("send finished: %w", err)
 	}
 
+	// resumption_master_secret covers the transcript through the *client's*
+	// Finished, so that message has to join the transcript before it is
+	// derived. Post-handshake tickets hang off this secret.
+	hs.transcript.Write(finishedMsg)
+	resMaster := hs.ks.resumptionMasterSecret(hs.transcript.Sum(nil))
+
 	// Derive application traffic keys
 	serverAppAEAD, serverAppIV, err := hs.ks.makeTrafficKeys(hs.ks.serverAppTraffic)
 	if err != nil {
@@ -310,6 +354,11 @@ func (hs *handshakeState) run() (*Conn, error) {
 		negotiatedALPN: hs.negotiatedALPN,
 		serverReader:   newEncryptedRecord(serverAppAEAD, serverAppIV),
 		clientWriter:   newEncryptedRecord(clientAppAEAD, clientAppIV),
+		didResume:      resumed,
+		suite:          hs.suite,
+		resMaster:      resMaster,
+		sessions:       hs.sessions,
+		sessionKey:     hs.sessionKey,
 	}, nil
 }
 
@@ -432,6 +481,21 @@ func (hs *handshakeState) parseServerHello(data []byte) (suite uint16, dhe []byt
 					alpn = string(extData[3 : 3+protoLen])
 				}
 			}
+
+		case extPreSharedKey:
+			// RFC 8446 §4.2.11: the ServerHello echoes the index of the
+			// identity it chose. We offer exactly one, so anything but 0 —
+			// or an echo we never asked for — is a protocol violation.
+			if hs.offered == nil {
+				return 0, nil, nil, "", fmt.Errorf("server selected a psk we did not offer")
+			}
+			if len(extData) != 2 {
+				return 0, nil, nil, "", fmt.Errorf("malformed pre_shared_key in server hello")
+			}
+			if idx := binary.BigEndian.Uint16(extData); idx != 0 {
+				return 0, nil, nil, "", fmt.Errorf("server selected psk identity %d, only 0 was offered", idx)
+			}
+			hs.pskAccepted = true
 		}
 	}
 

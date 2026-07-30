@@ -23,7 +23,20 @@ type Conn struct {
 
 	readBuf []byte // decrypted application data buffer
 	readErr error  // stored read error
+
+	// Resumption state. Tickets arrive after the handshake, interleaved with
+	// application data, so the live connection is what turns them into
+	// reusable sessions.
+	didResume  bool
+	suite      uint16
+	resMaster  []byte
+	sessions   *SessionCache
+	sessionKey string
 }
+
+// DidResume reports whether this connection resumed an earlier session rather
+// than performing a full handshake.
+func (c *Conn) DidResume() bool { return c.didResume }
 
 // NegotiatedProtocol returns the negotiated ALPN protocol.
 func (c *Conn) NegotiatedProtocol() string {
@@ -114,12 +127,53 @@ func (c *Conn) Read(b []byte) (int, error) {
 			continue
 
 		case recordTypeHandshake:
-			// Post-handshake messages (e.g., NewSessionTicket) - skip
+			// Post-handshake messages. NewSessionTicket is what makes the next
+			// connection to this host resumable; discarding it (the previous
+			// behaviour) forced a full handshake every time, which is both
+			// slower and unlike any real browser.
+			c.absorbPostHandshake(plaintext)
 			continue
 
 		default:
 			return 0, fmt.Errorf("unexpected inner type %d", innerType)
 		}
+	}
+}
+
+// absorbPostHandshake walks post-handshake handshake messages and turns any
+// NewSessionTicket into a cached, resumable session. Anything malformed or
+// unrecognised is ignored: a bad ticket costs a future resumption, never the
+// current connection.
+func (c *Conn) absorbPostHandshake(plaintext []byte) {
+	if c.sessions == nil || len(c.resMaster) == 0 {
+		return
+	}
+	remaining := plaintext
+	for len(remaining) >= 4 {
+		msgType := remaining[0]
+		msgLen := int(remaining[1])<<16 | int(remaining[2])<<8 | int(remaining[3])
+		if 4+msgLen > len(remaining) {
+			return
+		}
+		body := remaining[4 : 4+msgLen]
+		remaining = remaining[4+msgLen:]
+
+		if msgType != handshakeTypeNewSessionTicket {
+			continue
+		}
+		lifetime, ageAdd, nonce, ticket, err := parseNewSessionTicket(body)
+		if err != nil {
+			continue
+		}
+		h := hashForCipher(c.suite)
+		c.sessions.Put(c.sessionKey, &Session{
+			psk:       deriveResumptionPSK(h, c.resMaster, nonce),
+			ticket:    append([]byte(nil), ticket...),
+			ageAdd:    ageAdd,
+			lifetime:  lifetime,
+			suite:     c.suite,
+			createdAt: time.Now(),
+		})
 	}
 }
 
@@ -180,9 +234,38 @@ func DialWithConfig(ctx context.Context, network, addr, serverName string, alpn 
 	return WrapConn(ctx, rawConn, serverName, alpn, skipVerify, rootCAs, browser)
 }
 
-// WrapConn performs the TLS 1.3 handshake over an existing net.Conn.
-// This is the main entry point for use with pre-dialed connections (proxies, etc.).
+// Config carries everything WrapConnConfig needs for one handshake.
+type Config struct {
+	ServerName string
+	ALPN       []string
+	SkipVerify bool
+	RootCAs    *x509.CertPool
+	Browser    BrowserType
+
+	// Sessions, when set, enables TLS 1.3 resumption. SessionKey scopes the
+	// tickets: two connections sharing a key may present each other's tickets,
+	// which proves to the server that they are the same client. Callers that
+	// rotate proxies must include the proxy in the key, or resumption hands the
+	// server exactly the correlation the rotation was meant to prevent.
+	Sessions   *SessionCache
+	SessionKey string
+}
+
+// WrapConn performs the TLS 1.3 handshake over an existing net.Conn without
+// session resumption. It is the pre-dialed equivalent of Dial.
 func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType) (*Conn, error) {
+	return WrapConnConfig(ctx, rawConn, &Config{
+		ServerName: serverName,
+		ALPN:       alpn,
+		SkipVerify: skipVerify,
+		RootCAs:    rootCAs,
+		Browser:    browser,
+	})
+}
+
+// WrapConnConfig performs the TLS 1.3 handshake over an existing net.Conn.
+// This is the main entry point for use with pre-dialed connections (proxies, etc.).
+func WrapConnConfig(ctx context.Context, rawConn net.Conn, cfg *Config) (*Conn, error) {
 	// Set deadline from context
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := rawConn.SetDeadline(deadline); err != nil {
@@ -191,7 +274,7 @@ func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []s
 		}
 	}
 
-	tlsConn, err := handshake(rawConn, serverName, alpn, skipVerify, rootCAs, browser)
+	tlsConn, err := handshake(rawConn, cfg)
 	if err != nil {
 		rawConn.Close()
 		return nil, fmt.Errorf("tls handshake: %w", err)
