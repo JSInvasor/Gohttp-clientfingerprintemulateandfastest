@@ -28,13 +28,13 @@ const (
 
 // BrowserType selects which TLS ClientHello to build.
 //
-// The zero value is Safari iOS 18 so a caller that doesn't specify a profile
+// The zero value is Safari so a caller that does not specify a profile
 // keeps the Safari fingerprint this package shipped as its only profile.
 type BrowserType int
 
 const (
-	BrowserSafariIOS18 BrowserType = iota
-	BrowserChrome146
+	BrowserSafari BrowserType = iota
+	BrowserChrome
 )
 
 // TLS extension IDs
@@ -100,8 +100,9 @@ const (
 	pskModePSKDHE = 1
 )
 
-// Chrome 146 cipher suite order (a GREASE value is prepended at build time)
-var chrome146CipherSuites = []uint16{
+// Chrome cipher suite order (a GREASE value is prepended at build time).
+// Unchanged between Chrome 146 and 150 — verified against real Chrome 150.
+var chromeCipherSuites = []uint16{
 	cipherTLS_AES_128_GCM_SHA256,
 	cipherTLS_AES_256_GCM_SHA384,
 	cipherTLS_CHACHA20_POLY1305_SHA256,
@@ -119,8 +120,17 @@ var chrome146CipherSuites = []uint16{
 	cipherTLS_RSA_WITH_AES_256_CBC_SHA,
 }
 
-// Chrome 146 signature algorithms (8 algos, no SHA1)
-var chrome146SigAlgs = []uint16{
+// Chrome signature algorithms (11 algos, no SHA1). Verified against real
+// Chrome 150 via tls.peet.ws.
+//
+// The three ML-DSA entries lead the list: Chrome advertises post-quantum
+// certificate signatures ahead of the classical algorithms. They were absent
+// from the Chrome 146 profile, which put JA4_c at d8a2da3f94cd instead of the
+// real 806a8c22fdea.
+var chromeSigAlgs = []uint16{
+	0x0904, // mldsa44
+	0x0905, // mldsa65
+	0x0906, // mldsa87
 	0x0403, // ecdsa_secp256r1_sha256
 	0x0804, // rsa_pss_rsae_sha256
 	0x0401, // rsa_pkcs1_sha256

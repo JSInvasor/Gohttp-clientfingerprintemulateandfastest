@@ -138,15 +138,12 @@ func buildECHGrease() ([]byte, error) {
 		return nil, err
 	}
 
-	// Chrome alternates between the two payload lengths.
-	payloadLen := 128
-	var randByte [1]byte
-	if _, err := rand.Read(randByte[:]); err != nil {
-		return nil, err
-	}
-	if randByte[0]&1 == 1 {
-		payloadLen = 223
-	}
+	// Chrome derives this length from the padded ClientHelloInner, so it is not
+	// a constant across all sites — but it is deterministic for a given target,
+	// not a coin flip. A real Chrome 150 capture against tls.peet.ws carries 144
+	// bytes, so use that rather than the arbitrary 128/223 alternation an earlier
+	// revision picked (neither of which was ever observed).
+	const payloadLen = 144
 
 	payload := make([]byte, payloadLen)
 	if _, err := rand.Read(payload); err != nil {

@@ -1,18 +1,21 @@
 # gofire
 
-Ultra high-performance Go HTTP client with **Safari iOS 18** TLS fingerprint emulation. Designed for **200-300k+ RPS** with full JA3/JA4 + HTTP/2 + header fingerprint bypass.
+Ultra high-performance Go HTTP client with **Safari (iPhone)** and **Chrome 150 (Windows)** TLS fingerprint emulation. Designed for **200-300k+ RPS** with full JA3/JA4 + HTTP/2 + header fingerprint bypass.
+
+Both profiles are verified against real devices via tls.peet.ws and pinned by tests in `internal/ctls`.
 
 ## Features
 
-- **Safari iOS 18 TLS Fingerprint** — Exact JA3/JA4 via custom TLS 1.3 (cipher suites, GREASE, 512-byte padding, X25519 key share)
-- **Safari iOS 18 HTTP/2 Fingerprint** — SETTINGS (MAX_CONCURRENT_STREAMS=100, NO_RFC7540_PRIORITIES=1), WINDOW_UPDATE, pseudo-header order (m,s,a,p)
-- **Safari iOS 18 Headers** — Correct order, Sec-Fetch-* (no Sec-Fetch-User), Priority
+- **Safari TLS Fingerprint** — Exact JA3/JA4 via custom TLS 1.3 (cipher suites, GREASE at 6 positions, X25519MLKEM768 + X25519 key share, no padding)
+- **Chrome 150 TLS Fingerprint** — Per-connection extension shuffle, ALPS, ECH GREASE, ML-DSA signature algorithms
+- **Safari HTTP/2 Fingerprint** — SETTINGS (MAX_CONCURRENT_STREAMS=100, NO_RFC7540_PRIORITIES=1), WINDOW_UPDATE, pseudo-header order (m,s,a,p)
+- **Safari Headers** — Correct order, Sec-Fetch-* (no Sec-Fetch-User), Priority
 - **200-300k+ RPS** — Worker pool pipeline, connection pre-warming, DNS cache
 - **Pipeline Mode** — Fixed worker pool for sustained max throughput
 - **PreConnect** — Pre-warm TLS connections before first request
 - **DNS Cache** — Round-robin IP selection, configurable TTL
 - **TCP Tuning** — TCP_NODELAY, TCP_QUICKACK, 256KB buffers (Linux)
-- **Auto Decompression** — gzip, brotli, deflate
+- **Auto Decompression** — gzip, brotli, deflate, zstd
 - **Cookie Jar** — Automatic cookie management
 - **Proxy Support** — HTTP/SOCKS5
 
@@ -35,7 +38,7 @@ import (
 )
 
 func main() {
-    // Emulate Safari iOS 18 - that's it!
+    // Emulate Safari on iPhone - that's it!
     client, err := gofire.Emulate(gofire.SafariIOS18)
     if err != nil {
         log.Fatal(err)
@@ -48,7 +51,7 @@ func main() {
     }
 
     text, _ := resp.Text()
-    fmt.Println(text) // Safari iOS 18 fingerprint verified
+    fmt.Println(text) // Safari fingerprint verified
 }
 ```
 
@@ -85,11 +88,12 @@ for i := 0; i < 1000000; i++ {
 ### Creating Clients
 
 ```go
-// Recommended: Emulate Safari iOS 18
+// Recommended: Emulate a real browser
 client, err := gofire.Emulate(gofire.SafariIOS18)
+client, err := gofire.Emulate(gofire.Chrome150)
 client, err := gofire.Emulate(gofire.SafariIOS18, gofire.WithProxy("socks5://..."))
 
-// Or with NewClient (defaults to Safari iOS 18)
+// Or with NewClient (defaults to Safari)
 client, err := gofire.NewClient(gofire.WithTimeout(5 * time.Second))
 ```
 
@@ -213,7 +217,7 @@ client.PreConnect(ctx, "https://target.com", 500)
 pipeline := client.NewPipeline(5000)
 ```
 
-## Safari iOS 18 Fingerprint Details
+## Safari Fingerprint Details
 
 ### TLS (JA3/JA4)
 
@@ -244,7 +248,7 @@ Extension order is fixed — Apple does not permute it, unlike Chrome.
 > Every browser on iOS emits this same TLS fingerprint. Chrome (`CriOS`) and the
 > Google app (`GSA`) were captured byte-identical to Safari, because iOS forces
 > all of them onto Apple's networking stack; only the User-Agent differs. Use the
-> `Chrome147` profile only for desktop Chrome.
+> `Chrome150` profile only for desktop Chrome.
 
 ### HTTP/2 (Akamai)
 - ENABLE_PUSH: 0
@@ -265,6 +269,33 @@ Extension order is fixed — Apple does not permute it, unlike Chrome.
 - `accept-encoding` LAST (Firefox/Chrome place it earlier)
 - `accept-encoding: gzip, deflate, br, zstd`
 - No `Upgrade-Insecure-Requests`, no `Sec-Fetch-User`, no `Sec-Ch-Ua`, no `TE`
+
+## Chrome 150 Fingerprint Details
+
+Verified against a real Chrome 150 on Windows via tls.peet.ws, and pinned by
+`internal/ctls/chrome_hello_test.go`:
+
+- JA4: `t13d1516h2_8daaf6152771_806a8c22fdea`
+- Akamai H2: `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`
+- Akamai hash: `52d84b11737d980aef856699f885ca86`
+
+No reference JA3 is published for Chrome: BoringSSL permutes the extension order
+on every connection, so a stable Chrome JA3 does not exist. A client that emits a
+constant JA3 across connections is itself a bot signal. JA4 sorts before hashing
+and is stable.
+
+- 15 cipher suites + GREASE prefix, no 3DES and no ECDSA-CBC. TLS 1.3 suites lead
+  with AES-128-GCM (`0x1301`) — the opposite of Safari
+- 16 counted extensions, shuffled per connection via Fisher-Yates over
+  `crypto/rand`, with GREASE pinned first and last
+- Supported groups: GREASE + X25519MLKEM768 + X25519 + P-256 + P-384 (no P-521)
+- key_share: GREASE + X25519MLKEM768 + X25519
+- 11 signature algorithms led by ML-DSA (`0x0904`, `0x0905`, `0x0906`), no SHA1
+- `compress_certificate`: brotli. Plus ALPS (`17613`, h2 only), ECH GREASE
+  (`65037`), and `session_ticket` (`35`) — none of which Safari sends
+- HEADERS frame carries the priority flag: weight 256, depends_on 0, exclusive
+- `sec-ch-ua: "Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"`
+  — both the greased brand spelling and the list order are version-bound
 
 ## License
 

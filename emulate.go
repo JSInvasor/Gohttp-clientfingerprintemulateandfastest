@@ -16,28 +16,30 @@ const (
 	// "iPhone OS 18_7" token in Safari's User-Agent; see SafariIOS18UserAgent.
 	// Every browser on iOS produces this same TLS fingerprint.
 	SafariIOS18 BrowserProfile = iota
-	// Chrome147 emulates Chrome 147 on Windows with full TLS/HTTP2/header
-	// fingerprint. The TLS layer (ciphers, per-connection extension shuffle,
-	// JA4 t13d1516h2_8daaf6152771_d8a2da3f94cd, Akamai H2 52d84b1...) matches
-	// Chrome 146; only the UA and sec-ch-ua brand list differ.
+	// Chrome150 emulates Chrome 150 on Windows with full TLS/HTTP2/header
+	// fingerprint (JA4 t13d1516h2_8daaf6152771_806a8c22fdea, Akamai H2
+	// 52d84b1...), verified against a real Chrome 150 capture.
 	//
 	// This is desktop Chrome. For Chrome on an iPhone use SafariIOS18 with a
 	// CriOS User-Agent override — iOS forces every browser onto Apple's TLS
 	// stack, so Chrome-on-iOS emits the Safari fingerprint, not this one.
-	Chrome147
+	Chrome150
 
-	// Chrome146 is a backward-compatible alias for Chrome147: the TLS layer is
-	// unchanged between the two releases, only UA + sec-ch-ua moved.
-	Chrome146 = Chrome147
+	// Chrome147 and Chrome146 are backward-compatible aliases for Chrome150.
+	// The cipher list, extension set, and HTTP/2 fingerprint are unchanged
+	// across those releases; the signature algorithms, UA, and sec-ch-ua moved,
+	// and callers get the current verified values under any of these names.
+	Chrome147 = Chrome150
+	Chrome146 = Chrome150
 )
 
 // String returns the browser profile name.
 func (b BrowserProfile) String() string {
 	switch b {
 	case SafariIOS18:
-		return "Safari/18.7"
-	case Chrome147:
-		return "Chrome/147.0"
+		return "Safari/26.5.2"
+	case Chrome150:
+		return "Chrome/150.0"
 	default:
 		return "Unknown"
 	}
@@ -48,11 +50,11 @@ func (b BrowserProfile) String() string {
 // Usage:
 //
 //	client, err := gofire.Emulate(gofire.SafariIOS18)
-//	client, err := gofire.Emulate(gofire.Chrome147)
-//	client, err := gofire.Emulate(gofire.Chrome147, gofire.WithProxy("socks5://..."))
+//	client, err := gofire.Emulate(gofire.Chrome150)
+//	client, err := gofire.Emulate(gofire.Chrome150, gofire.WithProxy("socks5://..."))
 func Emulate(profile BrowserProfile, opts ...Option) (*Client, error) {
 	switch profile {
-	case SafariIOS18, Chrome147:
+	case SafariIOS18, Chrome150:
 		allOpts := make([]Option, 0, len(opts)+1)
 		allOpts = append(allOpts, withBrowserProfile(profile))
 		allOpts = append(allOpts, opts...)
@@ -69,7 +71,7 @@ func withBrowserProfile(profile BrowserProfile) Option {
 		c.transport.DisableCompression = true
 
 		switch profile {
-		case Chrome147:
+		case Chrome150:
 			c.acceptLanguage = "en-US,en;q=0.9"
 			c.accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
 		default:

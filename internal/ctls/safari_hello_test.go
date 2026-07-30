@@ -295,6 +295,48 @@ func parseClientHello(msg []byte) (*parsedHello, error) {
 	return h, nil
 }
 
+// findExtension returns the raw payload of the first extension of type typ.
+func findExtension(msg []byte, typ uint16) ([]byte, bool) {
+	if len(msg) < 4 {
+		return nil, false
+	}
+	b := msg[4:]
+	p := 2 + 32
+	if p >= len(b) {
+		return nil, false
+	}
+	p += 1 + int(b[p]) // session_id
+	if p+2 > len(b) {
+		return nil, false
+	}
+	p += 2 + int(binary.BigEndian.Uint16(b[p:])) // cipher_suites
+	if p >= len(b) {
+		return nil, false
+	}
+	p += 1 + int(b[p]) // compression_methods
+	if p+2 > len(b) {
+		return nil, false
+	}
+	end := p + 2 + int(binary.BigEndian.Uint16(b[p:]))
+	p += 2
+	if end > len(b) {
+		return nil, false
+	}
+	for p+4 <= end {
+		t := binary.BigEndian.Uint16(b[p:])
+		n := int(binary.BigEndian.Uint16(b[p+2:]))
+		p += 4
+		if p+n > end {
+			return nil, false
+		}
+		if t == typ {
+			return b[p : p+n], true
+		}
+		p += n
+	}
+	return nil, false
+}
+
 func isGreaseValue(v uint16) bool {
 	for _, g := range greaseValues {
 		if v == g {

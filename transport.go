@@ -145,12 +145,12 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 	switch browser {
 	case Chrome147:
 		t.h2Settings = Chrome146H2Settings()
-		t.headerOrder = chrome146HeaderOrder
-		t.ctlsBrowser = ctls.BrowserChrome146
+		t.headerOrder = chromeHeaderOrder
+		t.ctlsBrowser = ctls.BrowserChrome
 	default:
 		t.h2Settings = SafariIOS18H2Settings()
 		t.headerOrder = safariIOS18HeaderOrder
-		t.ctlsBrowser = ctls.BrowserSafariIOS18
+		t.ctlsBrowser = ctls.BrowserSafari
 	}
 
 	rcvBuf := cfg.SocketRcvBuf

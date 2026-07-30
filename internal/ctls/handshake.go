@@ -58,7 +58,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 	var chMsg []byte
 	var err error
 	switch hs.browser {
-	case BrowserChrome146:
+	case BrowserChrome:
 		chMsg, err = buildChromeClientHello(hs.serverName, hs.alpn, hs.km)
 	default:
 		chMsg, err = buildSafariClientHello(hs.serverName, hs.alpn, hs.km)

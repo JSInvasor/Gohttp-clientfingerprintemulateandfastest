@@ -152,7 +152,7 @@ func Dial(ctx context.Context, network, addr string, alpn []string) (*Conn, erro
 	if err != nil {
 		return nil, fmt.Errorf("split host port: %w", err)
 	}
-	return DialWithConfig(ctx, network, addr, host, alpn, false, nil, BrowserSafariIOS18)
+	return DialWithConfig(ctx, network, addr, host, alpn, false, nil, BrowserSafari)
 }
 
 // DialWithConfig creates a TLS connection with full configuration.

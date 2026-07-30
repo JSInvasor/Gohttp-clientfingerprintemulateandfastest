@@ -5,7 +5,7 @@
 // Usage:
 //
 //	client, _ := gofire.Emulate(gofire.SafariIOS18)
-//	client, _ := gofire.Emulate(gofire.Chrome147)
+//	client, _ := gofire.Emulate(gofire.Chrome150)
 //	resp, _ := client.Get("https://example.com")
 //	text, _ := resp.Text()
 package gofire

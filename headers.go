@@ -122,29 +122,38 @@ func applySafariHeaders(req *http.Request, accept, lang string) {
 	// advertising it is safe.
 }
 
-// ========== Chrome 146/147 Headers ==========
+// ========== Chrome 150 Headers ==========
 
-// Chrome147UserAgent is the User-Agent string sent by Chrome 147 on Windows 10 x64.
-const Chrome147UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+// Chrome150UserAgent is the User-Agent string sent by Chrome 150 on Windows 10 x64.
+// Verified against a real Chrome 150 capture from tls.peet.ws.
+const Chrome150UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
-// Chrome146UserAgent is kept for backward compatibility. It resolves to the
-// Chrome 147 User-Agent because the underlying TLS/H2 fingerprint matches that
-// release (only UA + sec-ch-ua brand list moved).
-const Chrome146UserAgent = Chrome147UserAgent
+// Chrome147UserAgent and Chrome146UserAgent are backward-compatible aliases.
+// They resolve to the Chrome 150 User-Agent so callers pinning an older name
+// still get a UA consistent with the TLS/H2 fingerprint this package emits.
+const (
+	Chrome147UserAgent = Chrome150UserAgent
+	Chrome146UserAgent = Chrome150UserAgent
+)
 
-// Chrome147SecChUa is the sec-ch-ua header value for Chrome 147 on Windows.
-// Chrome rotates the "Not A Brand" entry per major version using a deterministic
-// algorithm, so this string is version-bound. Chrome 147 specifically emits:
+// Chrome150SecChUa is the sec-ch-ua header value for Chrome 150 on Windows.
 //
-//	"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"
+// Both the greased brand string and the list order are version-bound, and both
+// are checked by UAM/bot scoring against the UA's major version. Chrome 150
+// emits the greased entry first:
 //
-// Note that the brand strings differ between versions (e.g. Chrome 146 used
-// "Not-A.Brand";v="24"). UAM/bot scoring systems compare this header to the UA
-// major version - drift here is a fake-Chrome signal.
-const Chrome147SecChUa = `"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"`
+//	"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"
+//
+// Earlier releases differ in both respects — the Chrome 147 profile had
+// "Google Chrome" first with a "Not.A/Brand" spelling, and Chrome 146 used
+// "Not-A.Brand";v="24" — so this string must move whenever the UA does.
+const Chrome150SecChUa = `"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"`
 
-// chrome146HeaderOrder defines the exact header order Chrome 146 sends in an
-// HTTP/2 HEADERS frame (verified from tls.peet.ws capture).
+// Chrome147SecChUa is a backward-compatible alias for Chrome150SecChUa.
+const Chrome147SecChUa = Chrome150SecChUa
+
+// chromeHeaderOrder defines the exact header order Chrome sends in an
+// HTTP/2 HEADERS frame. Verified unchanged against real Chrome 150.
 //
 //	:method, :authority, :scheme, :path (pseudo-headers)
 //	sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform
@@ -158,7 +167,7 @@ const Chrome147SecChUa = `"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromiu
 //	priority
 //
 // NOTE: Chrome does NOT send TE, DNT, or Sec-GPC headers.
-var chrome146HeaderOrder = []string{
+var chromeHeaderOrder = []string{
 	"Sec-Ch-Ua",
 	"Sec-Ch-Ua-Mobile",
 	"Sec-Ch-Ua-Platform",
@@ -179,7 +188,7 @@ var chrome146HeaderOrder = []string{
 	"Priority",
 }
 
-// applyChromeHeaders sets exact Chrome 147 default headers on the request.
+// applyChromeHeaders sets exact Chrome 150 default headers on the request.
 // Only sets headers that are not already present, preserving user overrides.
 func applyChromeHeaders(req *http.Request, accept, lang string) {
 	h := req.Header
@@ -189,11 +198,11 @@ func applyChromeHeaders(req *http.Request, accept, lang string) {
 	}
 
 	// Chrome-specific Client Hints (Safari doesn't support them at all)
-	setIfEmpty(h, "Sec-Ch-Ua", Chrome147SecChUa)
+	setIfEmpty(h, "Sec-Ch-Ua", Chrome150SecChUa)
 	setIfEmpty(h, "Sec-Ch-Ua-Mobile", "?0")
 	setIfEmpty(h, "Sec-Ch-Ua-Platform", `"Windows"`)
 	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
-	setIfEmpty(h, "User-Agent", Chrome147UserAgent)
+	setIfEmpty(h, "User-Agent", Chrome150UserAgent)
 	setIfEmpty(h, "Accept", accept)
 	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(req))
 	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")

@@ -6,9 +6,14 @@ import (
 	"math/big"
 )
 
-// Chrome 146 ClientHello builder.
+// Chrome ClientHello builder.
 //
-// JA4: t13d1516h2_8daaf6152771_d8a2da3f94cd
+// Verified against a real Chrome 150 on Windows via tls.peet.ws:
+//
+//	JA4: t13d1516h2_8daaf6152771_806a8c22fdea
+//
+// chrome_hello_test.go pins that, along with the sorted extension list the
+// device reports in ja4_r, which this builder reproduces exactly.
 //
 // There is deliberately no reference JA3 here. Chrome permutes its extension
 // order on every connection (see buildChromeExtensions), and JA3 hashes the
@@ -19,24 +24,23 @@ import (
 // value was read off a capture of a RESUMED session, which carries
 // pre_shared_key (0x0029) as a 17th counted extension. This builder never
 // sends PSK (see the trailing-GREASE note in buildChromeExtensions), so it
-// emits 16 counted extensions and can never produce that hash. Re-deriving
-// the JA4_c input with 0x0029 removed gives d8a2da3f94cd.
+// emits 16 counted extensions and can never produce that hash — and the
+// device confirms 16.
 //
-// The cipher-list component (8daaf6152771) is unaffected and was verified
-// against real Chrome.
-//
-// Key differences from Safari iOS 18:
-//   - 15 cipher suites, no 3DES and no ECDSA-CBC legacy suites
+// Key differences from Safari on iPhone:
+//   - 15 cipher suites, no 3DES and no ECDSA-CBC legacy suites, and the TLS 1.3
+//     suites lead with AES-128-GCM where Apple leads with AES-256-GCM
 //   - Extension order is shuffled per connection (see buildChromeExtensions)
-//   - 2 real key shares (X25519MLKEM768, X25519) vs Safari's X25519 only
-//   - 4 supported groups incl. post-quantum, no P-521
-//   - 8 signature algorithms (no SHA1) vs Safari's 9
+//   - 4 supported groups incl. post-quantum, no P-521 (Safari offers P-521)
+//   - 11 signature algorithms led by ML-DSA, no SHA1; Safari sends 10 with SHA1
+//     last and a repeated rsa_pss_rsae_sha384
 //   - Only brotli for compress_certificate vs Safari's zlib
-//   - Has ALPS (17613) and ECH GREASE (65037); Safari has neither
-//   - No padding extension
+//   - Has ALPS (17613), ECH GREASE (65037) and session_ticket (35); Safari has none
 //   - Pseudo-header order: m,a,s,p
+//
+// Both profiles carry an X25519MLKEM768 + X25519 key_share and send no padding.
 
-// buildChromeClientHello builds the Chrome 146 ClientHello handshake message.
+// buildChromeClientHello builds the Chrome ClientHello handshake message.
 func buildChromeClientHello(serverName string, alpn []string, km *keyMaterial) ([]byte, error) {
 	gs := newGreaseSet()
 
@@ -67,11 +71,11 @@ func buildChromeClientHello(serverName string, alpn []string, km *keyMaterial) (
 	body = append(body, 32)
 	body = append(body, sessionID[:]...)
 
-	// Cipher suites: GREASE + chrome146CipherSuites
-	cipherCount := 1 + len(chrome146CipherSuites) // +1 for GREASE
+	// Cipher suites: GREASE + chromeCipherSuites
+	cipherCount := 1 + len(chromeCipherSuites) // +1 for GREASE
 	body = appendUint16(body, uint16(cipherCount*2))
 	body = appendUint16(body, gs.cipher) // GREASE cipher
-	for _, cs := range chrome146CipherSuites {
+	for _, cs := range chromeCipherSuites {
 		body = appendUint16(body, cs)
 	}
 
@@ -129,7 +133,7 @@ func buildChromeExtensions(serverName string, alpn []string, km *keyMaterial, gs
 		{extALPN, buildALPN(alpn)},
 		{extServerName, buildSNI(serverName)},
 		{extSupportedGroups, buildChromeSupportedGroups(gs)},
-		{extALPS, buildALPS(alpn)},
+		{extALPS, buildALPS(alpsProtocols)},
 		{extSignatureAlgorithms, buildChromeSigAlgs()},
 		{extECH, echGrease},
 		{extStatusRequest, buildStatusRequest()},
@@ -245,7 +249,7 @@ func buildChromeSupportedVersions(gs greaseSet) []byte {
 
 // buildChromeSigAlgs builds Chrome 146 signature algorithms.
 func buildChromeSigAlgs() []byte {
-	algs := chrome146SigAlgs
+	algs := chromeSigAlgs
 	data := make([]byte, 2+len(algs)*2)
 	binary.BigEndian.PutUint16(data[0:], uint16(len(algs)*2))
 	for i, a := range algs {
@@ -254,8 +258,14 @@ func buildChromeSigAlgs() []byte {
 	return data
 }
 
+// alpsProtocols is the protocol list Chrome advertises in application_settings.
+//
+// ALPS is only defined over HTTP/2, so Chrome lists h2 alone here even though
+// its ALPN offers h2 and http/1.1. An earlier revision reused the full ALPN
+// list, putting an http/1.1 entry on the wire that no real Chrome sends.
+var alpsProtocols = []string{"h2"}
+
 // buildALPS builds the application_settings (ALPS) extension.
-// Chrome sends this with the same protocol list as ALPN.
 func buildALPS(alpn []string) []byte {
 	// ALPS format: protocol_list_length(2) + [ length(1) + protocol ... ]
 	total := 0

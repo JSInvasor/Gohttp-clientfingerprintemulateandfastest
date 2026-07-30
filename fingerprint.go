@@ -26,7 +26,7 @@ type H2Profile struct {
 
 // ========== Safari iOS 18 ==========
 //
-// Safari iOS 18.7 HTTP/2 fingerprint.
+// Safari HTTP/2 fingerprint. Verified against a real iPhone 13 / iOS 26.5.2.
 //
 // Akamai HTTP/2 fingerprint: 2:0;3:100;4:2097152;9:1|10420225|0|m,s,a,p
 // Akamai hash: c52879e43202aeb92740be6e8c86ea96
@@ -54,12 +54,17 @@ func SafariIOS18H2Profile() H2Profile {
 	}
 }
 
-// ========== Chrome 146/147 ==========
+// ========== Chrome ==========
 //
-// Chrome 146 HTTP/2 fingerprint.
+// Chrome HTTP/2 fingerprint. Verified byte-for-byte against a real Chrome 150
+// capture (SETTINGS order, WINDOW_UPDATE increment, pseudo-header order, and
+// the HEADERS priority flag: weight 256, depends_on 0, exclusive).
 //
 // Akamai HTTP/2 fingerprint: 1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
 // Akamai hash: 52d84b11737d980aef856699f885ca86
+//
+// The Chrome146* function names are retained for API compatibility; the HTTP/2
+// layer is unchanged from Chrome 146 through 150.
 
 func Chrome146H2Settings() H2Settings {
 	return H2Settings{
