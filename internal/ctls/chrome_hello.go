@@ -240,7 +240,7 @@ func buildChromeSupportedGroups(gs greaseSet) []byte {
 // buildChromeSupportedVersions: GREASE + TLS 1.3 + TLS 1.2
 func buildChromeSupportedVersions(gs greaseSet) []byte {
 	return []byte{
-		0x06, // list length: 6 bytes (3 versions)
+		0x06,                                    // list length: 6 bytes (3 versions)
 		byte(gs.version >> 8), byte(gs.version), // GREASE
 		0x03, 0x04, // TLS 1.3
 		0x03, 0x03, // TLS 1.2

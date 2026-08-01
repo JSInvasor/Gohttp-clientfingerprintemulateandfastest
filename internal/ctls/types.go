@@ -10,13 +10,47 @@ const (
 
 // TLS handshake message types
 const (
-	handshakeTypeClientHello             = 1
-	handshakeTypeServerHello             = 2
-	handshakeTypeEncryptedExtensions     = 8
-	handshakeTypeCertificate             = 11
-	handshakeTypeCertificateVerify       = 15
-	handshakeTypeFinished                = 20
-	handshakeTypeCompressedCertificate   = 25
+	handshakeTypeClientHello           = 1
+	handshakeTypeServerHello           = 2
+	handshakeTypeNewSessionTicket      = 4
+	handshakeTypeEncryptedExtensions   = 8
+	handshakeTypeCertificate           = 11
+	handshakeTypeCertificateVerify     = 15
+	handshakeTypeFinished              = 20
+	handshakeTypeKeyUpdate             = 24
+	handshakeTypeCompressedCertificate = 25
+)
+
+// KeyUpdate request_update values (RFC 8446 §4.6.3).
+const (
+	keyUpdateNotRequested = 0
+	keyUpdateRequested    = 1
+)
+
+// helloRetryRequestRandom is the fixed ServerHello.random that marks a message
+// as a HelloRetryRequest (RFC 8446 §4.1.3). It is SHA-256("HelloRetryRequest").
+var helloRetryRequestRandom = []byte{
+	0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
+	0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+	0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
+	0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+}
+
+// Signature schemes accepted in CertificateVerify (RFC 8446 §4.2.3).
+//
+// RSASSA-PKCS1-v1_5 code points are deliberately absent: §4.4.3 forbids them in
+// signed handshake messages even though they stay legal inside certificates.
+const (
+	sigECDSAP256SHA256  = 0x0403
+	sigECDSAP384SHA384  = 0x0503
+	sigECDSAP521SHA512  = 0x0603
+	sigRSAPSSRSAeSHA256 = 0x0804
+	sigRSAPSSRSAeSHA384 = 0x0805
+	sigRSAPSSRSAeSHA512 = 0x0806
+	sigEd25519          = 0x0807
+	sigRSAPSSPSSSHA256  = 0x0809
+	sigRSAPSSPSSSHA384  = 0x080A
+	sigRSAPSSPSSSHA512  = 0x080B
 )
 
 // TLS versions
@@ -68,23 +102,23 @@ const (
 
 // Cipher suites used by the Safari iOS 18 and Chrome 146 profiles
 const (
-	cipherTLS_AES_128_GCM_SHA256                     = 0x1301
-	cipherTLS_CHACHA20_POLY1305_SHA256               = 0x1303
-	cipherTLS_AES_256_GCM_SHA384                     = 0x1302
-	cipherTLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256    = 0xC02B
-	cipherTLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256      = 0xC02F
-	cipherTLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305     = 0xCCA9
-	cipherTLS_ECDHE_RSA_WITH_CHACHA20_POLY1305       = 0xCCA8
-	cipherTLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384    = 0xC02C
-	cipherTLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384      = 0xC030
-	cipherTLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA       = 0xC00A
-	cipherTLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA       = 0xC009
-	cipherTLS_ECDHE_RSA_WITH_AES_128_CBC_SHA         = 0xC013
-	cipherTLS_ECDHE_RSA_WITH_AES_256_CBC_SHA         = 0xC014
-	cipherTLS_RSA_WITH_AES_128_GCM_SHA256            = 0x009C
-	cipherTLS_RSA_WITH_AES_256_GCM_SHA384            = 0x009D
-	cipherTLS_RSA_WITH_AES_128_CBC_SHA               = 0x002F
-	cipherTLS_RSA_WITH_AES_256_CBC_SHA               = 0x0035
+	cipherTLS_AES_128_GCM_SHA256                  = 0x1301
+	cipherTLS_CHACHA20_POLY1305_SHA256            = 0x1303
+	cipherTLS_AES_256_GCM_SHA384                  = 0x1302
+	cipherTLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 = 0xC02B
+	cipherTLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256   = 0xC02F
+	cipherTLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305  = 0xCCA9
+	cipherTLS_ECDHE_RSA_WITH_CHACHA20_POLY1305    = 0xCCA8
+	cipherTLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 = 0xC02C
+	cipherTLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384   = 0xC030
+	cipherTLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA    = 0xC00A
+	cipherTLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA    = 0xC009
+	cipherTLS_ECDHE_RSA_WITH_AES_128_CBC_SHA      = 0xC013
+	cipherTLS_ECDHE_RSA_WITH_AES_256_CBC_SHA      = 0xC014
+	cipherTLS_RSA_WITH_AES_128_GCM_SHA256         = 0x009C
+	cipherTLS_RSA_WITH_AES_256_GCM_SHA384         = 0x009D
+	cipherTLS_RSA_WITH_AES_128_CBC_SHA            = 0x002F
+	cipherTLS_RSA_WITH_AES_256_CBC_SHA            = 0x0035
 )
 
 // Certificate compression algorithms
@@ -153,8 +187,8 @@ const (
 	alertLevelWarning = 1
 	alertLevelFatal   = 2
 
-	alertCloseNotify    = 0
-	alertUnexpectedMsg  = 10
+	alertCloseNotify      = 0
+	alertUnexpectedMsg    = 10
 	alertHandshakeFailure = 40
-	alertDecryptError   = 51
+	alertDecryptError     = 51
 )

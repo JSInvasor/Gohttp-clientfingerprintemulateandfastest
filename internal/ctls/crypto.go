@@ -111,14 +111,14 @@ func deriveSecret(h func() hash.Hash, secret []byte, label string, transcriptHas
 
 // tlsKeySchedule holds the TLS 1.3 key schedule state.
 type tlsKeySchedule struct {
-	suite         uint16
-	h             func() hash.Hash
-	earlySecret   []byte
+	suite           uint16
+	h               func() hash.Hash
+	earlySecret     []byte
 	handshakeSecret []byte
-	masterSecret  []byte
+	masterSecret    []byte
 
-	clientHSTraffic []byte
-	serverHSTraffic []byte
+	clientHSTraffic  []byte
+	serverHSTraffic  []byte
 	clientAppTraffic []byte
 	serverAppTraffic []byte
 }

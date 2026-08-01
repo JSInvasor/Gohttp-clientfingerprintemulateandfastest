@@ -3,7 +3,13 @@ package ctls
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto"
 	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/hmac"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
@@ -15,6 +21,13 @@ import (
 	"github.com/andybalholm/brotli"
 	mlkem "github.com/cloudflare/circl/kem/mlkem/mlkem768"
 )
+
+// maxHandshakeMessage bounds a single reassembled handshake message and the
+// amount of unconsumed handshake data we are willing to buffer. The length
+// field allows 16 MiB; the largest thing a server legitimately sends is its
+// certificate chain, so this uses the same 256 KiB ceiling as crypto/tls.
+// Without a bound a hostile server could pin 16 MiB per connection.
+const maxHandshakeMessage = 256 * 1024
 
 // handshakeState manages the TLS 1.3 handshake.
 type handshakeState struct {
@@ -54,6 +67,60 @@ func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool,
 	return hs.run()
 }
 
+// handshakeReader reassembles handshake messages out of a stream of record
+// payloads. RFC 8446 §5.1 lets one handshake message span several records and
+// lets several messages share one record, so neither boundary can be assumed.
+// Certificate chains routinely exceed the 16 KiB record limit, which is exactly
+// where one-message-per-record reading breaks.
+type handshakeReader struct {
+	buf []byte
+}
+
+// add appends record payload bytes to the reassembly buffer.
+func (hr *handshakeReader) add(data []byte) error {
+	if len(hr.buf)+len(data) > maxHandshakeMessage {
+		return fmt.Errorf("handshake data exceeds %d bytes", maxHandshakeMessage)
+	}
+	hr.buf = append(hr.buf, data...)
+	return nil
+}
+
+// next returns the next complete handshake message including its 4-byte header,
+// or nil when more record data is needed. The returned slice stays valid until
+// the message after it is consumed.
+func (hr *handshakeReader) next() ([]byte, error) {
+	if len(hr.buf) < 4 {
+		return nil, nil
+	}
+	msgLen := int(hr.buf[1])<<16 | int(hr.buf[2])<<8 | int(hr.buf[3])
+	if msgLen > maxHandshakeMessage-4 {
+		return nil, fmt.Errorf("handshake message length %d exceeds limit", msgLen)
+	}
+	if len(hr.buf) < 4+msgLen {
+		return nil, nil
+	}
+	msg := hr.buf[:4+msgLen]
+	hr.buf = hr.buf[4+msgLen:]
+	return msg, nil
+}
+
+// alertError turns an alert record body into an error. Warning-level alerts
+// other than close_notify carry no failure, so they return nil and the caller
+// keeps reading.
+func alertError(body []byte) error {
+	if len(body) < 2 {
+		return fmt.Errorf("malformed alert record")
+	}
+	level, desc := body[0], body[1]
+	if level == alertLevelFatal {
+		return fmt.Errorf("server alert: %d", desc)
+	}
+	if desc == alertCloseNotify {
+		return fmt.Errorf("server closed connection during handshake")
+	}
+	return nil
+}
+
 func (hs *handshakeState) run() (*Conn, error) {
 	var chMsg []byte
 	var err error
@@ -72,16 +139,38 @@ func (hs *handshakeState) run() (*Conn, error) {
 		return nil, fmt.Errorf("send client hello: %w", err)
 	}
 
-	// Read ServerHello
-	rec, err := readRawRecord(hs.conn)
-	if err != nil {
-		return nil, fmt.Errorf("read server hello record: %w", err)
-	}
-	if rec.typ != recordTypeHandshake {
-		return nil, fmt.Errorf("expected handshake record, got %d", rec.typ)
+	// Read ServerHello, reassembling across records rather than assuming a
+	// single record carries the whole message.
+	var shReader handshakeReader
+	var serverHelloMsg []byte
+	for serverHelloMsg == nil {
+		rec, err := readRawRecord(hs.conn)
+		if err != nil {
+			return nil, fmt.Errorf("read server hello record: %w", err)
+		}
+		if rec.typ == recordTypeAlert {
+			if err := alertError(rec.data); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if rec.typ == recordTypeChangeCipherSpec {
+			continue
+		}
+		if rec.typ != recordTypeHandshake {
+			return nil, fmt.Errorf("expected handshake record, got %d", rec.typ)
+		}
+		if err := shReader.add(rec.data); err != nil {
+			return nil, fmt.Errorf("read server hello: %w", err)
+		}
+		msg, err := shReader.next()
+		if err != nil {
+			return nil, fmt.Errorf("read server hello: %w", err)
+		}
+		serverHelloMsg = msg
 	}
 
-	suite, dhe, serverHelloMsg, negotiatedALPN, err := hs.parseServerHello(rec.data)
+	suite, dhe, negotiatedALPN, err := hs.parseServerHello(serverHelloMsg)
 	if err != nil {
 		return nil, fmt.Errorf("parse server hello: %w", err)
 	}
@@ -106,13 +195,15 @@ func (hs *handshakeState) run() (*Conn, error) {
 	}
 	serverHSER := newEncryptedRecord(serverHSAEAD, serverHSIV)
 
-	// Read encrypted handshake messages: EncryptedExtensions, Certificate, CertVerify, Finished
+	// Read encrypted handshake messages: EncryptedExtensions, Certificate,
+	// CertificateVerify, Finished.
 	var serverCerts []*x509.Certificate
-	var serverFinishedMAC []byte
+	var sawCertVerify bool
+	var finished bool
+	var hr handshakeReader
 
-	// Drain ChangeCipherSpec if present (TLS 1.3 middlebox compat)
-	for {
-		rec, err = readRawRecord(hs.conn)
+	for !finished {
+		rec, err := readRawRecord(hs.conn)
 		if err != nil {
 			return nil, fmt.Errorf("read handshake: %w", err)
 		}
@@ -122,19 +213,25 @@ func (hs *handshakeState) run() (*Conn, error) {
 			continue
 		}
 
+		if rec.typ == recordTypeAlert {
+			if err := alertError(rec.data); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
 		if rec.typ != recordTypeApplicationData {
 			return nil, fmt.Errorf("expected encrypted record, got type %d", rec.typ)
 		}
 
-		// Decrypt
 		plaintext, innerType, err := serverHSER.decrypt(rec.data)
 		if err != nil {
 			return nil, fmt.Errorf("decrypt hs record (suite=0x%04x dheLen=%d recLen=%d): %w", hs.suite, len(dhe), len(rec.data), err)
 		}
 
 		if innerType == recordTypeAlert {
-			if len(plaintext) >= 2 && plaintext[0] == alertLevelFatal {
-				return nil, fmt.Errorf("server alert: %d", plaintext[1])
+			if err := alertError(plaintext); err != nil {
+				return nil, err
 			}
 			continue
 		}
@@ -143,76 +240,99 @@ func (hs *handshakeState) run() (*Conn, error) {
 			return nil, fmt.Errorf("expected handshake inner type, got %d", innerType)
 		}
 
-		// Process handshake messages - may contain multiple messages
-		remaining := plaintext
-		for len(remaining) >= 4 {
-			msgType := remaining[0]
-			msgLen := int(remaining[1])<<16 | int(remaining[2])<<8 | int(remaining[3])
-			if 4+msgLen > len(remaining) {
-				return nil, fmt.Errorf("truncated handshake message type %d", msgType)
-			}
-			msg := remaining[:4+msgLen]
-			remaining = remaining[4+msgLen:]
+		if err := hr.add(plaintext); err != nil {
+			return nil, err
+		}
 
-			switch msgType {
+		for !finished {
+			msg, err := hr.next()
+			if err != nil {
+				return nil, err
+			}
+			if msg == nil {
+				break
+			}
+			body := msg[4:]
+
+			switch msg[0] {
 			case handshakeTypeEncryptedExtensions:
 				// In TLS 1.3 ALPN is delivered here, not in ServerHello.
 				// parseServerHello leaves negotiatedALPN empty for 1.3, so
 				// extracting it now is what lets the caller route h1-only
 				// servers to the HTTP/1.1 transport instead of pumping the
 				// h2 preface into them.
-				if alpn := parseEncryptedExtensionsALPN(msg[4 : 4+msgLen]); alpn != "" {
+				if alpn := parseEncryptedExtensionsALPN(body); alpn != "" {
 					hs.negotiatedALPN = alpn
 				}
 				hs.transcript.Write(msg)
 
 			case handshakeTypeCertificate:
-				// Update transcript before parsing
 				hs.transcript.Write(msg)
-				certs, err := parseCertificate(msg[4 : 4+msgLen])
+				certs, err := parseCertificate(body)
 				if err != nil {
 					return nil, fmt.Errorf("parse certificate: %w", err)
 				}
 				serverCerts = certs
+				if err := hs.verifyChain(serverCerts); err != nil {
+					return nil, err
+				}
 
 			case handshakeTypeCompressedCertificate:
 				// RFC 8879: CompressedCertificate replaces Certificate in transcript
 				hs.transcript.Write(msg)
-				certs, err := parseCompressedCertificate(msg[4 : 4+msgLen])
+				certs, err := parseCompressedCertificate(body)
 				if err != nil {
 					return nil, fmt.Errorf("parse compressed certificate: %w", err)
 				}
 				serverCerts = certs
+				if err := hs.verifyChain(serverCerts); err != nil {
+					return nil, err
+				}
 
 			case handshakeTypeCertificateVerify:
-				// Update transcript with this message
+				// RFC 8446 §4.4.3: the signature covers the transcript up to
+				// and including Certificate, so the hash must be taken before
+				// this message is folded in.
+				if !hs.skipVerify {
+					if len(serverCerts) == 0 {
+						return nil, fmt.Errorf("certificate_verify before certificate")
+					}
+					if err := verifyCertificateVerify(body, serverCerts[0], hs.transcript.Sum(nil)); err != nil {
+						return nil, fmt.Errorf("certificate_verify: %w", err)
+					}
+				}
 				hs.transcript.Write(msg)
+				sawCertVerify = true
 
 			case handshakeTypeFinished:
 				// DO NOT update transcript yet - verify first
 				finishedKey := hs.ks.finishedKey(hs.ks.serverHSTraffic)
 				expectedMAC := computeFinishedMAC(hs.ks.h, finishedKey, hs.transcript.Sum(nil))
-				receivedMAC := msg[4 : 4+msgLen]
-				if !bytes.Equal(expectedMAC, receivedMAC) {
+				if !hmac.Equal(expectedMAC, body) {
 					return nil, fmt.Errorf("server finished MAC mismatch")
 				}
-				serverFinishedMAC = receivedMAC
-				_ = serverFinishedMAC
 				// Now update transcript
+				hs.transcript.Write(msg)
+				finished = true
+
+			default:
+				// Unknown or unhandled messages still belong in the transcript.
+				// Dropping one would desynchronise the Finished MAC and turn a
+				// benign extension into a handshake failure.
 				hs.transcript.Write(msg)
 			}
 		}
-
-		// Check if we received Finished
-		if serverFinishedMAC != nil {
-			break
-		}
 	}
 
-	// Verify server certificate
-	if !hs.skipVerify && len(serverCerts) > 0 {
-		if err := verifyCertificate(serverCerts, hs.serverName, hs.rootCAs); err != nil {
-			return nil, fmt.Errorf("certificate verify: %w", err)
+	// A chain that never arrived, or one that arrived without a matching
+	// CertificateVerify, means the peer never proved it holds the private key.
+	// Neither may be treated as "nothing to check".
+	if !hs.skipVerify {
+		if len(serverCerts) == 0 {
+			return nil, fmt.Errorf("server sent no certificate")
+		}
+		if !sawCertVerify {
+			return nil, fmt.Errorf("server sent no certificate_verify")
 		}
 	}
 
@@ -265,33 +385,89 @@ func (hs *handshakeState) run() (*Conn, error) {
 	}
 
 	return &Conn{
-		Conn:           hs.conn,
-		serverName:     hs.serverName,
-		negotiatedALPN: hs.negotiatedALPN,
-		serverReader:   newEncryptedRecord(serverAppAEAD, serverAppIV),
-		clientWriter:   newEncryptedRecord(clientAppAEAD, clientAppIV),
+		Conn:            hs.conn,
+		serverName:      hs.serverName,
+		negotiatedALPN:  hs.negotiatedALPN,
+		suite:           hs.suite,
+		peerCerts:       serverCerts,
+		ks:              hs.ks,
+		serverAppSecret: hs.ks.serverAppTraffic,
+		clientAppSecret: hs.ks.clientAppTraffic,
+		serverReader:    newEncryptedRecord(serverAppAEAD, serverAppIV),
+		clientWriter:    newEncryptedRecord(clientAppAEAD, clientAppIV),
 	}, nil
 }
 
+// verifyChain validates the presented chain against the configured roots and
+// the requested server name.
+func (hs *handshakeState) verifyChain(certs []*x509.Certificate) error {
+	if hs.skipVerify {
+		return nil
+	}
+	if err := verifyCertificate(certs, hs.serverName, hs.rootCAs); err != nil {
+		return fmt.Errorf("certificate verify: %w", err)
+	}
+	return nil
+}
+
+// forEachExtension walks a TLS extension block, calling fn for each entry.
+// Every length in the block is attacker-controlled, so an overrun returns an
+// error instead of slicing past the end.
+func forEachExtension(exts []byte, fn func(extType uint16, extData []byte) error) error {
+	for len(exts) > 0 {
+		if len(exts) < 4 {
+			return fmt.Errorf("trailing %d bytes in extension block", len(exts))
+		}
+		extType := binary.BigEndian.Uint16(exts[0:2])
+		extLen := int(binary.BigEndian.Uint16(exts[2:4]))
+		exts = exts[4:]
+		if extLen > len(exts) {
+			return fmt.Errorf("extension 0x%04x claims %d bytes, %d remain", extType, extLen, len(exts))
+		}
+		if err := fn(extType, exts[:extLen]); err != nil {
+			return err
+		}
+		exts = exts[extLen:]
+	}
+	return nil
+}
+
 // parseServerHello parses a ServerHello message and returns the cipher suite,
-// DHE shared secret (X25519 or X25519MLKEM768), the raw message bytes, and negotiated ALPN.
-func (hs *handshakeState) parseServerHello(data []byte) (suite uint16, dhe []byte, rawMsg []byte, alpn string, err error) {
+// the DHE shared secret (X25519, P-256 or X25519MLKEM768) and the negotiated
+// ALPN. data must be one complete handshake message including its header.
+func (hs *handshakeState) parseServerHello(data []byte) (suite uint16, dhe []byte, alpn string, err error) {
+	fail := func(format string, args ...any) (uint16, []byte, string, error) {
+		return 0, nil, "", fmt.Errorf(format, args...)
+	}
+
 	if len(data) < 4 {
-		return 0, nil, nil, "", fmt.Errorf("server hello too short")
+		return fail("server hello too short")
 	}
 
 	msgType := data[0]
 	msgLen := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
 
 	if msgType != handshakeTypeServerHello {
-		return 0, nil, nil, "", fmt.Errorf("expected ServerHello (2), got %d", msgType)
+		return fail("expected ServerHello (2), got %d", msgType)
+	}
+	if 4+msgLen > len(data) {
+		return fail("server hello claims %d bytes, %d available", msgLen, len(data)-4)
 	}
 
-	rawMsg = data[:4+msgLen]
 	body := data[4 : 4+msgLen]
 
 	if len(body) < 2+32+1 {
-		return 0, nil, nil, "", fmt.Errorf("server hello body too short")
+		return fail("server hello body too short")
+	}
+
+	// A HelloRetryRequest is a ServerHello carrying this fixed random. Its
+	// key_share holds a bare 2-byte group id instead of a key, so parsing it as
+	// an ordinary ServerHello reads past the end of the message. We do not
+	// retry: both profiles offer the key shares the browsers they emulate
+	// offer, so a retry request means the server wants a group we deliberately
+	// do not advertise, and answering it would change the fingerprint anyway.
+	if bytes.Equal(body[2:34], helloRetryRequestRandom) {
+		return fail("server sent HelloRetryRequest: no offered key share was acceptable")
 	}
 
 	// Skip legacy version (2) + random (32)
@@ -301,89 +477,71 @@ func (hs *handshakeState) parseServerHello(data []byte) (suite uint16, dhe []byt
 	sessionIDLen := int(body[offset])
 	offset += 1 + sessionIDLen
 
-	if offset+2 > len(body) {
-		return 0, nil, nil, "", fmt.Errorf("truncated server hello")
+	// Cipher suite (2) + compression method (1)
+	if offset+3 > len(body) {
+		return fail("truncated server hello")
 	}
-
-	// Cipher suite
 	suite = binary.BigEndian.Uint16(body[offset:])
 	offset += 2
+	offset++
 
-	// Compression method (skip)
-	offset += 1
+	switch suite {
+	case cipherTLS_AES_128_GCM_SHA256, cipherTLS_AES_256_GCM_SHA384, cipherTLS_CHACHA20_POLY1305_SHA256:
+	default:
+		return fail("server selected unsupported cipher suite 0x%04x", suite)
+	}
 
-	// Extensions
+	// Extensions. TLS 1.3 is signalled by supported_versions, so a ServerHello
+	// without extensions is by definition not a 1.3 handshake.
 	if offset+2 > len(body) {
-		return suite, nil, rawMsg, "", nil
+		return fail("server hello has no extensions (not TLS 1.3)")
 	}
 	extsLen := int(binary.BigEndian.Uint16(body[offset:]))
 	offset += 2
+	if offset+extsLen > len(body) {
+		return fail("server hello extensions claim %d bytes, %d remain", extsLen, len(body)-offset)
+	}
 	exts := body[offset : offset+extsLen]
 
-	// Check if TLS 1.3 via supported_versions extension
-	isTLS13 := false
-	eOffset := 0
-	for eOffset+4 <= len(exts) {
-		extType := binary.BigEndian.Uint16(exts[eOffset:])
-		extLen := int(binary.BigEndian.Uint16(exts[eOffset+2:]))
-		eOffset += 4
-		extData := exts[eOffset : eOffset+extLen]
-		eOffset += extLen
-
+	var (
+		isTLS13      bool
+		keyShareData []byte
+	)
+	if err := forEachExtension(exts, func(extType uint16, extData []byte) error {
 		switch extType {
 		case extSupportedVersions:
-			if len(extData) == 2 {
-				ver := binary.BigEndian.Uint16(extData)
-				if ver == versionTLS13 {
-					isTLS13 = true
-				}
+			if len(extData) == 2 && binary.BigEndian.Uint16(extData) == versionTLS13 {
+				isTLS13 = true
 			}
-
 		case extKeyShare:
-			if !isTLS13 {
-				// Parse after we confirm TLS 1.3, re-parse below
-				break
-			}
-			// Falls through if already TLS 1.3
-		}
-	}
-
-	if !isTLS13 {
-		return 0, nil, nil, "", fmt.Errorf("server did not negotiate TLS 1.3 (falling back not supported)")
-	}
-
-	// Re-parse extensions to get key_share
-	eOffset = 0
-	for eOffset+4 <= len(exts) {
-		extType := binary.BigEndian.Uint16(exts[eOffset:])
-		extLen := int(binary.BigEndian.Uint16(exts[eOffset+2:]))
-		eOffset += 4
-		extData := exts[eOffset : eOffset+extLen]
-		eOffset += extLen
-
-		switch extType {
-		case extKeyShare:
-			dhe, err = hs.processServerKeyShare(extData)
-			if err != nil {
-				return 0, nil, nil, "", fmt.Errorf("key share: %w", err)
-			}
-
+			keyShareData = extData
 		case extALPN:
-			if len(extData) >= 4 {
-				// protocol_name_list length (2) + protocol_length (1) + protocol
+			// protocol_name_list length (2) + protocol_length (1) + protocol
+			if len(extData) >= 3 {
 				protoLen := int(extData[2])
 				if 3+protoLen <= len(extData) {
 					alpn = string(extData[3 : 3+protoLen])
 				}
 			}
 		}
+		return nil
+	}); err != nil {
+		return fail("server hello extensions: %w", err)
 	}
 
-	if dhe == nil {
-		return 0, nil, nil, "", fmt.Errorf("no key_share in ServerHello")
+	if !isTLS13 {
+		return fail("server did not negotiate TLS 1.3 (falling back not supported)")
+	}
+	if keyShareData == nil {
+		return fail("no key_share in ServerHello")
 	}
 
-	return suite, dhe, rawMsg, alpn, nil
+	dhe, err = hs.processServerKeyShare(keyShareData)
+	if err != nil {
+		return fail("key share: %w", err)
+	}
+
+	return suite, dhe, alpn, nil
 }
 
 // processServerKeyShare computes DHE shared secret from server's key share.
@@ -394,6 +552,9 @@ func (hs *handshakeState) processServerKeyShare(data []byte) ([]byte, error) {
 
 	group := binary.BigEndian.Uint16(data[0:])
 	keyLen := int(binary.BigEndian.Uint16(data[2:]))
+	if 4+keyLen > len(data) {
+		return nil, fmt.Errorf("key_share claims %d bytes, %d remain", keyLen, len(data)-4)
+	}
 	keyData := data[4 : 4+keyLen]
 
 	switch group {
@@ -412,8 +573,9 @@ func (hs *handshakeState) processServerKeyShare(data []byte) ([]byte, error) {
 	case groupX25519MLKEM768:
 		// X25519MLKEM768: server sends ML-KEM-768 ciphertext (1088 bytes) || X25519 public key (32 bytes)
 		const mlkemCTSize = mlkem.CiphertextSize // 1088 bytes
-		if len(keyData) < mlkemCTSize+32 {
-			return nil, fmt.Errorf("x25519mlkem768 key data too short: %d", len(keyData))
+		// Exact, not minimum: DecapsulateTo panics on a wrong-sized ciphertext.
+		if len(keyData) != mlkemCTSize+32 {
+			return nil, fmt.Errorf("x25519mlkem768 key share is %d bytes, want %d", len(keyData), mlkemCTSize+32)
 		}
 
 		mlkemCT := keyData[:mlkemCTSize]
@@ -452,6 +614,127 @@ func (hs *handshakeState) processServerKeyShare(data []byte) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unsupported server key share group: 0x%04x", group)
 	}
+}
+
+// serverSignatureContext is the context string RFC 8446 §4.4.3 mixes into the
+// CertificateVerify signature so a server signature can never be replayed as a
+// client one.
+const serverSignatureContext = "TLS 1.3, server CertificateVerify"
+
+// certificateVerifyPayload builds the octet string the server signed: 64 space
+// characters, the context string, a zero separator, then the transcript hash.
+func certificateVerifyPayload(transcriptHash []byte) []byte {
+	payload := make([]byte, 0, 64+len(serverSignatureContext)+1+len(transcriptHash))
+	for i := 0; i < 64; i++ {
+		payload = append(payload, 0x20)
+	}
+	payload = append(payload, serverSignatureContext...)
+	payload = append(payload, 0x00)
+	payload = append(payload, transcriptHash...)
+	return payload
+}
+
+// verifyCertificateVerify checks that the peer holds the private key for the
+// certificate it presented (RFC 8446 §4.4.3). transcriptHash must cover every
+// handshake message up to and including Certificate.
+//
+// Skipping this check makes the rest of the chain of trust decorative. A
+// server's certificate chain is public information, so an attacker in path can
+// replay a valid chain for the requested name, run its own ECDHE, and derive
+// Finished keys that match — chain validation and hostname matching both still
+// pass. This signature is the only step in the handshake that cannot be
+// produced without the private key.
+func verifyCertificateVerify(body []byte, cert *x509.Certificate, transcriptHash []byte) error {
+	if len(body) < 4 {
+		return fmt.Errorf("message too short")
+	}
+	sigAlg := binary.BigEndian.Uint16(body[0:2])
+	sigLen := int(binary.BigEndian.Uint16(body[2:4]))
+	if 4+sigLen > len(body) {
+		return fmt.Errorf("signature claims %d bytes, %d remain", sigLen, len(body)-4)
+	}
+	sig := body[4 : 4+sigLen]
+	payload := certificateVerifyPayload(transcriptHash)
+
+	switch sigAlg {
+	case sigEd25519:
+		pub, ok := cert.PublicKey.(ed25519.PublicKey)
+		if !ok {
+			return fmt.Errorf("ed25519 scheme with %T certificate key", cert.PublicKey)
+		}
+		// Ed25519 signs the payload directly; there is no pre-hash.
+		if !ed25519.Verify(pub, payload, sig) {
+			return fmt.Errorf("ed25519 signature mismatch")
+		}
+		return nil
+
+	case sigECDSAP256SHA256, sigECDSAP384SHA384, sigECDSAP521SHA512:
+		pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
+		if !ok {
+			return fmt.Errorf("ecdsa scheme with %T certificate key", cert.PublicKey)
+		}
+		curve, h := ecdsaSchemeParams(sigAlg)
+		// RFC 8446 §4.2.3 binds each ECDSA scheme to exactly one curve.
+		// Accepting a mismatch would let a P-256 key be verified under the
+		// P-384 code point.
+		if pub.Curve != curve {
+			return fmt.Errorf("ecdsa key on %s used with scheme 0x%04x", pub.Curve.Params().Name, sigAlg)
+		}
+		if !ecdsa.VerifyASN1(pub, hashPayload(h, payload), sig) {
+			return fmt.Errorf("ecdsa signature mismatch")
+		}
+		return nil
+
+	case sigRSAPSSRSAeSHA256, sigRSAPSSRSAeSHA384, sigRSAPSSRSAeSHA512,
+		sigRSAPSSPSSSHA256, sigRSAPSSPSSSHA384, sigRSAPSSPSSSHA512:
+		pub, ok := cert.PublicKey.(*rsa.PublicKey)
+		if !ok {
+			return fmt.Errorf("rsa-pss scheme with %T certificate key", cert.PublicKey)
+		}
+		h := rsaPSSSchemeHash(sigAlg)
+		opts := &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: h}
+		if err := rsa.VerifyPSS(pub, h, hashPayload(h, payload), sig, opts); err != nil {
+			return fmt.Errorf("rsa-pss signature mismatch: %w", err)
+		}
+		return nil
+
+	default:
+		// Fail closed. RSASSA-PKCS1-v1_5 is excluded on purpose (§4.4.3
+		// forbids it here), and the ML-DSA code points the Chrome profile
+		// advertises have no verifier available, so a server picking one gets
+		// a rejected handshake rather than an unchecked signature.
+		return fmt.Errorf("unsupported signature algorithm 0x%04x", sigAlg)
+	}
+}
+
+func ecdsaSchemeParams(sigAlg uint16) (elliptic.Curve, crypto.Hash) {
+	switch sigAlg {
+	case sigECDSAP384SHA384:
+		return elliptic.P384(), crypto.SHA384
+	case sigECDSAP521SHA512:
+		return elliptic.P521(), crypto.SHA512
+	default:
+		return elliptic.P256(), crypto.SHA256
+	}
+}
+
+func rsaPSSSchemeHash(sigAlg uint16) crypto.Hash {
+	switch sigAlg {
+	case sigRSAPSSRSAeSHA384, sigRSAPSSPSSSHA384:
+		return crypto.SHA384
+	case sigRSAPSSRSAeSHA512, sigRSAPSSPSSSHA512:
+		return crypto.SHA512
+	default:
+		return crypto.SHA256
+	}
+}
+
+// hashPayload digests payload with h. Every hash reached here is registered by
+// the crypto/sha256 and crypto/sha512 imports in crypto.go.
+func hashPayload(h crypto.Hash, payload []byte) []byte {
+	hh := h.New()
+	hh.Write(payload)
+	return hh.Sum(nil)
 }
 
 // parseCertificate parses a TLS Certificate message body (after the handshake header).
@@ -513,8 +796,8 @@ func verifyCertificate(certs []*x509.Certificate, serverName string, rootCAs *x5
 
 	leaf := certs[0]
 	opts := x509.VerifyOptions{
-		DNSName:   serverName,
-		Roots:     rootCAs,
+		DNSName:     serverName,
+		Roots:       rootCAs,
 		CurrentTime: time.Now(),
 	}
 
@@ -543,6 +826,11 @@ func parseCompressedCertificate(data []byte) ([]*x509.Certificate, error) {
 	if 8+compressedLen > len(data) {
 		return nil, fmt.Errorf("compressed data truncated")
 	}
+	// The declared size is attacker-controlled and drives the decompression
+	// bound, so cap it before allocating anything against it.
+	if uncompressedLen > maxHandshakeMessage {
+		return nil, fmt.Errorf("declared certificate size %d exceeds %d", uncompressedLen, maxHandshakeMessage)
+	}
 
 	compressed := data[8 : 8+compressedLen]
 
@@ -562,6 +850,10 @@ func parseCompressedCertificate(data []byte) ([]*x509.Certificate, error) {
 
 	if err != nil {
 		return nil, fmt.Errorf("decompress (algo=%d): %w", algorithm, err)
+	}
+	// RFC 8879 §4: the decompressed length must equal the declared one.
+	if len(decompressed) != uncompressedLen {
+		return nil, fmt.Errorf("decompressed to %d bytes, header declared %d", len(decompressed), uncompressedLen)
 	}
 
 	return parseCertificate(decompressed)
@@ -600,24 +892,16 @@ func parseEncryptedExtensionsALPN(body []byte) string {
 		return ""
 	}
 	exts = exts[:extsLen]
-	for len(exts) >= 4 {
-		extType := binary.BigEndian.Uint16(exts[0:2])
-		extLen := int(binary.BigEndian.Uint16(exts[2:4]))
-		exts = exts[4:]
-		if extLen > len(exts) {
-			return ""
-		}
-		extData := exts[:extLen]
-		exts = exts[extLen:]
 
-		if extType == extALPN && len(extData) >= 3 {
+	var alpn string
+	_ = forEachExtension(exts, func(extType uint16, extData []byte) error {
+		if extType == extALPN && alpn == "" && len(extData) >= 3 {
 			protoLen := int(extData[2])
 			if 3+protoLen <= len(extData) {
-				return string(extData[3 : 3+protoLen])
+				alpn = string(extData[3 : 3+protoLen])
 			}
 		}
-	}
-	return ""
+		return nil
+	})
+	return alpn
 }
-
-
