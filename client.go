@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -172,12 +173,10 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 			lastResp = nil
 		}
 		if attempt > 0 {
-			// Exponential backoff: baseDelay * 2^(attempt-1)
-			delay := c.config.retryBaseDelay * (1 << (attempt - 1))
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(delay):
+			case <-time.After(retryDelay(c.config.retryBaseDelay, attempt)):
 			}
 		}
 
@@ -214,8 +213,12 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			lastErr = err
-			// Network error - retry if we have attempts left
-			if attempt < maxAttempts-1 {
+			// Retry network errors only when replaying is safe. A transport
+			// error is ambiguous: the server may have received and processed
+			// the request before the connection broke, so resending a POST or
+			// PATCH can duplicate an order or a payment. RFC 9110 §9.2.2 lists
+			// the methods for which a repeat is defined to be harmless.
+			if attempt < maxAttempts-1 && isIdempotent(method) {
 				continue
 			}
 			return nil, lastErr
@@ -252,6 +255,49 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 		return lastResp, nil
 	}
 	return nil, lastErr
+}
+
+// maxRetryDelay caps the exponential backoff. Without a ceiling the doubling
+// overflows int64 at high retry counts and wraps negative, and time.After of a
+// negative duration fires immediately — turning the backoff into a hot loop
+// exactly when the server is least able to absorb one.
+const maxRetryDelay = 30 * time.Second
+
+// isIdempotent reports whether replaying a request with this method is defined
+// to be harmless (RFC 9110 §9.2.2).
+func isIdempotent(method string) bool {
+	switch strings.ToUpper(method) {
+	case "", http.MethodGet, http.MethodHead, http.MethodPut,
+		http.MethodDelete, http.MethodOptions, http.MethodTrace:
+		return true
+	}
+	return false
+}
+
+// retryDelay returns the backoff before the given attempt: exponential from
+// base, capped at maxRetryDelay, with full jitter.
+//
+// Jitter matters as much as the cap here. Every worker that failed in the same
+// instant would otherwise retry in the same instant, so a blip turns into a
+// synchronised stampede that keeps the origin down.
+func retryDelay(base time.Duration, attempt int) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	d := base
+	for i := 1; i < attempt; i++ {
+		if d >= maxRetryDelay/2 {
+			d = maxRetryDelay
+			break
+		}
+		d *= 2
+	}
+	if d > maxRetryDelay || d <= 0 {
+		d = maxRetryDelay
+	}
+	// Uniform in [d/2, d].
+	half := d / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
 }
 
 // shouldRetryStatus checks if an HTTP status code should trigger a retry.
@@ -396,7 +442,16 @@ func (c *Client) GetHTTPClient() *http.Client {
 }
 
 // Flood sends n concurrent requests to the given URL and returns all responses.
+//
+// The caller owns every non-nil response and must Close it. Each one holds an
+// open HTTP/2 stream until then, and abandoning it makes the transport emit
+// RST_STREAM, which Cloudflare and Akamai score as an abusive client. For a
+// throughput run where the bodies are not needed, prefer Pipeline.Spray, which
+// drains them for you.
 func (c *Client) Flood(ctx context.Context, method, rawURL string, n, concurrency int) ([]*Response, []error) {
+	if n <= 0 {
+		return nil, nil
+	}
 	if concurrency <= 0 {
 		concurrency = 100
 	}
@@ -411,19 +466,23 @@ func (c *Client) Flood(ctx context.Context, method, rawURL string, n, concurrenc
 	sem := make(chan struct{}, concurrency)
 
 	for i := 0; i < n; i++ {
-		wg.Add(1)
-		sem <- struct{}{}
+		// Acquiring the slot has to be cancellable. Blocking on a bare send
+		// meant a cancelled context could not stop the loop until in-flight
+		// requests finished releasing slots.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			for j := i; j < n; j++ {
+				errors[j] = ctx.Err()
+			}
+			wg.Wait()
+			return responses, errors
+		}
 
+		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-
-			select {
-			case <-ctx.Done():
-				errors[idx] = ctx.Err()
-				return
-			default:
-			}
 
 			resp, err := c.DoWithContext(ctx, method, rawURL, nil, nil)
 			responses[idx] = resp

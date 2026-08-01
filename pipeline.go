@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,10 +20,10 @@ type PipelineResult struct {
 
 // PipelineStats holds real-time statistics for a pipeline.
 type PipelineStats struct {
-	TotalSent   atomic.Int64
-	TotalOK     atomic.Int64
-	TotalErr    atomic.Int64
-	TotalBytes  atomic.Int64
+	TotalSent  atomic.Int64
+	TotalOK    atomic.Int64
+	TotalErr   atomic.Int64
+	TotalBytes atomic.Int64
 }
 
 // Pipeline provides maximum throughput request sending with a fixed worker pool.
@@ -37,9 +38,15 @@ type Pipeline struct {
 	// stopCh is closed by Close() to signal senders to abandon their writes
 	// to jobCh. Senders select on stopCh alongside jobCh so a concurrent
 	// Close() can never cause a "send on closed channel" panic.
-	stopCh  chan struct{}
-	Stats   PipelineStats
-	closed  atomic.Bool
+	stopCh chan struct{}
+	Stats  PipelineStats
+	closed atomic.Bool
+
+	// inFlight counts submitters that have passed the closed check and may
+	// still be writing to jobCh. Close waits for it to reach zero before
+	// failing queued jobs, so no job can be enqueued after that sweep and be
+	// left with nobody to answer it.
+	inFlight atomic.Int64
 
 	// OnResult is called for every completed request (both success and error).
 	// When set, FireAndForget will invoke this callback instead of discarding results.
@@ -69,6 +76,13 @@ type pipelineJob struct {
 	body    []byte
 	headers map[string]string
 	result  chan<- *PipelineResult
+
+	// blockResult makes the worker wait for the result to be received rather
+	// than dropping it when the channel is full. Send gives every job its own
+	// single-slot channel so the non-blocking send always lands, but Spray
+	// shares one bounded channel across every request, where a dropped result
+	// would silently corrupt its totals.
+	blockResult bool
 }
 
 // PipelineConfig tunes pipeline internals beyond worker count.
@@ -200,9 +214,10 @@ func (p *Pipeline) drainWorker() {
 			continue
 		}
 		bufPtr := drainBufPool.Get().(*[]byte)
-		io.CopyBuffer(io.Discard, resp.Body, *bufPtr) //nolint:errcheck
+		n, _ := io.CopyBuffer(io.Discard, resp.Body, *bufPtr)
 		drainBufPool.Put(bufPtr)
 		resp.Body.Close()
+		p.Stats.TotalBytes.Add(n)
 	}
 }
 
@@ -219,8 +234,9 @@ func (p *Pipeline) asyncDrain(resp *Response) {
 		return
 	}
 	if p.closed.Load() {
-		io.Copy(io.Discard, resp.Response.Body) //nolint:errcheck
+		n, _ := io.Copy(io.Discard, resp.Response.Body)
 		resp.Response.Body.Close()
+		p.Stats.TotalBytes.Add(n)
 		return
 	}
 	p.drainCh <- resp.Response
@@ -273,9 +289,22 @@ func (p *Pipeline) worker() {
 			result.Err = err
 			result.Latency = latency
 
-			select {
-			case job.result <- result:
-			default:
+			delivered := false
+			if job.blockResult {
+				select {
+				case job.result <- result:
+					delivered = true
+				case <-p.stopCh:
+				case <-job.ctx.Done():
+				}
+			} else {
+				select {
+				case job.result <- result:
+					delivered = true
+				default:
+				}
+			}
+			if !delivered {
 				if resp != nil {
 					p.asyncDrain(resp)
 				}
@@ -303,6 +332,7 @@ func (p *Pipeline) worker() {
 		job.body = nil
 		job.headers = nil
 		job.result = nil
+		job.blockResult = false
 		p.jobPool.Put(job)
 	}
 }
@@ -311,6 +341,9 @@ func (p *Pipeline) worker() {
 // Respects context cancellation to avoid blocking when the pipeline is full.
 func (p *Pipeline) Send(ctx context.Context, method, url string, body []byte, headers map[string]string) <-chan *PipelineResult {
 	ch := make(chan *PipelineResult, 1)
+
+	p.inFlight.Add(1)
+	defer p.inFlight.Add(-1)
 
 	if p.closed.Load() {
 		ch <- &PipelineResult{Err: ErrPipelineClosed}
@@ -342,6 +375,9 @@ func (p *Pipeline) Send(ctx context.Context, method, url string, body []byte, he
 // Responses are automatically drained and closed.
 // This is the fastest mode for maximum RPS.
 func (p *Pipeline) FireAndForget(ctx context.Context, method, url string, body []byte, headers map[string]string) {
+	p.inFlight.Add(1)
+	defer p.inFlight.Add(-1)
+
 	if p.closed.Load() {
 		return
 	}
@@ -364,116 +400,151 @@ func (p *Pipeline) FireAndForget(ctx context.Context, method, url string, body [
 }
 
 // Spray sends n requests as fast as possible and returns aggregate results.
-// Uses a fixed collector pool instead of spawning n goroutines to avoid
-// GC pressure at high request counts.
+//
+// Requests are submitted from a background goroutine and results are collected
+// as they arrive, over a single bounded channel. The previous form allocated
+// one result channel per request plus an n-entry slice before collecting
+// anything, so the Spray(ctx, ..., 100000) from the README paid 100k channel
+// allocations up front and a million-request run paid a million — all live at
+// once. Memory now scales with the worker count, not with n.
+//
+// Response bodies are handed to the pipeline's drain pool rather than closed
+// inline, so a slow body cannot stall the accounting loop.
 func (p *Pipeline) Spray(ctx context.Context, method, url string, n int) *SprayResult {
 	sr := &SprayResult{
 		Total:      n,
 		StartTime:  time.Now(),
 		MinLatency: time.Duration(1<<63 - 1),
 	}
-
-	var okCount, errCount atomic.Int64
-	var totalLatencyNs atomic.Int64
-	var minLatencyNs, maxLatencyNs atomic.Int64
-	minLatencyNs.Store(int64(sr.MinLatency))
-
-	// Use a bounded collector pool instead of n goroutines.
-	// collectors = min(n, workers) ensures we don't create more collectors than needed.
-	collectors := p.workers
-	if collectors > n {
-		collectors = n
+	if n <= 0 {
+		sr.EndTime = time.Now()
+		sr.Total = 0
+		sr.MinLatency = 0
+		return sr
 	}
 
-	// Result channels fed by pipeline workers, consumed by collectors
-	resultChs := make([]<-chan *PipelineResult, 0, n)
-
-	// Submit all jobs
-	submitted := 0
-	for i := 0; i < n; i++ {
-		select {
-		case <-ctx.Done():
-			sr.Total = i
-			goto collect
-		default:
-		}
-		resultChs = append(resultChs, p.Send(ctx, method, url, nil, nil))
-		submitted++
+	bufSize := p.workers * 2
+	if bufSize > n {
+		bufSize = n
 	}
-
-collect:
-	// Collect results using a fixed pool of collector goroutines
-	var wg sync.WaitGroup
-	chunkSize := (submitted + collectors - 1) / collectors
-	if chunkSize < 1 {
-		chunkSize = 1
+	if bufSize < 1 {
+		bufSize = 1
 	}
+	results := make(chan *PipelineResult, bufSize)
+	countCh := make(chan int, 1)
 
-	for start := 0; start < submitted; start += chunkSize {
-		end := start + chunkSize
-		if end > submitted {
-			end = submitted
-		}
-		chunk := resultChs[start:end]
+	go p.spraySubmit(ctx, method, url, n, results, countCh)
 
-		wg.Add(1)
-		go func(channels []<-chan *PipelineResult) {
-			defer wg.Done()
-			for _, ch := range channels {
-				result := <-ch
-				if result.Err != nil {
-					errCount.Add(1)
-				} else {
-					okCount.Add(1)
-					if result.Response != nil {
-						result.Response.Close()
-					}
-				}
+	var (
+		received                     int
+		submitted                    = -1
+		okCount, errCount            int
+		totalLatency, minLat, maxLat time.Duration
+		observed                     bool
+	)
 
-				latNs := int64(result.Latency)
-				totalLatencyNs.Add(latNs)
-
-				// Update min latency (CAS loop)
-				for {
-					cur := minLatencyNs.Load()
-					if latNs >= cur || minLatencyNs.CompareAndSwap(cur, latNs) {
-						break
-					}
-				}
-				// Update max latency (CAS loop)
-				for {
-					cur := maxLatencyNs.Load()
-					if latNs <= cur || maxLatencyNs.CompareAndSwap(cur, latNs) {
-						break
-					}
-				}
-
-				// Return result to pool
-				result.Response = nil
-				result.Err = nil
-				p.resultPool.Put(result)
+	collect := func(result *PipelineResult) {
+		received++
+		if result.Err != nil {
+			errCount++
+		} else {
+			okCount++
+			if result.Response != nil {
+				p.asyncDrain(result.Response)
 			}
-		}(chunk)
+		}
+		lat := result.Latency
+		totalLatency += lat
+		if !observed || lat < minLat {
+			minLat = lat
+		}
+		if !observed || lat > maxLat {
+			maxLat = lat
+		}
+		observed = true
+
+		result.Response = nil
+		result.Err = nil
+		p.resultPool.Put(result)
 	}
 
-	wg.Wait()
+loop:
+	for submitted < 0 || received < submitted {
+		select {
+		case c := <-countCh:
+			submitted = c
+			sr.Total = c
+			countCh = nil // a nil channel blocks forever, so stop selecting it
+		case result := <-results:
+			collect(result)
+		case <-p.stopCh:
+			// Pipeline shut down mid-run; report what completed.
+			break loop
+		}
+	}
+
+	// Anything already buffered still owns a response body.
+	for {
+		select {
+		case result := <-results:
+			collect(result)
+		default:
+			goto done
+		}
+	}
+
+done:
 	sr.EndTime = time.Now()
-	sr.Success = int(okCount.Load())
-	sr.Failed = int(errCount.Load())
+	sr.Success = okCount
+	sr.Failed = errCount
 	sr.Duration = sr.EndTime.Sub(sr.StartTime)
 	if sr.Duration.Seconds() > 0 {
 		sr.RPS = float64(sr.Success) / sr.Duration.Seconds()
 	}
-	total := sr.Success + sr.Failed
-	if total > 0 {
-		sr.AvgLatency = time.Duration(totalLatencyNs.Load() / int64(total))
-		sr.MinLatency = time.Duration(minLatencyNs.Load())
-		sr.MaxLatency = time.Duration(maxLatencyNs.Load())
+	if total := okCount + errCount; total > 0 {
+		sr.AvgLatency = totalLatency / time.Duration(total)
+		sr.MinLatency = minLat
+		sr.MaxLatency = maxLat
 	} else {
 		sr.MinLatency = 0
 	}
 
 	return sr
+}
+
+// spraySubmit queues n jobs that all report into results, then publishes how
+// many were actually submitted so the collector knows when it is done.
+func (p *Pipeline) spraySubmit(ctx context.Context, method, url string, n int, results chan<- *PipelineResult, countCh chan<- int) {
+	p.inFlight.Add(1)
+	defer p.inFlight.Add(-1)
+
+	submitted := 0
+	defer func() { countCh <- submitted }()
+
+	for i := 0; i < n; i++ {
+		if p.closed.Load() {
+			return
+		}
+		job := p.jobPool.Get().(*pipelineJob)
+		job.ctx = ctx
+		job.method = method
+		job.url = url
+		job.body = nil
+		job.headers = nil
+		job.result = results
+		job.blockResult = true
+
+		select {
+		case p.jobCh <- job:
+			submitted++
+		case <-ctx.Done():
+			p.jobPool.Put(job)
+			return
+		case <-p.stopCh:
+			p.jobPool.Put(job)
+			return
+		}
+	}
 }
 
 // SprayResult holds the results of a Spray operation.
@@ -494,16 +565,57 @@ type SprayResult struct {
 //
 // We close stopCh and let workers exit via select; jobCh is NOT closed
 // because a concurrent Send/FireAndForget that just passed the closed check
-// could still race a close(jobCh) and panic ("send on closed channel"). Any
-// jobs buffered in jobCh at shutdown are discarded — acceptable for a
-// fire-and-forget RPS pipeline.
+// could still race a close(jobCh) and panic ("send on closed channel").
+//
+// Jobs still queued in jobCh are answered with ErrPipelineClosed rather than
+// discarded. Dropping them silently was safe only for FireAndForget: a Send
+// caller is blocked on its result channel, and with the job thrown away
+// nothing ever writes to it, so the caller waited forever.
 func (p *Pipeline) Close() {
 	if p.closed.CompareAndSwap(false, true) {
 		close(p.stopCh)
 		p.wg.Wait()
+
+		// Wait out submitters that passed the closed check before it flipped;
+		// each is blocked in a select whose stopCh case is now ready, so this
+		// settles immediately.
+		for p.inFlight.Load() > 0 {
+			runtime.Gosched()
+		}
+		p.failQueuedJobs()
+
 		// Close drain pool after all workers are done
 		close(p.drainCh)
 		p.drainWg.Wait()
+	}
+}
+
+// failQueuedJobs answers every job left in jobCh with ErrPipelineClosed. It
+// must run only after all workers have exited and no submitter is in flight,
+// so nothing can be added behind it.
+func (p *Pipeline) failQueuedJobs() {
+	for {
+		select {
+		case job := <-p.jobCh:
+			if job.result != nil {
+				select {
+				case job.result <- &PipelineResult{Err: ErrPipelineClosed}:
+				default:
+					// Send gives each job an empty single-slot channel, so
+					// this always lands for the caller that is waiting. The
+					// fallback covers Spray's shared channel, whose collector
+					// has its own shutdown path and is not waiting on us.
+				}
+			}
+			job.ctx = nil
+			job.body = nil
+			job.headers = nil
+			job.result = nil
+			job.blockResult = false
+			p.jobPool.Put(job)
+		default:
+			return
+		}
 	}
 }
 
