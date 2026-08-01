@@ -142,7 +142,7 @@ func main() {
 	start = time.Now()
 	resp, err = client.BuildRequest().
 		Method("GET").
-		URL(targetURL + "/headers").
+		URL(targetURL+"/headers").
 		Header("X-Custom-Header", "gofire-test").
 		Header("Authorization", "Bearer test-token-12345").
 		Send()

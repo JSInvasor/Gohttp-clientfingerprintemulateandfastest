@@ -14,11 +14,11 @@ const mlkem768PubKeySize = 1184
 
 // keyMaterial holds generated key pairs.
 //
-// Safari iOS 18 only advertises an X25519 key share, but we still generate
-// ML-KEM-768 and P-256 keys so handshake.go's processServerKeyShare can
-// service a server that chooses one of those groups (defensive — never
-// reached when the ClientHello only lists X25519, but kept so a future
-// profile tweak doesn't crash the handshake decoder).
+// Both profiles advertise X25519MLKEM768 and X25519 key shares. The P-256 key
+// is generated anyway so handshake.go's processServerKeyShare can service a
+// server that picks that group (defensive — not reachable from the shares we
+// actually offer, but kept so a future profile tweak cannot turn an unexpected
+// selection into a failed handshake).
 type keyMaterial struct {
 	mlkemPub   []byte
 	mlkemPriv  *mlkem.PrivateKey

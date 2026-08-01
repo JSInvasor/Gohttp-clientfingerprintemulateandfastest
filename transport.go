@@ -24,16 +24,17 @@ import (
 )
 
 // Transport is a high-performance HTTP transport with browser fingerprint
-// emulation. Safari iOS 18 and Chrome 147 are supported.
+// emulation. Safari iOS 18 and Chrome 150 are supported.
 //
 // It emulates both TLS (JA3/JA4) and HTTP/2 (Akamai) fingerprints using a custom
 // TLS 1.3 implementation (internal/ctls) - no uTLS dependency. Everything below
 // is selected from the BrowserProfile passed to newTransport:
 //
-//   - TLS: ClientHello built at the byte level. Safari: GREASE, padding to 512
-//     bytes, X25519-only key share, zlib compress_certificate. Chrome: GREASE,
-//     per-connection extension shuffle, MLKEM768+X25519 key shares, ALPS, ECH
-//     GREASE, brotli compress_certificate.
+//   - TLS: ClientHello built at the byte level. Safari: GREASE,
+//     MLKEM768+X25519 key shares, no padding extension, zlib
+//     compress_certificate. Chrome: GREASE, per-connection extension shuffle,
+//     MLKEM768+X25519 key shares, ALPS, ECH GREASE, brotli
+//     compress_certificate.
 //   - HTTP/2 SETTINGS: Safari sends ENABLE_PUSH, MAX_CONCURRENT_STREAMS=100,
 //     INITIAL_WINDOW_SIZE=2097152, NO_RFC7540_PRIORITIES=1. Chrome sends
 //     HEADER_TABLE_SIZE=65536, ENABLE_PUSH, INITIAL_WINDOW_SIZE=6291456,
@@ -146,7 +147,7 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 
 	// Per-browser fingerprint tables.
 	switch browser {
-	case Chrome147:
+	case Chrome150:
 		t.h2Settings = Chrome146H2Settings()
 		t.headerOrder = chromeHeaderOrder
 		t.ctlsBrowser = ctls.BrowserChrome
@@ -206,7 +207,7 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 	// HTTP/2 transport with the selected browser's fingerprint.
 	if !cfg.ForceHTTP1 {
 		h2p := SafariIOS18H2Profile()
-		if browser == Chrome147 {
+		if browser == Chrome150 {
 			h2p = Chrome146H2Profile()
 		}
 

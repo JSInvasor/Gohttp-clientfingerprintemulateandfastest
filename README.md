@@ -297,6 +297,19 @@ and is stable.
 - `sec-ch-ua: "Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"`
   — both the greased brand spelling and the list order are version-bound
 
+## Performance claims
+
+The "200-300k+ RPS" figure above is a design target, not a measured result.
+There is no reproducible benchmark behind it: `benchmark_test.go` runs against a
+local `httptest` server, which measures this client's own overhead rather than
+what any real target will serve, and no hardware, concurrency level or endpoint
+is recorded for the number. Treat it as an order-of-magnitude goal and measure
+your own workload before relying on it.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
+
+`internal/http2` vendors a modified copy of `golang.org/x/net/http2` under the
+Go project's BSD-3-Clause licence; see [internal/http2/FORK.md](internal/http2/FORK.md)
+for the base version and the list of local changes.
