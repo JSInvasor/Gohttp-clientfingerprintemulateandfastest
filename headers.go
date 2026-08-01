@@ -58,17 +58,115 @@ var safariIOS18HeaderOrder = []string{
 	"Accept-Encoding",
 }
 
+// defaultNavigateAccept is the Accept header a browser sends for a top-level
+// document load. It is also clientConfig's default, which is what lets
+// fetch-mode requests distinguish "the caller left Accept alone" from "the
+// caller chose this value deliberately".
+const defaultNavigateAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+// fetchMode distinguishes a top-level navigation from a script-initiated
+// fetch/XHR.
+//
+// Browsers annotate the two very differently, and stamping every request as a
+// navigation is a bot signal on its own: no browser can produce a POST with a
+// JSON body carrying Sec-Fetch-Mode: navigate, Sec-Fetch-Dest: document and
+// Accept: text/html. That combination gives away a synthetic client no matter
+// how exact the TLS and HTTP/2 layers underneath it are.
+type fetchMode int
+
+const (
+	modeNavigate fetchMode = iota
+	modeFetch
+)
+
+// fetchModeFor infers how a browser would have issued req.
+//
+// Navigations are GET/HEAD document loads plus HTML form submissions — a real
+// form POST carries application/x-www-form-urlencoded or multipart/form-data
+// and is annotated as a navigation. Everything else (JSON bodies, PUT, PATCH,
+// DELETE, other content types) is script-initiated.
+//
+// Callers who disagree can set Sec-Fetch-Mode or Sec-Fetch-Dest themselves;
+// nothing below overwrites a header that is already present.
+func fetchModeFor(req *http.Request) fetchMode {
+	switch req.Method {
+	case "", http.MethodGet, http.MethodHead:
+		return modeNavigate
+	case http.MethodPost:
+		ct := strings.ToLower(req.Header.Get("Content-Type"))
+		if strings.HasPrefix(ct, "application/x-www-form-urlencoded") ||
+			strings.HasPrefix(ct, "multipart/form-data") {
+			return modeNavigate
+		}
+	}
+	return modeFetch
+}
+
+// acceptFor returns the Accept header for the request mode. A caller-configured
+// value always wins; only the built-in navigation default is swapped for the
+// */* that fetch and XHR send.
+func acceptFor(configured string, mode fetchMode) string {
+	if mode == modeFetch && configured == defaultNavigateAccept {
+		return "*/*"
+	}
+	return configured
+}
+
+// secFetchModeFor returns the Sec-Fetch-Mode value. A script-initiated request
+// is "same-origin" when it stays within its own origin and "cors" otherwise.
+func secFetchModeFor(req *http.Request, mode fetchMode) string {
+	if mode == modeNavigate {
+		return "navigate"
+	}
+	if secFetchSiteFor(req) == "same-origin" {
+		return "same-origin"
+	}
+	return "cors"
+}
+
+// originFor returns the Origin header value, or "" when a browser would send
+// none. Origin accompanies every request with an unsafe method and every
+// cross-origin fetch, but not a same-origin GET and not a plain navigation.
+//
+// The value is the initiating document's origin. A configured Referer is the
+// closest thing to one we have; without it the request is treated as coming
+// from the target's own origin.
+func originFor(req *http.Request, mode fetchMode) string {
+	if req.URL == nil || req.URL.Host == "" {
+		return ""
+	}
+
+	switch req.Method {
+	case "", http.MethodGet, http.MethodHead:
+		// Safe methods carry Origin only on a cross-origin fetch.
+		if mode != modeFetch {
+			return ""
+		}
+		if site := secFetchSiteFor(req); site == "same-origin" || site == "none" {
+			return ""
+		}
+	}
+
+	if ref := req.Header.Get("Referer"); ref != "" {
+		if u, err := url.Parse(ref); err == nil && u.Host != "" && u.Scheme != "" {
+			return u.Scheme + "://" + u.Host
+		}
+	}
+	return req.URL.Scheme + "://" + req.URL.Host
+}
+
 // Pre-allocated single-value slices for the fast-path header set. http.Header
 // is map[string][]string; h.Set always allocates a fresh []string{value}.
 // For our fixed-value headers we can hand the map the same backing slice
 // every call (the slice is never appended to or mutated). Saves 6-7 small
 // allocations per request on the DoWithContext path.
 var (
-	safariSecFetchDest  = []string{"document"}
-	safariUserAgent     = []string{SafariIOS18UserAgent}
-	safariSecFetchMode  = []string{"navigate"}
-	safariPriority      = []string{"u=0, i"}
-	safariAcceptEncode  = []string{"gzip, deflate, br, zstd"}
+	safariSecFetchDest      = []string{"document"}
+	safariSecFetchDestFetch = []string{"empty"}
+	safariUserAgent         = []string{SafariIOS18UserAgent}
+	safariPriority          = []string{"u=0, i"}
+	safariPriorityFetch     = []string{"u=1, i"}
+	safariAcceptEncode      = []string{"gzip, deflate, br, zstd"}
 )
 
 // applySafariHeaders sets exact Safari iOS 18 default headers on the request.
@@ -78,7 +176,7 @@ var (
 // directly with already-canonical keys. http.Header.Set canonicalizes its key
 // on every call (allocates a temp byte slice), and for a fixed set of
 // well-known headers that's ~150-200ns per request of pure waste.
-func applySafariHeaders(req *http.Request, accept, lang string) {
+func applySafariHeaders(req *http.Request, accept, lang string, mode fetchMode) {
 	h := req.Header
 	if h == nil {
 		h = make(http.Header, 10)
@@ -86,25 +184,41 @@ func applySafariHeaders(req *http.Request, accept, lang string) {
 	}
 
 	if _, ok := h["Sec-Fetch-Dest"]; !ok {
-		h["Sec-Fetch-Dest"] = safariSecFetchDest
+		if mode == modeFetch {
+			h["Sec-Fetch-Dest"] = safariSecFetchDestFetch
+		} else {
+			h["Sec-Fetch-Dest"] = safariSecFetchDest
+		}
 	}
 	if _, ok := h["User-Agent"]; !ok {
 		h["User-Agent"] = safariUserAgent
 	}
 	if _, ok := h["Accept"]; !ok {
-		h["Accept"] = []string{accept}
+		h["Accept"] = []string{acceptFor(accept, mode)}
+	}
+	if _, ok := h["Origin"]; !ok {
+		if origin := originFor(req, mode); origin != "" {
+			h["Origin"] = []string{origin}
+		}
 	}
 	if _, ok := h["Sec-Fetch-Site"]; !ok {
 		h["Sec-Fetch-Site"] = []string{secFetchSiteFor(req)}
 	}
 	if _, ok := h["Sec-Fetch-Mode"]; !ok {
-		h["Sec-Fetch-Mode"] = safariSecFetchMode
+		h["Sec-Fetch-Mode"] = []string{secFetchModeFor(req, mode)}
 	}
 	if _, ok := h["Accept-Language"]; !ok {
 		h["Accept-Language"] = []string{lang}
 	}
 	if _, ok := h["Priority"]; !ok {
-		h["Priority"] = safariPriority
+		// u=0 is reserved for the main document. The navigation value is
+		// pinned to a real iOS 26.5.2 capture; the fetch value follows RFC
+		// 9218's urgency semantics and has not been checked against a device.
+		if mode == modeFetch {
+			h["Priority"] = safariPriorityFetch
+		} else {
+			h["Priority"] = safariPriority
+		}
 	}
 	if _, ok := h["Accept-Encoding"]; !ok {
 		h["Accept-Encoding"] = safariAcceptEncode
@@ -190,7 +304,7 @@ var chromeHeaderOrder = []string{
 
 // applyChromeHeaders sets exact Chrome 150 default headers on the request.
 // Only sets headers that are not already present, preserving user overrides.
-func applyChromeHeaders(req *http.Request, accept, lang string) {
+func applyChromeHeaders(req *http.Request, accept, lang string, mode fetchMode) {
 	h := req.Header
 	if h == nil {
 		h = make(http.Header, 16)
@@ -201,27 +315,44 @@ func applyChromeHeaders(req *http.Request, accept, lang string) {
 	setIfEmpty(h, "Sec-Ch-Ua", Chrome150SecChUa)
 	setIfEmpty(h, "Sec-Ch-Ua-Mobile", "?0")
 	setIfEmpty(h, "Sec-Ch-Ua-Platform", `"Windows"`)
-	setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
+	if mode == modeNavigate {
+		// Both are navigation-only. Upgrade-Insecure-Requests advertises what
+		// the document load will accept, and Sec-Fetch-User marks a
+		// user-activated navigation; neither appears on a fetch or XHR.
+		setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
+	}
 	setIfEmpty(h, "User-Agent", Chrome150UserAgent)
-	setIfEmpty(h, "Accept", accept)
+	setIfEmpty(h, "Accept", acceptFor(accept, mode))
+	if origin := originFor(req, mode); origin != "" {
+		setIfEmpty(h, "Origin", origin)
+	}
 	setIfEmpty(h, "Sec-Fetch-Site", secFetchSiteFor(req))
-	setIfEmpty(h, "Sec-Fetch-Mode", "navigate")
-	setIfEmpty(h, "Sec-Fetch-User", "?1")
-	setIfEmpty(h, "Sec-Fetch-Dest", "document")
+	setIfEmpty(h, "Sec-Fetch-Mode", secFetchModeFor(req, mode))
+	if mode == modeNavigate {
+		setIfEmpty(h, "Sec-Fetch-User", "?1")
+		setIfEmpty(h, "Sec-Fetch-Dest", "document")
+		setIfEmpty(h, "Priority", "u=0, i")
+	} else {
+		setIfEmpty(h, "Sec-Fetch-Dest", "empty")
+		// u=0 is reserved for the main document; Chrome sends u=1 for
+		// script-initiated requests.
+		setIfEmpty(h, "Priority", "u=1, i")
+	}
 	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br, zstd")
 	setIfEmpty(h, "Accept-Language", lang)
-	setIfEmpty(h, "Priority", "u=0, i")
 
 	// NOTE: Chrome does NOT send TE, DNT, Sec-GPC, or Connection.
 }
 
-// applyBrowserHeaders applies headers for the configured browser profile.
+// applyBrowserHeaders applies headers for the configured browser profile,
+// annotated for how a browser would have issued this request.
 func applyBrowserHeaders(req *http.Request, browser BrowserProfile, accept, lang string) {
+	mode := fetchModeFor(req)
 	switch browser {
-	case Chrome147:
-		applyChromeHeaders(req, accept, lang)
+	case Chrome150:
+		applyChromeHeaders(req, accept, lang, mode)
 	default:
-		applySafariHeaders(req, accept, lang)
+		applySafariHeaders(req, accept, lang, mode)
 	}
 }
 

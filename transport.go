@@ -272,27 +272,42 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-// dialWithDNSCache returns a DialContext function with DNS caching and round-robin.
+// dialWithDNSCache returns a DialContext function with DNS caching and
+// round-robin. Only h1Transport uses it, so the returned conn carries the
+// HTTP/1.1 header-order rewriter.
 func (t *Transport) dialWithDNSCache() func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
-			return t.dialer.DialContext(ctx, network, addr)
+			conn, derr := t.dialer.DialContext(ctx, network, addr)
+			return newH1OrderConn(conn, t.headerOrder), derr
 		}
 
 		ip, err := t.dnscache.lookup(host)
 		if err != nil {
-			return t.dialer.DialContext(ctx, network, addr)
+			conn, derr := t.dialer.DialContext(ctx, network, addr)
+			return newH1OrderConn(conn, t.headerOrder), derr
 		}
 
-		return t.dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		conn, err := t.dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		return newH1OrderConn(conn, t.headerOrder), err
 	}
 }
 
 // dialTLSForH1 creates ctls connections for HTTP/1.1 (ALPN: http/1.1 only).
+//
+// The conn is wrapped so request headers go out in the browser's order.
+// net/http sorts them alphabetically with no hook to intervene, so the h1 path
+// would otherwise emit an order no browser produces — losing the header-order
+// half of the fingerprint on every h1-only host and under WithForceHTTP1, while
+// h2 kept its order through HPACK.
 func (t *Transport) dialTLSForH1() func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return t.dialTLS(ctx, network, addr, []string{"http/1.1"})
+		conn, err := t.dialTLS(ctx, network, addr, []string{"http/1.1"})
+		if err != nil {
+			return nil, err
+		}
+		return newH1OrderConn(conn, t.headerOrder), nil
 	}
 }
 

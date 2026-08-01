@@ -191,26 +191,24 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 
-		// Stage Referer BEFORE applyBrowserHeaders so Sec-Fetch-Site can be
-		// computed against the correct origin. Caller-supplied Referer wins
-		// over the configured default.
-		if v, ok := headers["Referer"]; ok && v != "" {
-			req.Header.Set("Referer", v)
-		} else if c.config.referer != "" {
+		// Stage every caller header BEFORE applyBrowserHeaders. That function
+		// only fills in headers that are absent, and it needs to see two of
+		// them: Referer, so Sec-Fetch-Site is computed against the right
+		// origin, and Content-Type, so a form submission is annotated as a
+		// navigation while a JSON body is annotated as a fetch.
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		callerSetUA := req.Header.Get("User-Agent") != ""
+		if req.Header.Get("Referer") == "" && c.config.referer != "" {
 			req.Header.Set("Referer", c.config.referer)
 		}
 
-		// Apply browser default headers (Sec-Fetch-Site reads the staged Referer).
 		applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage)
 
-		// Apply custom User-Agent if set
-		if c.config.userAgent != "" {
+		// Precedence: caller header > configured User-Agent > browser default.
+		if c.config.userAgent != "" && !callerSetUA {
 			req.Header.Set("User-Agent", c.config.userAgent)
-		}
-
-		// Apply custom headers (override defaults)
-		for k, v := range headers {
-			req.Header.Set(k, v)
 		}
 
 		resp, err := c.httpClient.Do(req)
