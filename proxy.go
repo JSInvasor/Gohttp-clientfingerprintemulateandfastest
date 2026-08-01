@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -18,12 +17,16 @@ import (
 // after the cooldown it gets one probe slot to recover. This keeps a partially
 // rotten proxy list from dragging the whole RPS down to its slowest member.
 type ProxyRotator struct {
-	proxies  []*proxyEntry
-	counter  atomic.Uint64
-	cooldown time.Duration
+	proxies []*proxyEntry
+	counter atomic.Uint64
 
-	// failThreshold is the consecutive failure count that marks a proxy dead.
-	failThreshold int
+	// health holds the cooldown and failure threshold. It is a pointer so
+	// every Pinned view shares it with the parent: the settings were
+	// previously copied into each view, so a SetCooldown call after the views
+	// existed silently applied to none of them. The fields are atomic because
+	// MarkFailure reads them from dial goroutines while a caller may still be
+	// setting them.
+	health *proxyHealth
 
 	// primaryIdx, when >= 0, makes this rotator "sticky": NextEntry always
 	// prefers proxies[primaryIdx] while it is alive, and only rotates to a live
@@ -31,6 +34,12 @@ type ProxyRotator struct {
 	// Per-client views created via Pinned share the same proxyEntry pointers
 	// (and thus health) but carry their own primaryIdx + counter.
 	primaryIdx int
+}
+
+// proxyHealth is the failure policy shared by a rotator and all of its views.
+type proxyHealth struct {
+	cooldownNs    atomic.Int64
+	failThreshold atomic.Int32
 }
 
 type proxyEntry struct {
@@ -81,11 +90,14 @@ func NewProxyRotator(proxies []string) (*ProxyRotator, error) {
 		return nil, fmt.Errorf("no valid proxies found")
 	}
 
+	health := &proxyHealth{}
+	health.cooldownNs.Store(int64(30 * time.Second))
+	health.failThreshold.Store(3)
+
 	return &ProxyRotator{
-		proxies:       parsed,
-		cooldown:      30 * time.Second,
-		failThreshold: 3,
-		primaryIdx:    -1,
+		proxies:    parsed,
+		health:     health,
+		primaryIdx: -1,
 	}, nil
 }
 
@@ -105,10 +117,9 @@ func (pr *ProxyRotator) Pinned(idx int) *ProxyRotator {
 		idx = -1
 	}
 	return &ProxyRotator{
-		proxies:       pr.proxies,
-		cooldown:      pr.cooldown,
-		failThreshold: pr.failThreshold,
-		primaryIdx:    idx,
+		proxies:    pr.proxies,
+		health:     pr.health,
+		primaryIdx: idx,
 	}
 }
 
@@ -137,26 +148,32 @@ func NewProxyRotatorFromFile(path string) (*ProxyRotator, error) {
 }
 
 // SetCooldown configures how long a dead proxy is skipped before getting
-// another chance. Default 30s.
+// another chance. Default 30s. Safe to call while requests are in flight, and
+// the change is seen by every view created with Pinned.
 func (pr *ProxyRotator) SetCooldown(d time.Duration) {
 	if d > 0 {
-		pr.cooldown = d
+		pr.health.cooldownNs.Store(int64(d))
 	}
 }
 
 // SetFailThreshold configures how many consecutive failures mark a proxy
-// dead. Default 3.
+// dead. Default 3. Same concurrency and sharing rules as SetCooldown.
 func (pr *ProxyRotator) SetFailThreshold(n int) {
 	if n > 0 {
-		pr.failThreshold = n
+		pr.health.failThreshold.Store(int32(n))
 	}
 }
 
 // Next returns the next live proxy URL in round-robin order. Dead proxies in
 // cooldown are skipped. If every proxy is dead, returns the least-recently-failed
-// one anyway (better to try a stale proxy than fail outright).
+// one anyway (better to try a stale proxy than fail outright). Returns nil when
+// the rotator holds no proxies.
 func (pr *ProxyRotator) Next() *url.URL {
-	return pr.NextEntry().url
+	e := pr.NextEntry()
+	if e == nil {
+		return nil
+	}
+	return e.url
 }
 
 // NextEntry is like Next but returns the proxyEntry so the caller can report
@@ -214,8 +231,8 @@ func (pr *ProxyRotator) MarkFailure(e *proxyEntry) {
 		return
 	}
 	e.totalFailed.Add(1)
-	if int(e.failCount.Add(1)) >= pr.failThreshold {
-		e.deadUntilNs.Store(time.Now().Add(pr.cooldown).UnixNano())
+	if e.failCount.Add(1) >= pr.health.failThreshold.Load() {
+		e.deadUntilNs.Store(time.Now().UnixNano() + pr.health.cooldownNs.Load())
 	}
 }
 
@@ -336,6 +353,3 @@ func parseProxyString(s string) (*url.URL, error) {
 func (c *Client) SetProxyRotator(pr *ProxyRotator) {
 	c.transport.setProxyRotator(pr)
 }
-
-// rotatorMu guards access to a transport's proxy rotator binding.
-var _ = sync.Mutex{}

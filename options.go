@@ -166,7 +166,14 @@ func WithResponseHeaderTimeout(d time.Duration) Option {
 	}
 }
 
-// WithEnableCompression enables response decompression (disabled by default for speed).
+// WithEnableCompression is a no-op and is kept only for compatibility.
+//
+// Deprecated: response bodies are always decompressed. It flips
+// http.Transport.DisableCompression, which controls net/http's transparent
+// gzip — but that path only engages when the request carries no
+// Accept-Encoding, and the browser profiles always set one. Decompression is
+// handled by Response.Bytes instead, which covers gzip, br, deflate and zstd
+// including chained encodings, whatever this option is set to.
 func WithEnableCompression() Option {
 	return func(c *clientConfig) {
 		c.transport.DisableCompression = false

@@ -1049,6 +1049,49 @@ type dnsCacheEntry struct {
 	ipsLen      uint64 // cached len(ips) so the hot path skips a slice header deref
 }
 
+// hasGlobalIPv6 reports whether this host has a routable global IPv6 address.
+// Dialing UDP sends no packets; it only asks the kernel to select a source
+// address, which fails when there is no global IPv6 route. Evaluated once.
+var hasGlobalIPv6 = sync.OnceValue(func() bool {
+	c, err := net.Dial("udp6", "[2001:4860:4860::8888]:53")
+	if err != nil {
+		return false
+	}
+	c.Close()
+	return true
+})
+
+// selectAddressFamily narrows a mixed A/AAAA result down to one family.
+//
+// net.LookupHost returns both, and round-robining across the mixed list sent a
+// share of every host's requests to an address family the machine may have no
+// route for. On an IPv4-only host that surfaced as a fraction of requests
+// failing with "network unreachable" for no visible reason. There is no Happy
+// Eyeballs here, so the family has to be picked up front: IPv6 when this host
+// can actually reach it, IPv4 otherwise, and whatever is left if the preferred
+// family returned nothing.
+func selectAddressFamily(ips []string) []string {
+	var v4, v6 []string
+	for _, ip := range ips {
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			continue
+		}
+		if parsed.To4() != nil {
+			v4 = append(v4, ip)
+		} else {
+			v6 = append(v6, ip)
+		}
+	}
+	if hasGlobalIPv6() && len(v6) > 0 {
+		return v6
+	}
+	if len(v4) > 0 {
+		return v4
+	}
+	return v6
+}
+
 func newDNSCache(ttl time.Duration) *dnsCache {
 	// Guard against zero/negative TTLs — time.NewTicker(0) panics, and a
 	// negative TTL would expire every lookup immediately. Either is almost
@@ -1135,12 +1178,13 @@ func (d *dnsCache) lookup(host string) (string, error) {
 		return res.ips[0], nil
 	}
 
-	ips, err := net.LookupHost(host)
+	resolved, err := net.LookupHost(host)
 	if err != nil {
 		resultCh <- resolveResult{err: err}
 		d.inflight.Delete(host)
 		return "", err
 	}
+	ips := selectAddressFamily(resolved)
 	if len(ips) == 0 {
 		err := fmt.Errorf("no IPs found for %s", host)
 		resultCh <- resolveResult{err: err}
