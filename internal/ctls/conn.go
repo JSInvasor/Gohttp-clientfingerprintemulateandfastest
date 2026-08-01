@@ -1,6 +1,7 @@
 package ctls
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -27,6 +28,11 @@ type Conn struct {
 	serverAppSecret []byte
 	clientAppSecret []byte
 
+	// br buffers record reads so a header and its body come from one syscall.
+	// It is inherited from the handshake, which may already have pulled the
+	// first application-data bytes into it.
+	br *bufio.Reader
+
 	serverReader *encryptedRecord // server → client application data
 	readBuf      []byte           // decrypted application data buffer
 	readErr      error            // stored read error
@@ -39,6 +45,7 @@ type Conn struct {
 	// nonce, which both corrupts the stream and destroys AEAD security.
 	writeMu      sync.Mutex
 	clientWriter *encryptedRecord // client → server application data
+	writeBuf     []byte           // reusable record buffer, guarded by writeMu
 	closeSent    bool
 }
 
@@ -77,7 +84,7 @@ func (c *Conn) Read(b []byte) (int, error) {
 
 	// Read records until we get application data
 	for {
-		rec, err := readRawRecord(c.Conn)
+		rec, err := readRawRecord(c.br)
 		if err != nil {
 			c.readErr = err
 			return 0, err
@@ -240,16 +247,19 @@ func (c *Conn) Write(b []byte) (int, error) {
 	written := 0
 	for len(b) > 0 {
 		chunk := b
-		if len(chunk) > 16384 {
-			chunk = chunk[:16384]
+		if len(chunk) > maxPlaintextRecord {
+			chunk = chunk[:maxPlaintextRecord]
 		}
 
-		ciphertext, err := c.clientWriter.encrypt(chunk, recordTypeApplicationData)
+		// Seal straight into the connection's reusable buffer: header and
+		// ciphertext land in one allocation-free slice and go out as one write.
+		record, err := c.clientWriter.sealRecord(c.writeBuf, chunk, recordTypeApplicationData)
 		if err != nil {
 			return written, fmt.Errorf("encrypt: %w", err)
 		}
+		c.writeBuf = record
 
-		if err := writeRawRecord(c.Conn, recordTypeApplicationData, ciphertext); err != nil {
+		if _, err := c.Conn.Write(record); err != nil {
 			return written, err
 		}
 

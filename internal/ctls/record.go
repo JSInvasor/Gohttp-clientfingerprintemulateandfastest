@@ -1,12 +1,40 @@
 package ctls
 
 import (
+	"bufio"
 	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 )
+
+const (
+	// recordHeaderLen is the TLS record header: type(1) + version(2) + length(2).
+	recordHeaderLen = 5
+
+	// maxPlaintextRecord is the largest plaintext we put in one record.
+	maxPlaintextRecord = 16384
+
+	// maxCiphertextRecord is the largest record body RFC 8446 §5.2 allows a
+	// peer to send us: the plaintext limit plus 256 bytes of expansion.
+	maxCiphertextRecord = maxPlaintextRecord + 256
+
+	// recordReadBuf sizes the buffered reader. It holds a full-size record
+	// header plus body, so an ordinary record costs one syscall rather than
+	// one for the 5-byte header and another for the body.
+	recordReadBuf = recordHeaderLen + maxCiphertextRecord
+)
+
+// newRecordReader wraps conn so record reads are buffered.
+//
+// The same reader has to be used for the handshake and for the connection that
+// comes out of it: buffering can pull the first application-data bytes off the
+// socket while reading the last handshake record, and those bytes are only
+// recoverable from the reader that holds them.
+func newRecordReader(conn net.Conn) *bufio.Reader {
+	return bufio.NewReaderSize(conn, recordReadBuf)
+}
 
 // tlsRecord represents a TLS record layer message.
 type tlsRecord struct {
@@ -17,7 +45,7 @@ type tlsRecord struct {
 // writeRawRecord writes a TLS record to the connection.
 // Per RFC 8446: ClientHello uses 0x0301, all other records use 0x0303.
 func writeRawRecord(conn net.Conn, typ uint8, data []byte) error {
-	buf := make([]byte, 5+len(data))
+	buf := make([]byte, recordHeaderLen+len(data))
 	buf[0] = typ
 	// ClientHello (handshake, first record) uses 0x0301 for compat.
 	// All other records (CCS, encrypted) MUST use 0x0303 per RFC 8446 §5.1.
@@ -27,22 +55,22 @@ func writeRawRecord(conn net.Conn, typ uint8, data []byte) error {
 		binary.BigEndian.PutUint16(buf[1:], versionTLS12) // 0x0303
 	}
 	binary.BigEndian.PutUint16(buf[3:], uint16(len(data)))
-	copy(buf[5:], data)
+	copy(buf[recordHeaderLen:], data)
 	_, err := conn.Write(buf)
 	return err
 }
 
 // readRawRecord reads a single TLS record from the connection.
 func readRawRecord(r io.Reader) (*tlsRecord, error) {
-	header := make([]byte, 5)
-	if _, err := io.ReadFull(r, header); err != nil {
+	var header [recordHeaderLen]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return nil, fmt.Errorf("read record header: %w", err)
 	}
 
 	typ := header[0]
 	length := binary.BigEndian.Uint16(header[3:])
 
-	if length > 16384+256 {
+	if length > maxCiphertextRecord {
 		return nil, fmt.Errorf("record too large: %d bytes", length)
 	}
 
@@ -56,10 +84,21 @@ func readRawRecord(r io.Reader) (*tlsRecord, error) {
 
 // encryptedRecord handles AEAD encryption/decryption of TLS 1.3 records.
 // In TLS 1.3, all records after ServerHello are encrypted as ApplicationData (type 23).
+//
+// It is not safe for concurrent use: the sequence number must advance exactly
+// once per record, and reusing a nonce voids the cipher's security. Conn
+// serialises the write side with a mutex; the read side is single-goroutine.
 type encryptedRecord struct {
 	aead cipher.AEAD
 	iv   [12]byte
 	seq  uint64
+
+	// nonceBuf and adBuf are scratch for the per-record nonce and additional
+	// data. Both are fields rather than locals because they are passed to an
+	// interface method, which makes the compiler heap-allocate a local array
+	// on every single record.
+	nonceBuf [12]byte
+	adBuf    [recordHeaderLen]byte
 }
 
 // newEncryptedRecord creates an encrypted record handler.
@@ -69,57 +108,74 @@ func newEncryptedRecord(aead cipher.AEAD, iv []byte) *encryptedRecord {
 	return er
 }
 
-// nonce derives the per-record nonce by XOR-ing the base IV with the sequence number.
+// nonce derives the per-record nonce by XOR-ing the base IV with the sequence
+// number, then advances the sequence. The returned slice is scratch owned by
+// er and is valid only until the next call.
 func (er *encryptedRecord) nonce() []byte {
-	nonce := make([]byte, 12)
-	copy(nonce, er.iv[:])
-	// XOR last 8 bytes with big-endian sequence number
-	seqBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(seqBytes, er.seq)
-	for i := 0; i < 8; i++ {
-		nonce[4+i] ^= seqBytes[i]
+	er.nonceBuf = er.iv
+	seq := er.seq
+	// XOR the trailing 8 bytes with the big-endian sequence number.
+	for i := 11; i >= 4; i-- {
+		er.nonceBuf[i] ^= byte(seq)
+		seq >>= 8
 	}
 	er.seq++
-	return nonce
+	return er.nonceBuf[:]
 }
 
-// encrypt encrypts a TLS 1.3 record.
+// sealRecord encrypts plaintext into a complete TLS record — header included —
+// using buf as storage, and returns the filled slice. Pass the previous return
+// value back in to reuse the allocation.
+//
 // additional_data = type(1) || version(2) || length(2) of ciphertext
-func (er *encryptedRecord) encrypt(plaintext []byte, innerType uint8) ([]byte, error) {
+func (er *encryptedRecord) sealRecord(buf []byte, plaintext []byte, innerType uint8) ([]byte, error) {
 	// Inner content = plaintext || content_type byte (TLS 1.3 inner type)
-	inner := make([]byte, len(plaintext)+1)
+	innerLen := len(plaintext) + 1
+	cipherLen := innerLen + er.aead.Overhead()
+	total := recordHeaderLen + cipherLen
+
+	if cap(buf) < total {
+		buf = make([]byte, total)
+	}
+	buf = buf[:total]
+
+	// TLSCiphertext header, which doubles as the additional data.
+	buf[0] = recordTypeApplicationData
+	binary.BigEndian.PutUint16(buf[1:], versionTLS12)
+	binary.BigEndian.PutUint16(buf[3:], uint16(cipherLen))
+
+	inner := buf[recordHeaderLen : recordHeaderLen+innerLen]
 	copy(inner, plaintext)
 	inner[len(plaintext)] = innerType
 
-	// Ciphertext length = inner_length + tag_length
-	cipherLen := len(inner) + er.aead.Overhead()
+	// Sealing into inner[:0] is the documented in-place form, so the
+	// ciphertext lands straight after the header with no second buffer.
+	sealed := er.aead.Seal(inner[:0], er.nonce(), inner, buf[:recordHeaderLen])
+	return buf[:recordHeaderLen+len(sealed)], nil
+}
 
-	// Additional data: TLSCiphertext header
-	// type=23 (Application Data), version=0x0303, length=cipherLen
-	additional := make([]byte, 5)
-	additional[0] = recordTypeApplicationData
-	binary.BigEndian.PutUint16(additional[1:], versionTLS12)
-	binary.BigEndian.PutUint16(additional[3:], uint16(cipherLen))
-
-	nonce := er.nonce()
-	ciphertext := er.aead.Seal(nil, nonce, inner, additional)
-	return ciphertext, nil
+// encrypt encrypts a TLS 1.3 record body, without the record header.
+func (er *encryptedRecord) encrypt(plaintext []byte, innerType uint8) ([]byte, error) {
+	record, err := er.sealRecord(nil, plaintext, innerType)
+	if err != nil {
+		return nil, err
+	}
+	return record[recordHeaderLen:], nil
 }
 
 // decrypt decrypts a TLS 1.3 record and returns (plaintext, innerType, error).
+// The plaintext aliases ciphertext, which is decrypted in place.
 func (er *encryptedRecord) decrypt(ciphertext []byte) ([]byte, uint8, error) {
 	if len(ciphertext) < er.aead.Overhead()+1 {
 		return nil, 0, fmt.Errorf("ciphertext too short")
 	}
 
 	// Reconstruct additional data
-	additional := make([]byte, 5)
-	additional[0] = recordTypeApplicationData
-	binary.BigEndian.PutUint16(additional[1:], versionTLS12)
-	binary.BigEndian.PutUint16(additional[3:], uint16(len(ciphertext)))
+	er.adBuf[0] = recordTypeApplicationData
+	binary.BigEndian.PutUint16(er.adBuf[1:], versionTLS12)
+	binary.BigEndian.PutUint16(er.adBuf[3:], uint16(len(ciphertext)))
 
-	nonce := er.nonce()
-	inner, err := er.aead.Open(nil, nonce, ciphertext, additional)
+	inner, err := er.aead.Open(ciphertext[:0], er.nonce(), ciphertext, er.adBuf[:])
 	if err != nil {
 		return nil, 0, fmt.Errorf("aead decrypt: %w", err)
 	}

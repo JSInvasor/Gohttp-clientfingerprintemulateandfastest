@@ -1,0 +1,21 @@
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+
+# Note: internal/http2 is a vendored fork of golang.org/x/net/http2. Bumping the
+# golang.org/x/net requirement here does NOT update it — upstream fixes to that
+# package have to be backported by hand. See internal/http2/FORK.md.

@@ -1,6 +1,7 @@
 package ctls
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"crypto"
@@ -32,6 +33,7 @@ const maxHandshakeMessage = 256 * 1024
 // handshakeState manages the TLS 1.3 handshake.
 type handshakeState struct {
 	conn       net.Conn
+	br         *bufio.Reader
 	serverName string
 	alpn       []string
 	skipVerify bool
@@ -56,6 +58,7 @@ func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool,
 
 	hs := &handshakeState{
 		conn:       conn,
+		br:         newRecordReader(conn),
 		serverName: serverName,
 		alpn:       alpn,
 		skipVerify: skipVerify,
@@ -144,7 +147,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 	var shReader handshakeReader
 	var serverHelloMsg []byte
 	for serverHelloMsg == nil {
-		rec, err := readRawRecord(hs.conn)
+		rec, err := readRawRecord(hs.br)
 		if err != nil {
 			return nil, fmt.Errorf("read server hello record: %w", err)
 		}
@@ -203,7 +206,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 	var hr handshakeReader
 
 	for !finished {
-		rec, err := readRawRecord(hs.conn)
+		rec, err := readRawRecord(hs.br)
 		if err != nil {
 			return nil, fmt.Errorf("read handshake: %w", err)
 		}
@@ -386,6 +389,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 
 	return &Conn{
 		Conn:            hs.conn,
+		br:              hs.br,
 		serverName:      hs.serverName,
 		negotiatedALPN:  hs.negotiatedALPN,
 		suite:           hs.suite,

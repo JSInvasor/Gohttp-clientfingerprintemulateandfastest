@@ -3,7 +3,11 @@
 ## Base
 
 - **Upstream:** `golang.org/x/net/http2`
-- **Version:** `v0.33.0` (matches the `golang.org/x/net` requirement in `go.mod`)
+- **Version:** `v0.33.0`
+
+This is recorded here because it is not derivable from anywhere else. The code
+is vendored, so the `golang.org/x/net` requirement in `go.mod` says nothing
+about it — the two happen to match today and can drift apart at any bump.
 
 Verified by diffing every non-test file against
 `$(go env GOMODCACHE)/golang.org/x/net@v0.33.0/http2`: the file sets are
