@@ -60,7 +60,10 @@ type Transport struct {
 	// requests skip the h2 attempt for hosts that only speak http/1.1. Without
 	// this cache every request to an h1-only host would dial twice (once for
 	// h2 to fail, once for h1) and h2Transport would also panic by feeding the
-	// h2 preface into an http/1.1 connection. Values: "h2" or "http/1.1".
+	// h2 preface into an http/1.1 connection.
+	//
+	// Keys are always the canonical host:port from hostProtoKey; see the note
+	// there. Values are hostProtoEntry.
 	hostProto sync.Map
 
 	// Proxy support - used directly in dialTLS to tunnel through proxies
@@ -257,7 +260,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return t.h1Transport.RoundTrip(req)
 	}
 
-	if proto, ok := t.hostProto.Load(req.URL.Host); ok && proto.(string) == "http/1.1" {
+	if t.prefersHTTP1(hostProtoKey(req.URL.Host, "443")) {
 		return t.h1Transport.RoundTrip(req)
 	}
 
@@ -306,16 +309,65 @@ func (t *Transport) dialTLSForH2(ctx context.Context, network, addr string) (net
 	}
 	if alpnConn, ok := conn.(interface{ NegotiatedProtocol() string }); ok {
 		if proto := alpnConn.NegotiatedProtocol(); proto != "" && proto != "h2" {
-			host, _, splitErr := net.SplitHostPort(addr)
-			if splitErr != nil {
-				host = addr
-			}
-			t.hostProto.Store(host, "http/1.1")
+			t.hostProto.Store(hostProtoKey(addr, "443"), hostProtoEntry{
+				proto:   "http/1.1",
+				expires: time.Now().Add(hostProtoTTL),
+			})
 			conn.Close()
 			return nil, errAlpnHTTP1
 		}
 	}
 	return conn, nil
+}
+
+// hostProtoTTL bounds how long an http/1.1 negotiation is remembered. Without
+// it, a host that fell back to HTTP/1.1 once — during an incident, or behind a
+// misconfigured edge node — stays pinned to HTTP/1.1 for the life of the
+// process, and the map only ever grows.
+const hostProtoTTL = 10 * time.Minute
+
+type hostProtoEntry struct {
+	proto   string
+	expires time.Time
+}
+
+// hostProtoKey canonicalises a host into the host:port form that both the
+// RoundTrip lookup and the dial-time store agree on.
+//
+// req.URL.Host omits the default port while the dialer's addr always carries
+// one, so keying on the raw values meant the cache never hit for a host on a
+// non-standard port — every request paid dial, fail, redial — and, worse, a
+// result learned from example.com:8443 was stored under "example.com" and then
+// applied to example.com:443, routing ordinary HTTPS traffic to HTTP/1.1.
+func hostProtoKey(host, defaultPort string) string {
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+	// Either a bracketed host with no port or a bare IPv6 literal lands here.
+	// JoinHostPort re-adds brackets, so strip any that are already present
+	// rather than producing [[::1]]:443.
+	host = strings.TrimPrefix(host, "[")
+	host = strings.TrimSuffix(host, "]")
+	return net.JoinHostPort(host, defaultPort)
+}
+
+// prefersHTTP1 reports whether key is known to speak only HTTP/1.1, dropping
+// the record once it has aged out.
+func (t *Transport) prefersHTTP1(key string) bool {
+	v, ok := t.hostProto.Load(key)
+	if !ok {
+		return false
+	}
+	entry, ok := v.(hostProtoEntry)
+	if !ok {
+		t.hostProto.Delete(key)
+		return false
+	}
+	if time.Now().After(entry.expires) {
+		t.hostProto.Delete(key)
+		return false
+	}
+	return entry.proto == "http/1.1"
 }
 
 // dialTLS performs TLS handshake using our custom ctls package with browser-specific ClientHello.
