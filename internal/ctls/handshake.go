@@ -30,6 +30,13 @@ import (
 // Without a bound a hostile server could pin 16 MiB per connection.
 const maxHandshakeMessage = 256 * 1024
 
+// maxNoProgressRecords bounds how many consecutive records a server may send
+// that carry no handshake bytes — warning alerts, ChangeCipherSpec, or empty
+// payloads. Each is skipped with a `continue`, so without a ceiling a peer can
+// hold the handshake loop open indefinitely by never sending anything real.
+// The context deadline already bounds the wall clock; this bounds the work.
+const maxNoProgressRecords = 64
+
 // handshakeState manages the TLS 1.3 handshake.
 type handshakeState struct {
 	conn       net.Conn
@@ -146,10 +153,16 @@ func (hs *handshakeState) run() (*Conn, error) {
 	// single record carries the whole message.
 	var shReader handshakeReader
 	var serverHelloMsg []byte
+	idleRecords := 0
 	for serverHelloMsg == nil {
 		rec, err := readRawRecord(hs.br)
 		if err != nil {
 			return nil, fmt.Errorf("read server hello record: %w", err)
+		}
+		if rec.typ == recordTypeAlert || rec.typ == recordTypeChangeCipherSpec {
+			if idleRecords++; idleRecords > maxNoProgressRecords {
+				return nil, fmt.Errorf("server sent %d records without a server hello", idleRecords)
+			}
 		}
 		if rec.typ == recordTypeAlert {
 			if err := alertError(rec.data); err != nil {
@@ -205,10 +218,17 @@ func (hs *handshakeState) run() (*Conn, error) {
 	var finished bool
 	var hr handshakeReader
 
+	idleRecords = 0
 	for !finished {
 		rec, err := readRawRecord(hs.br)
 		if err != nil {
 			return nil, fmt.Errorf("read handshake: %w", err)
+		}
+
+		if rec.typ != recordTypeApplicationData {
+			if idleRecords++; idleRecords > maxNoProgressRecords {
+				return nil, fmt.Errorf("server sent %d records carrying no handshake data", idleRecords)
+			}
 		}
 
 		// Skip ChangeCipherSpec records (middlebox compat)
@@ -235,6 +255,11 @@ func (hs *handshakeState) run() (*Conn, error) {
 		if innerType == recordTypeAlert {
 			if err := alertError(plaintext); err != nil {
 				return nil, err
+			}
+			// A warning alert decrypts fine but advances nothing, so it counts
+			// against the same budget as a plaintext one.
+			if idleRecords++; idleRecords > maxNoProgressRecords {
+				return nil, fmt.Errorf("server sent %d records carrying no handshake data", idleRecords)
 			}
 			continue
 		}

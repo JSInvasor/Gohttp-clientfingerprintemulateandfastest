@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/net/publicsuffix"
 )
@@ -363,13 +364,35 @@ func setIfEmpty(h http.Header, key, value string) {
 }
 
 // secFetchSiteCache memoizes secFetchSiteFor results keyed by the
-// (referer, scheme://host:port) pair. At sustained high RPS the same
-// (referer, target) pair repeats indefinitely, and the underlying
-// url.Parse + publicsuffix lookup is non-trivial.
+// (referer origin, target origin) pair. At sustained high RPS the same pair
+// repeats indefinitely, and the underlying url.Parse + publicsuffix lookup is
+// non-trivial.
 //
-// sync.Map is fine here: keys are bounded by the cardinality of distinct
-// (referer, target-origin) pairs in a workload — typically tiny (1-10).
-var secFetchSiteCache sync.Map // map[string]string
+// Both halves of the key are origins, never full URLs. computeSecFetchSite
+// reads nothing but the referer's scheme, host and port, so keying on the whole
+// referer only made the key space unbounded: a crawler that sets a per-request
+// Referer (the normal way to walk a site) minted one permanent entry per page
+// visited and the map grew for the life of the process.
+const maxSecFetchSiteCacheEntries = 4096
+
+var (
+	secFetchSiteCache     sync.Map // map[string]string
+	secFetchSiteCacheSize atomic.Int64
+)
+
+// refererOrigin returns the scheme://host[:port] prefix of a URL without
+// parsing it. Cutting at the first '/', '?' or '#' after the scheme separator
+// leaves exactly what computeSecFetchSite looks at.
+func refererOrigin(referer string) string {
+	i := strings.Index(referer, "://")
+	if i < 0 {
+		return referer
+	}
+	if j := strings.IndexAny(referer[i+3:], "/?#"); j >= 0 {
+		return referer[:i+3+j]
+	}
+	return referer
+}
 
 // secFetchSiteFor returns the correct Sec-Fetch-Site value for a navigation
 // based on the relationship between the Referer and the request URL.
@@ -395,25 +418,33 @@ func secFetchSiteFor(req *http.Request) string {
 		return "none"
 	}
 
-	// Cache key uses target origin (scheme+host+port) + full referer URL.
-	// We deliberately key on the full referer string (not just its origin) so
-	// callers that pass a path-preserving referer still get the right answer
-	// in the same-origin branch without paying for a re-parse.
+	// Cache key pairs the target origin (scheme+host+port) with the referer
+	// origin. Anything past the origin cannot change the answer.
+	refOrigin := refererOrigin(referer)
+
 	var keyBuf strings.Builder
-	keyBuf.Grow(len(req.URL.Scheme) + len(req.URL.Host) + len(referer) + 4)
+	keyBuf.Grow(len(req.URL.Scheme) + len(req.URL.Host) + len(refOrigin) + 4)
 	keyBuf.WriteString(req.URL.Scheme)
 	keyBuf.WriteByte('|')
 	keyBuf.WriteString(req.URL.Host)
 	keyBuf.WriteByte('|')
-	keyBuf.WriteString(referer)
+	keyBuf.WriteString(refOrigin)
 	key := keyBuf.String()
 
 	if v, ok := secFetchSiteCache.Load(key); ok {
 		return v.(string)
 	}
 
-	result := computeSecFetchSite(req, referer)
-	secFetchSiteCache.Store(key, result)
+	result := computeSecFetchSite(req, refOrigin)
+
+	// Hard ceiling as belt and braces. Past it the answer is still correct,
+	// just recomputed each time, which is far better than growing without
+	// bound in a process that runs for days.
+	if secFetchSiteCacheSize.Load() < maxSecFetchSiteCacheEntries {
+		if _, loaded := secFetchSiteCache.LoadOrStore(key, result); !loaded {
+			secFetchSiteCacheSize.Add(1)
+		}
+	}
 	return result
 }
 

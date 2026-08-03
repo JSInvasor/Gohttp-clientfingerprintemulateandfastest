@@ -26,6 +26,18 @@ type clientConfig struct {
 	retryStatusCodes []int         // HTTP status codes to retry on (e.g. 429, 502, 503, 504)
 }
 
+// defaultMaxResponseBody caps Response.Bytes() when the caller has not chosen a
+// limit. Bytes() decodes Content-Encoding itself and this client advertises
+// br and zstd, both of which reach compression ratios far past gzip's — an
+// unlimited io.ReadAll over a decoder lets a hostile endpoint answer a few MiB
+// of ciphertext with tens of GiB of plaintext and take the process out.
+//
+// 256 MiB is well beyond any body a caller would sensibly hold in memory (which
+// is what Bytes() does regardless), so this bounds the damage without getting in
+// the way. WithMaxResponseBodySize(0) still means genuinely unlimited for
+// callers who want it.
+const defaultMaxResponseBody = 256 << 20
+
 func defaultClientConfig() clientConfig {
 	return clientConfig{
 		transport:       defaultTransportConfig(),
@@ -35,6 +47,7 @@ func defaultClientConfig() clientConfig {
 		timeout:         30 * time.Second,
 		acceptLanguage:  "en-US,en;q=0.9",
 		accept:          defaultNavigateAccept,
+		maxResponseBody: defaultMaxResponseBody,
 	}
 }
 
@@ -238,8 +251,13 @@ func WithReferer(referer string) Option {
 	}
 }
 
-// WithMaxResponseBodySize sets the maximum allowed response body size in bytes.
-// Responses exceeding this limit will return an error. Default: 0 (unlimited).
+// WithMaxResponseBodySize sets the maximum allowed response body size in bytes,
+// measured after Content-Encoding is decoded. Responses exceeding the limit
+// return an error (the body is still drained, so the HTTP/2 stream ends with
+// END_STREAM rather than RST_STREAM).
+//
+// Default: 256 MiB, see defaultMaxResponseBody. Pass 0 for genuinely unlimited,
+// which removes the only guard against a decompression bomb.
 func WithMaxResponseBodySize(n int64) Option {
 	return func(c *clientConfig) {
 		c.maxResponseBody = n

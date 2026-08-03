@@ -302,8 +302,15 @@ func (pr *ProxyRotator) ProxyFunc() func(*http.Request) (*url.URL, error) {
 
 // proxyFuncEntry is a richer variant that returns the entry too, so the
 // transport can call MarkSuccess/MarkFailure on the actual entry that was used.
+//
+// NextEntry returns nil for a rotator holding no proxies, so the nil check is
+// not optional — Next() has always had one, and dereferencing e.url here would
+// panic instead of letting dialRaw report "no usable proxies".
 func (pr *ProxyRotator) nextProxyEntry() (*url.URL, *proxyEntry) {
 	e := pr.NextEntry()
+	if e == nil {
+		return nil, nil
+	}
 	return e.url, e
 }
 

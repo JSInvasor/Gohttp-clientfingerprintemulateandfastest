@@ -64,6 +64,17 @@ type Pipeline struct {
 	drainCh chan *http.Response
 	drainWg sync.WaitGroup
 
+	// drainMu guards whether drainCh is still open. asyncDrain holds it for
+	// read across its send; Close takes it for write before closing.
+	//
+	// Nothing else keeps those two apart. Spray runs collect -> asyncDrain on
+	// the CALLER's goroutine, which neither p.wg (workers only) nor p.inFlight
+	// (submitters only) covers, so a collector parked on a full drainCh was
+	// free to be sending at the moment Close closed the channel — "send on
+	// closed channel", which is a panic, not an error.
+	drainMu     sync.RWMutex
+	drainClosed bool
+
 	// Object pools to reduce GC pressure at high RPS
 	jobPool    sync.Pool
 	resultPool sync.Pool
@@ -224,22 +235,36 @@ func (p *Pipeline) drainWorker() {
 // asyncDrain hands off a response body to the drain pool for async reading.
 // The worker can immediately proceed to the next request.
 //
-// Backpressure policy: if the drain channel is full we BLOCK the worker rather
+// Backpressure policy: if the drain channel is full we BLOCK the caller rather
 // than truncate. Truncation issues RST_STREAM (CANCEL) which Cloudflare/Akamai
-// score as an abusive client and respond with 403. Worker stalling is the
-// lesser evil — it naturally throttles ingress until drain catches up.
-// The closed-pipeline branch ensures Close() never deadlocks.
+// score as an abusive client and respond with 403. Stalling is the lesser evil
+// — it naturally throttles ingress until drain catches up.
+//
+// The send happens under drainMu.RLock and selects on stopCh, so a shutdown
+// both wakes a parked sender and cannot close drainCh underneath one. Once the
+// channel is gone the body is drained inline instead, which is slower but keeps
+// the stream ending in END_STREAM either way.
 func (p *Pipeline) asyncDrain(resp *Response) {
 	if resp == nil || resp.Response == nil || resp.Response.Body == nil || resp.bodyRead {
 		return
 	}
-	if p.closed.Load() {
-		n, _ := io.Copy(io.Discard, resp.Response.Body)
-		resp.Response.Body.Close()
-		p.Stats.TotalBytes.Add(n)
-		return
+
+	p.drainMu.RLock()
+	if !p.drainClosed {
+		select {
+		case p.drainCh <- resp.Response:
+			p.drainMu.RUnlock()
+			return
+		case <-p.stopCh:
+			// Shutting down: drain inline rather than park on a channel that
+			// is about to be closed.
+		}
 	}
-	p.drainCh <- resp.Response
+	p.drainMu.RUnlock()
+
+	n, _ := io.Copy(io.Discard, resp.Response.Body)
+	resp.Response.Body.Close()
+	p.Stats.TotalBytes.Add(n)
 }
 
 // worker processes jobs from the channel.
@@ -477,6 +502,13 @@ loop:
 			countCh = nil // a nil channel blocks forever, so stop selecting it
 		case result := <-results:
 			collect(result)
+		case <-ctx.Done():
+			// A worker abandons its blockResult send once job.ctx is done (see
+			// worker), draining the body itself instead. Those results never
+			// reach us, so `received` can never catch up to `submitted` and
+			// waiting on it here hung Spray forever on any cancelled or
+			// timed-out context. Report what completed instead.
+			break loop
 		case <-p.stopCh:
 			// Pipeline shut down mid-run; report what completed.
 			break loop
@@ -494,6 +526,17 @@ loop:
 	}
 
 done:
+	// An early exit can leave the submitted count unread. Take it if it has
+	// landed so Total reports what was actually queued rather than the n that
+	// was asked for.
+	if countCh != nil {
+		select {
+		case c := <-countCh:
+			sr.Total = c
+		default:
+		}
+	}
+
 	sr.EndTime = time.Now()
 	sr.Success = okCount
 	sr.Failed = errCount
@@ -584,8 +627,16 @@ func (p *Pipeline) Close() {
 		}
 		p.failQueuedJobs()
 
-		// Close drain pool after all workers are done
+		// Close the drain pool under the write lock. Workers are done, but
+		// Spray's collector calls asyncDrain from the caller's goroutine and is
+		// covered by neither wg nor inFlight, so the lock is what guarantees no
+		// send is in progress. Any sender parked in the select above has
+		// already woken on stopCh, so this acquires immediately.
+		p.drainMu.Lock()
+		p.drainClosed = true
 		close(p.drainCh)
+		p.drainMu.Unlock()
+
 		p.drainWg.Wait()
 	}
 }
