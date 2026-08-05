@@ -176,6 +176,16 @@ func (hs *handshakeState) run() (*Conn, error) {
 		if rec.typ != recordTypeHandshake {
 			return nil, fmt.Errorf("expected handshake record, got %d", rec.typ)
 		}
+		// RFC 8446 §5.1 forbids zero-length handshake fragments. Accepting them
+		// also punched a hole through maxNoProgressRecords: the budget is only
+		// charged for alerts and ChangeCipherSpec, so an empty handshake record
+		// advanced nothing yet cost nothing, and a peer could hold this loop
+		// open indefinitely. WrapConn only installs a deadline when the caller's
+		// context carries one, so on a context.Background() dial that is a
+		// permanent hang, not a slow failure.
+		if len(rec.data) == 0 {
+			return nil, fmt.Errorf("server sent a zero-length handshake fragment")
+		}
 		if err := shReader.add(rec.data); err != nil {
 			return nil, fmt.Errorf("read server hello: %w", err)
 		}
@@ -266,6 +276,14 @@ func (hs *handshakeState) run() (*Conn, error) {
 
 		if innerType != recordTypeHandshake {
 			return nil, fmt.Errorf("expected handshake inner type, got %d", innerType)
+		}
+
+		// Same rule as the plaintext loop above: an encrypted record whose
+		// inner content is an empty handshake fragment is illegal, and it is
+		// not charged against the no-progress budget because it arrives as
+		// application data.
+		if len(plaintext) == 0 {
+			return nil, fmt.Errorf("server sent a zero-length handshake fragment")
 		}
 
 		if err := hr.add(plaintext); err != nil {

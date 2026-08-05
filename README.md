@@ -171,7 +171,7 @@ client.PreConnect(ctx, "https://target.com", 100)
 | Option | Default | Description |
 |--------|---------|-------------|
 | `WithTimeout` | 30s | Total request timeout |
-| `WithProxy` | - | HTTP/SOCKS5 proxy URL |
+| `WithProxy` | - | HTTP/SOCKS5 proxy URL (applied to `https://` and `http://` alike) |
 | `WithInsecureSkipVerify` | false | Skip TLS cert verification |
 | `WithMaxIdleConnsPerHost` | 1000 | Idle connections per host |
 | `WithMaxIdleConns` | 10000 | Total idle connections |

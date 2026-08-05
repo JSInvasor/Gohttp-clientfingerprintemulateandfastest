@@ -273,25 +273,29 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-// dialWithDNSCache returns a DialContext function with DNS caching and
-// round-robin. Only h1Transport uses it, so the returned conn carries the
-// HTTP/1.1 header-order rewriter.
+// dialWithDNSCache returns the DialContext used for cleartext HTTP. Only
+// h1Transport uses it, so the returned conn carries the HTTP/1.1 header-order
+// rewriter.
+//
+// It goes through dialRaw, which is what applies the configured proxy or
+// rotator. Dialling t.dialer directly here — the previous behaviour — meant
+// every http:// request went out from the real IP no matter what WithProxy or
+// SetProxyRotator was set to, because http.Transport.Proxy is deliberately left
+// nil (proxying is handled at the dial layer so the rotator can score each
+// proxy's health). dialRaw falls back to a direct, DNS-cached dial when no
+// proxy is configured, so the unproxied path is unchanged.
 func (t *Transport) dialWithDNSCache() func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
-			conn, derr := t.dialer.DialContext(ctx, network, addr)
-			return newH1OrderConn(conn, t.headerOrder), derr
+			host, port = addr, "80"
 		}
 
-		ip, err := t.dnscache.lookup(host)
+		conn, err := t.dialRaw(ctx, network, host, port)
 		if err != nil {
-			conn, derr := t.dialer.DialContext(ctx, network, addr)
-			return newH1OrderConn(conn, t.headerOrder), derr
+			return nil, err
 		}
-
-		conn, err := t.dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
-		return newH1OrderConn(conn, t.headerOrder), err
+		return newH1OrderConn(conn, t.headerOrder), nil
 	}
 }
 
@@ -449,7 +453,8 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 
 		tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, t.ctlsBrowser)
 		if err != nil {
-			rawConn.Close()
+			// WrapConn closes rawConn on every failure path, so there is
+			// nothing to close here.
 			// WrapConn already prefixes "tls handshake:"; don't double-wrap.
 			// The underlying detail (e.g. "read server hello record: i/o
 			// timeout") is what makes proxy failures diagnosable, so keep it.
@@ -484,19 +489,23 @@ func isTransientDialErr(err error) bool {
 		strings.Contains(s, "unexpected EOF")
 }
 
-// secureRandIntn returns a uniform random int in [0, n) using crypto/rand.
+// secureRandIntn returns a random int in [0, n) using crypto/rand.
 // Used for handshake retry jitter; not on the hot path.
+//
+// The value is assembled as a uint32 and only then narrowed. Building it in an
+// int and negating a negative result was fine on 64-bit, where the four bytes
+// can never overflow, but on a 32-bit build 0x80000000 negates to itself — so
+// the result stayed negative, the caller's minMs+jitter could go below zero,
+// and time.After of a negative duration fires immediately, removing the very
+// backoff this exists to provide.
 func secureRandIntn(n int) int {
 	if n <= 0 {
 		return 0
 	}
 	var b [4]byte
 	_, _ = cryptorand.Read(b[:])
-	v := int(b[0])<<24 | int(b[1])<<16 | int(b[2])<<8 | int(b[3])
-	if v < 0 {
-		v = -v
-	}
-	return v % n
+	v := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+	return int(v % uint32(n))
 }
 
 // dialRaw establishes a raw TCP connection, optionally through a proxy.
@@ -969,6 +978,12 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 				mu.Unlock()
 				return
 			}
+			// Drain before closing so the HTTP/2 stream ends with END_STREAM.
+			// Closing an unfinished body makes the transport emit RST_STREAM,
+			// which Cloudflare and Akamai score as an abusive client — and a
+			// pre-warm burst would fire n of them back to back, which is a
+			// worse first impression than not pre-warming at all.
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
 			resp.Body.Close()
 		}()
 	}

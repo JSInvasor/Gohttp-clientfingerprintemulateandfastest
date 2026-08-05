@@ -70,13 +70,16 @@ func withBrowserProfile(profile BrowserProfile) Option {
 		c.browser = profile
 		c.transport.DisableCompression = true
 
+		// Both constants live in headers.go so acceptFor can recognise them as
+		// profile defaults and swap them for */* on a fetch/XHR. Inlining the
+		// strings here is what let the Chrome default drift out of that set.
 		switch profile {
 		case Chrome150:
 			c.acceptLanguage = "en-US,en;q=0.9"
-			c.accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+			c.accept = chromeNavigateAccept
 		default:
 			c.acceptLanguage = "en-US,en;q=0.9"
-			c.accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+			c.accept = defaultNavigateAccept
 		}
 	}
 }

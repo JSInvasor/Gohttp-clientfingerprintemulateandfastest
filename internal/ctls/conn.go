@@ -82,7 +82,24 @@ func (c *Conn) Read(b []byte) (int, error) {
 		return 0, c.readErr
 	}
 
-	// Read records until we get application data
+	// Read records until we get application data.
+	//
+	// idle counts consecutive records that yielded no application data —
+	// ChangeCipherSpec, warning alerts, post-handshake messages and empty
+	// payloads all fall through with a `continue`. Each is legal, but none of
+	// them is bounded by anything else: net/http2 drives liveness with PINGs
+	// rather than read deadlines, so without a ceiling a peer can pin this
+	// goroutine forever by trickling records that say nothing. A real peer
+	// sends a handful (two session tickets is typical), so 64 in a row is far
+	// past anything legitimate. The counter is per-Read, so it resets as soon
+	// as one byte of application data comes through.
+	idle := 0
+	noProgress := func() error {
+		if idle++; idle > maxNoProgressRecords {
+			return fmt.Errorf("peer sent %d records carrying no application data", idle)
+		}
+		return nil
+	}
 	for {
 		rec, err := readRawRecord(c.br)
 		if err != nil {
@@ -92,6 +109,10 @@ func (c *Conn) Read(b []byte) (int, error) {
 
 		// Skip ChangeCipherSpec
 		if rec.typ == recordTypeChangeCipherSpec {
+			if err := noProgress(); err != nil {
+				c.readErr = err
+				return 0, err
+			}
 			continue
 		}
 
@@ -109,6 +130,10 @@ func (c *Conn) Read(b []byte) (int, error) {
 		switch innerType {
 		case recordTypeApplicationData:
 			if len(plaintext) == 0 {
+				if err := noProgress(); err != nil {
+					c.readErr = err
+					return 0, err
+				}
 				continue
 			}
 			n := copy(b, plaintext)
@@ -133,10 +158,18 @@ func (c *Conn) Read(b []byte) (int, error) {
 					return 0, c.readErr
 				}
 			}
+			if err := noProgress(); err != nil {
+				c.readErr = err
+				return 0, err
+			}
 			continue
 
 		case recordTypeHandshake:
 			if err := c.handlePostHandshake(plaintext); err != nil {
+				c.readErr = err
+				return 0, err
+			}
+			if err := noProgress(); err != nil {
 				c.readErr = err
 				return 0, err
 			}

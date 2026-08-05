@@ -59,11 +59,29 @@ var safariIOS18HeaderOrder = []string{
 	"Accept-Encoding",
 }
 
-// defaultNavigateAccept is the Accept header a browser sends for a top-level
+// defaultNavigateAccept is the Accept header Safari sends for a top-level
 // document load. It is also clientConfig's default, which is what lets
 // fetch-mode requests distinguish "the caller left Accept alone" from "the
 // caller chose this value deliberately".
 const defaultNavigateAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+// chromeNavigateAccept is the same thing for Chrome, which advertises the image
+// formats and signed-exchange support Safari does not. withBrowserProfile
+// installs it as the Chrome profile's default.
+const chromeNavigateAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+
+// isBuiltinNavigateAccept reports whether accept is one of the profile
+// defaults rather than a value the caller chose with WithAccept.
+//
+// Matching only Safari's constant was a fingerprint bug with teeth: the Chrome
+// profile installs chromeNavigateAccept, so acceptFor never recognised it and
+// every Chrome fetch/XHR went out with the document Accept next to
+// Sec-Fetch-Dest: empty and Sec-Fetch-Mode: cors. No real Chrome emits that
+// combination — an XHR always carries Accept: */* — so it undid exactly the
+// signal fetchMode exists to get right.
+func isBuiltinNavigateAccept(accept string) bool {
+	return accept == defaultNavigateAccept || accept == chromeNavigateAccept
+}
 
 // fetchMode distinguishes a top-level navigation from a script-initiated
 // fetch/XHR.
@@ -107,7 +125,7 @@ func fetchModeFor(req *http.Request) fetchMode {
 // value always wins; only the built-in navigation default is swapped for the
 // */* that fetch and XHR send.
 func acceptFor(configured string, mode fetchMode) string {
-	if mode == modeFetch && configured == defaultNavigateAccept {
+	if mode == modeFetch && isBuiltinNavigateAccept(configured) {
 		return "*/*"
 	}
 	return configured

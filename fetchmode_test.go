@@ -178,6 +178,51 @@ func TestOriginFollowsReferer(t *testing.T) {
 	}
 }
 
+// TestProfileDefaultAcceptBecomesWildcardOnFetch pins the Accept swap against
+// the Accept each profile actually installs, not the one the test hands in.
+//
+// requestFor above passes defaultNavigateAccept for both browsers, which is
+// Safari's string — so it could not see that the Chrome profile installs its
+// own. acceptFor matched Safari's constant alone, so a real
+// Emulate(Chrome150) client sent every fetch/XHR with the document Accept next
+// to Sec-Fetch-Dest: empty and Sec-Fetch-Mode: cors. No Chrome produces that.
+func TestProfileDefaultAcceptBecomesWildcardOnFetch(t *testing.T) {
+	for _, profile := range []struct {
+		name string
+		p    BrowserProfile
+	}{{"safari", SafariIOS18}, {"chrome", Chrome150}} {
+		t.Run(profile.name, func(t *testing.T) {
+			// Build the config exactly as Emulate does, so the Accept under
+			// test is the profile's own default.
+			cfg := defaultClientConfig()
+			withBrowserProfile(profile.p)(&cfg)
+
+			nav, err := http.NewRequest("GET", "https://example.com/", nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			applyBrowserHeaders(nav, cfg.browser, cfg.accept, cfg.acceptLanguage)
+			if got := nav.Header.Get("Accept"); got != cfg.accept {
+				t.Errorf("navigation Accept = %q, want the profile default %q", got, cfg.accept)
+			}
+
+			api, err := http.NewRequest("POST", "https://example.com/api", nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			api.Header.Set("Content-Type", "application/json")
+			applyBrowserHeaders(api, cfg.browser, cfg.accept, cfg.acceptLanguage)
+			if got := api.Header.Get("Accept"); got != "*/*" {
+				t.Errorf("fetch Accept = %q, want */* (a document Accept beside Sec-Fetch-Dest: empty is a bot signal)", got)
+			}
+			// The rest of the fetch annotation has to agree with it.
+			if got := api.Header.Get("Sec-Fetch-Dest"); got != "empty" {
+				t.Errorf("fetch Sec-Fetch-Dest = %q, want empty", got)
+			}
+		})
+	}
+}
+
 // TestConfiguredAcceptSurvivesFetchMode pins that WithAccept is honoured. Only
 // the built-in navigation default is swapped for */*.
 func TestConfiguredAcceptSurvivesFetchMode(t *testing.T) {

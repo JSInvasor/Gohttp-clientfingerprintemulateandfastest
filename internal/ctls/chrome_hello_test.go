@@ -168,3 +168,59 @@ func parseALPSProtocols(t *testing.T, msg []byte) []string {
 	}
 	return out
 }
+
+// TestChromeGreaseExtensionShapes pins the payloads of the two GREASE
+// extensions.
+//
+// BoringSSL's ssl_add_clienthello_tlsext writes the first GREASE extension with
+// a zero-length body and the second with exactly one 0x00 byte (RFC 8701 §3.1
+// suggests varying them; BoringSSL picks these two shapes and never varies).
+// Chrome inherits that verbatim, so a hello carrying two 1-byte GREASE bodies
+// is one byte longer than any real Chrome's. JA3 and JA4 hash extension type
+// IDs only and cannot see it — the raw ClientHello can.
+func TestChromeGreaseExtensionShapes(t *testing.T) {
+	km, err := generateKeyMaterial()
+	if err != nil {
+		t.Fatalf("generateKeyMaterial: %v", err)
+	}
+
+	for i := 0; i < 8; i++ {
+		gs := newGreaseSet()
+		exts, err := buildChromeExtensions("example.com", []string{"h2", "http/1.1"}, km, gs)
+		if err != nil {
+			t.Fatalf("buildChromeExtensions: %v", err)
+		}
+
+		type ext struct {
+			typ  uint16
+			data []byte
+		}
+		var all []ext
+		for off := 0; off < len(exts); {
+			if off+4 > len(exts) {
+				t.Fatalf("truncated extension at offset %d", off)
+			}
+			typ := uint16(exts[off])<<8 | uint16(exts[off+1])
+			n := int(uint16(exts[off+2])<<8 | uint16(exts[off+3]))
+			if off+4+n > len(exts) {
+				t.Fatalf("extension 0x%04x overruns the block", typ)
+			}
+			all = append(all, ext{typ: typ, data: exts[off+4 : off+4+n]})
+			off += 4 + n
+		}
+
+		first, last := all[0], all[len(all)-1]
+		if !isGreaseValue(first.typ) {
+			t.Fatalf("first extension is 0x%04x, want a GREASE value", first.typ)
+		}
+		if !isGreaseValue(last.typ) {
+			t.Fatalf("last extension is 0x%04x, want a GREASE value", last.typ)
+		}
+		if len(first.data) != 0 {
+			t.Errorf("first GREASE extension carries %d bytes, want 0 (BoringSSL sends it empty)", len(first.data))
+		}
+		if len(last.data) != 1 || last.data[0] != 0x00 {
+			t.Errorf("last GREASE extension carries %v, want a single 0x00 byte", last.data)
+		}
+	}
+}

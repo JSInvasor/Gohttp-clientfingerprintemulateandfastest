@@ -144,14 +144,23 @@ func buildChromeExtensions(serverName string, alpn []string, km *keyMaterial, gs
 	}
 
 	var out []byte
-	// First GREASE: pinned at index 0.
-	out = appendExt(out, gs.extFirst, []byte{0x00})
+	// First GREASE: pinned at index 0, and empty.
+	//
+	// The two GREASE extensions are not interchangeable. BoringSSL's
+	// ssl_add_clienthello_tlsext writes the first one with a zero-length body
+	// and the second with exactly one 0x00 byte, so a Chrome ClientHello always
+	// carries one of each. Emitting a 1-byte body here too made the hello a
+	// byte longer than any real Chrome's. JA3 and JA4 both hash extension type
+	// IDs only and so cannot see it, but the raw ClientHello — which is what
+	// byte-level fingerprints and total-length heuristics look at — can.
+	out = appendExt(out, gs.extFirst, nil)
 	for _, e := range middle {
 		out = appendExt(out, e.typ, e.data)
 	}
-	// Last GREASE: pinned at the end. (pre_shared_key would have to come after
-	// this on a resumed session per RFC 8446, but we don't send PSK on initial
-	// connections, so the trailing GREASE is the final extension.)
+	// Last GREASE: pinned at the end, one zero byte. (pre_shared_key would have
+	// to come after this on a resumed session per RFC 8446, but we don't send
+	// PSK on initial connections, so the trailing GREASE is the final
+	// extension.)
 	out = appendExt(out, gs.extLast, []byte{0x00})
 
 	return out, nil
