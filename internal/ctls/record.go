@@ -68,6 +68,18 @@ func readRawRecord(r io.Reader) (*tlsRecord, error) {
 	}
 
 	typ := header[0]
+
+	// RFC 8446 §5.1 defines exactly four content types, and every record
+	// version from SSL 3.0 onwards begins with 0x03. A header failing either
+	// check is not a TLS record at all, and the length field read out of it is
+	// meaningless — a cleartext proxy error page reports itself as
+	// "record too large: 20527 bytes" (the ASCII of "P/" in "HTTP/1.1"),
+	// which hides the one fact that would have explained the failure. Show the
+	// bytes instead.
+	if typ < recordTypeChangeCipherSpec || typ > recordTypeApplicationData || header[1] != 0x03 {
+		return nil, fmt.Errorf("not a TLS record: header %s", headerPreview(header[:]))
+	}
+
 	length := binary.BigEndian.Uint16(header[3:])
 
 	if length > maxCiphertextRecord {
@@ -80,6 +92,19 @@ func readRawRecord(r io.Reader) (*tlsRecord, error) {
 	}
 
 	return &tlsRecord{typ: typ, data: data}, nil
+}
+
+// headerPreview renders header bytes as hex, appending the ASCII form when
+// every byte is printable. That suffix is the whole point: it turns an opaque
+// "48 54 54 50 2f" into "HTTP/", which names the failure — a proxy that
+// answered the CONNECT in cleartext, a captive portal, a plain-HTTP port.
+func headerPreview(b []byte) string {
+	for _, c := range b {
+		if c < 0x20 || c > 0x7e {
+			return fmt.Sprintf("% x", b)
+		}
+	}
+	return fmt.Sprintf("% x (%q)", b, b)
 }
 
 // encryptedRecord handles AEAD encryption/decryption of TLS 1.3 records.

@@ -116,19 +116,45 @@ func (hr *handshakeReader) next() ([]byte, error) {
 
 // alertError turns an alert record body into an error. Warning-level alerts
 // other than close_notify carry no failure, so they return nil and the caller
-// keeps reading.
+// keeps reading — but the caller must also record them via warningAlert,
+// because a server that warns and then hangs up otherwise leaves nothing
+// behind but an unexplained EOF.
 func alertError(body []byte) error {
 	if len(body) < 2 {
 		return fmt.Errorf("malformed alert record")
 	}
 	level, desc := body[0], body[1]
 	if level == alertLevelFatal {
-		return fmt.Errorf("server alert: %d", desc)
+		return fmt.Errorf("server alert: %s", describeAlert(desc))
 	}
 	if desc == alertCloseNotify {
 		return fmt.Errorf("server closed connection during handshake")
 	}
 	return nil
+}
+
+// warningAlert describes a non-fatal, non-close_notify alert, or returns ""
+// for anything alertError already turns into a failure.
+func warningAlert(body []byte) string {
+	if len(body) < 2 || body[0] != alertLevelWarning || body[1] == alertCloseNotify {
+		return ""
+	}
+	return describeAlert(body[1])
+}
+
+// readError wraps a record-read failure, naming the last warning alert the
+// server sent if there was one.
+//
+// Warning alerts are skipped so the handshake can continue, which is correct,
+// but servers routinely warn (unrecognized_name, say) and then drop the
+// connection instead of alerting fatally. Without this the caller sees only
+// "read record header: EOF" — and blaze's classifier reads that as
+// "tunnel dropped by proxy", blaming the proxy for a server-side rejection.
+func readError(stage string, err error, lastWarning string) error {
+	if lastWarning != "" {
+		return fmt.Errorf("%s: %w (server had sent warning alert %s)", stage, err, lastWarning)
+	}
+	return fmt.Errorf("%s: %w", stage, err)
 }
 
 func (hs *handshakeState) run() (*Conn, error) {
@@ -154,10 +180,11 @@ func (hs *handshakeState) run() (*Conn, error) {
 	var shReader handshakeReader
 	var serverHelloMsg []byte
 	idleRecords := 0
+	lastWarning := ""
 	for serverHelloMsg == nil {
 		rec, err := readRawRecord(hs.br)
 		if err != nil {
-			return nil, fmt.Errorf("read server hello record: %w", err)
+			return nil, readError("read server hello record", err, lastWarning)
 		}
 		if rec.typ == recordTypeAlert || rec.typ == recordTypeChangeCipherSpec {
 			if idleRecords++; idleRecords > maxNoProgressRecords {
@@ -168,13 +195,16 @@ func (hs *handshakeState) run() (*Conn, error) {
 			if err := alertError(rec.data); err != nil {
 				return nil, err
 			}
+			if w := warningAlert(rec.data); w != "" {
+				lastWarning = w
+			}
 			continue
 		}
 		if rec.typ == recordTypeChangeCipherSpec {
 			continue
 		}
 		if rec.typ != recordTypeHandshake {
-			return nil, fmt.Errorf("expected handshake record, got %d", rec.typ)
+			return nil, fmt.Errorf("expected handshake record, got %s", describeRecordType(rec.typ))
 		}
 		// RFC 8446 §5.1 forbids zero-length handshake fragments. Accepting them
 		// also punched a hole through maxNoProgressRecords: the budget is only
@@ -229,10 +259,11 @@ func (hs *handshakeState) run() (*Conn, error) {
 	var hr handshakeReader
 
 	idleRecords = 0
+	lastWarning = ""
 	for !finished {
 		rec, err := readRawRecord(hs.br)
 		if err != nil {
-			return nil, fmt.Errorf("read handshake: %w", err)
+			return nil, readError("read handshake", err, lastWarning)
 		}
 
 		if rec.typ != recordTypeApplicationData {
@@ -250,11 +281,14 @@ func (hs *handshakeState) run() (*Conn, error) {
 			if err := alertError(rec.data); err != nil {
 				return nil, err
 			}
+			if w := warningAlert(rec.data); w != "" {
+				lastWarning = w
+			}
 			continue
 		}
 
 		if rec.typ != recordTypeApplicationData {
-			return nil, fmt.Errorf("expected encrypted record, got type %d", rec.typ)
+			return nil, fmt.Errorf("expected encrypted record, got %s", describeRecordType(rec.typ))
 		}
 
 		plaintext, innerType, err := serverHSER.decrypt(rec.data)
@@ -266,6 +300,9 @@ func (hs *handshakeState) run() (*Conn, error) {
 			if err := alertError(plaintext); err != nil {
 				return nil, err
 			}
+			if w := warningAlert(plaintext); w != "" {
+				lastWarning = w
+			}
 			// A warning alert decrypts fine but advances nothing, so it counts
 			// against the same budget as a plaintext one.
 			if idleRecords++; idleRecords > maxNoProgressRecords {
@@ -275,7 +312,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 		}
 
 		if innerType != recordTypeHandshake {
-			return nil, fmt.Errorf("expected handshake inner type, got %d", innerType)
+			return nil, fmt.Errorf("expected handshake inner type, got %s", describeRecordType(innerType))
 		}
 
 		// Same rule as the plaintext loop above: an encrypted record whose

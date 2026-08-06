@@ -1,5 +1,7 @@
 package ctls
 
+import "fmt"
+
 // TLS record content types
 const (
 	recordTypeChangeCipherSpec = 20
@@ -7,6 +9,26 @@ const (
 	recordTypeHandshake        = 22
 	recordTypeApplicationData  = 23
 )
+
+// describeRecordType renders a content type as "name(N)". A bare number in an
+// error is a lookup the reader has to do by hand, and "got 21" in particular
+// reads as a length or a count rather than as an alert.
+func describeRecordType(typ uint8) string {
+	var name string
+	switch typ {
+	case recordTypeChangeCipherSpec:
+		name = "change_cipher_spec"
+	case recordTypeAlert:
+		name = "alert"
+	case recordTypeHandshake:
+		name = "handshake"
+	case recordTypeApplicationData:
+		name = "application_data"
+	default:
+		return fmt.Sprintf("unknown(%d)", typ)
+	}
+	return fmt.Sprintf("%s(%d)", name, typ)
+}
 
 // TLS handshake message types
 const (
@@ -192,3 +214,83 @@ const (
 	alertHandshakeFailure = 40
 	alertDecryptError     = 51
 )
+
+// describeAlert renders an alert description as "name (N)" using the registry
+// in RFC 8446 §6.2.
+//
+// The description byte is the only thing a rejecting server tells us about why
+// it rejected us, so it is the difference between a debuggable failure and a
+// number. The ones that actually show up against a fingerprint-emulating
+// client are worth knowing by sight:
+//
+//   - handshake_failure(40): nothing in the ClientHello was acceptable —
+//     usually the cipher, group or signature-algorithm list, or an edge
+//     refusing the fingerprint outright.
+//   - protocol_version(70): the server cannot do TLS 1.3, which this package
+//     only speaks.
+//   - unrecognized_name(112): the server has no certificate for the SNI we
+//     sent. Dialing an IP, or a Host that does not match the vhost, lands here.
+//   - internal_error(80) / access_denied(49): commonly what an edge or WAF
+//     returns when it is shedding load or has decided to block the client.
+func describeAlert(desc uint8) string {
+	var name string
+	switch desc {
+	case alertCloseNotify:
+		name = "close_notify"
+	case alertUnexpectedMsg:
+		name = "unexpected_message"
+	case 20:
+		name = "bad_record_mac"
+	case 22:
+		name = "record_overflow"
+	case alertHandshakeFailure:
+		name = "handshake_failure"
+	case 42:
+		name = "bad_certificate"
+	case 43:
+		name = "unsupported_certificate"
+	case 44:
+		name = "certificate_revoked"
+	case 45:
+		name = "certificate_expired"
+	case 46:
+		name = "certificate_unknown"
+	case 47:
+		name = "illegal_parameter"
+	case 48:
+		name = "unknown_ca"
+	case 49:
+		name = "access_denied"
+	case 50:
+		name = "decode_error"
+	case alertDecryptError:
+		name = "decrypt_error"
+	case 70:
+		name = "protocol_version"
+	case 71:
+		name = "insufficient_security"
+	case 80:
+		name = "internal_error"
+	case 86:
+		name = "inappropriate_fallback"
+	case 90:
+		name = "user_canceled"
+	case 109:
+		name = "missing_extension"
+	case 110:
+		name = "unsupported_extension"
+	case 112:
+		name = "unrecognized_name"
+	case 113:
+		name = "bad_certificate_status_response"
+	case 115:
+		name = "unknown_psk_identity"
+	case 116:
+		name = "certificate_required"
+	case 120:
+		name = "no_application_protocol"
+	default:
+		return fmt.Sprintf("unknown alert (%d)", desc)
+	}
+	return fmt.Sprintf("%s (%d)", name, desc)
+}

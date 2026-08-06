@@ -163,6 +163,14 @@ func (cg *clientGroup) Close() {
 func classifyErr(errMsg string) string {
 	lc := strings.ToLower(errMsg)
 	switch {
+	// An alert is the server stating its own reason for the rejection, so it
+	// outranks every guess below it. Without this case the certificate branch
+	// swallows alerts like certificate_required(116) and reports them as
+	// "MITM/transparent proxy?", pointing debugging at the wrong layer.
+	case strings.Contains(lc, "server alert:"):
+		return trimErr(errMsg, "tls handshake: ")
+	case strings.Contains(lc, "not a tls record"):
+		return trimErr(errMsg, "not TLS on the wire: ")
 	case strings.Contains(lc, "connect failed") || strings.Contains(lc, "connect "):
 		return trimErr(errMsg, "proxy CONNECT failed: ")
 	case strings.Contains(lc, "i/o timeout") || strings.Contains(lc, "deadline exceeded") || strings.Contains(lc, "timeout"):
@@ -188,6 +196,13 @@ func classifyErr(errMsg string) string {
 func trimErr(errMsg, prefix string) string {
 	if len(errMsg) > 200 {
 		errMsg = errMsg[:200] + "..."
+	}
+	// The prefix is a label for the reader, not a second copy of what the
+	// error already says. ctls wraps its failures with "tls handshake: ", so
+	// prepending unconditionally produced "tls handshake: ... tls handshake:
+	// server alert: ...".
+	if prefix != "" && strings.Contains(errMsg, prefix) {
+		return errMsg
 	}
 	return prefix + errMsg
 }
