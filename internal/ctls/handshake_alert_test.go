@@ -100,8 +100,8 @@ func TestFatalAlertIsNamed(t *testing.T) {
 // Warning alerts are skipped so the handshake can continue, which is correct
 // per RFC 8446 §6.1 — but plenty of servers warn (unrecognized_name is the
 // common one) and then just close instead of alerting fatally. The skip left
-// nothing behind but "read record header: EOF", which blaze's classifier reads
-// as "tunnel dropped by proxy" — blaming the proxy for a server rejection.
+// nothing behind but "read record header: EOF", which reads as a dropped
+// connection — blaming the network for a rejection the server explained.
 func TestWarningAlertSurvivesTheClose(t *testing.T) {
 	got := alertProbe(t, func(c net.Conn) {
 		writeRawRecord(c, recordTypeAlert, []byte{alertLevelWarning, 112})

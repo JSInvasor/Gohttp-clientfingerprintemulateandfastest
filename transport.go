@@ -396,8 +396,9 @@ func (t *Transport) prefersHTTP1(key string) bool {
 // i/o timeout). Under heavy parallel dialing - thousands of workers all
 // opening connections to the same edge - some TCP/TLS handshakes get dropped
 // by the load balancer or fail mid-handshake. Real browsers retry these
-// transparently; our previous behavior surfaced them to the worker as
-// "tls handshake failed" errors, polluting blaze's error report.
+// transparently; our previous behavior surfaced every one of them to the
+// caller as a "tls handshake failed" error, burying the failures that mean
+// something under the ones that only needed a second try.
 func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {

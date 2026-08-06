@@ -148,8 +148,8 @@ func warningAlert(body []byte) string {
 // Warning alerts are skipped so the handshake can continue, which is correct,
 // but servers routinely warn (unrecognized_name, say) and then drop the
 // connection instead of alerting fatally. Without this the caller sees only
-// "read record header: EOF" — and blaze's classifier reads that as
-// "tunnel dropped by proxy", blaming the proxy for a server-side rejection.
+// "read record header: EOF", which reads as a dropped connection and invites
+// the caller to blame the network for a rejection the server explained.
 func readError(stage string, err error, lastWarning string) error {
 	if lastWarning != "" {
 		return fmt.Errorf("%s: %w (server had sent warning alert %s)", stage, err, lastWarning)
