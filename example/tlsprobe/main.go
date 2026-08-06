@@ -18,6 +18,12 @@
 //	go run ./example/tlsprobe -target example.com
 //	go run ./example/tlsprobe -target example.com -proxy http://user:pass@host:8080
 //	go run ./example/tlsprobe -target 1.2.3.4:443 -sni example.com
+//
+// A handshake that only fails under load fails for a different reason than one
+// that fails on its own. -n repeats it at a concurrency you choose and buckets
+// the outcomes, so the two are told apart by counting rather than by guessing:
+//
+//	go run ./example/tlsprobe -target example.com -n 500 -c 64
 package main
 
 import (
@@ -31,7 +37,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -47,6 +56,9 @@ func main() {
 	proxyURL := flag.String("proxy", "", "http:// or socks5:// proxy to reach the target through")
 	insecure := flag.Bool("insecure", false, "skip certificate verification")
 	timeout := flag.Duration("timeout", 10*time.Second, "per-attempt timeout")
+	count := flag.Int("n", 0, "after the single pass, run this many handshakes to reproduce a failure that only appears under load")
+	conc := flag.Int("c", 32, "concurrent handshakes during the -n run")
+	profile := flag.String("profile", "chrome", "profile for the -n run: chrome, safari or stdlib")
 	flag.Parse()
 
 	if *target == "" {
@@ -114,6 +126,150 @@ func main() {
 
 	fmt.Println()
 	verdict(control, results)
+
+	if *count > 0 {
+		singleOK := control.ok
+		if res, ok := results[*profile]; ok {
+			singleOK = res.ok
+		}
+		fmt.Println()
+		loadRun(dial, addr, name, *profile, *count, *conc, singleOK, *insecure, *timeout)
+	}
+}
+
+// loadRun repeats the handshake to catch what a single one cannot see. An edge
+// that answers one hello happily still drops them under a few thousand
+// parallel dials, and that failure arrives as the same alert or a bare EOF —
+// so the only way to tell a fingerprint rejection from a capacity limit is to
+// count how the outcomes split at the volume that produced them.
+func loadRun(dial func(string) (net.Conn, error), addr, name, profile string, count, conc int, singleOK, insecure bool, timeout time.Duration) {
+	if conc < 1 {
+		conc = 1
+	}
+	if conc > count {
+		conc = count
+	}
+
+	var attempt func() (time.Duration, error)
+	switch profile {
+	case "stdlib":
+		attempt = func() (time.Duration, error) {
+			start := time.Now()
+			res := probeStdlib(dial, addr, name, insecure, timeout)
+			return time.Since(start), res.err
+		}
+	case "safari", "chrome":
+		browser := ctls.BrowserChrome
+		if profile == "safari" {
+			browser = ctls.BrowserSafari
+		}
+		attempt = func() (time.Duration, error) {
+			start := time.Now()
+			res := probeCtls(dial, addr, name, browser, insecure, timeout)
+			return time.Since(start), res.err
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "unknown -profile %q (chrome, safari or stdlib)\n", profile)
+		os.Exit(2)
+	}
+
+	fmt.Printf("load     %d handshakes, %d concurrent, %s\n", count, conc, profile)
+
+	type outcome struct {
+		took time.Duration
+		err  error
+	}
+	jobs := make(chan struct{})
+	out := make(chan outcome, count)
+
+	var wg sync.WaitGroup
+	started := time.Now()
+	for i := 0; i < conc; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range jobs {
+				took, err := attempt()
+				out <- outcome{took, err}
+			}
+		}()
+	}
+	for i := 0; i < count; i++ {
+		jobs <- struct{}{}
+	}
+	close(jobs)
+	wg.Wait()
+	close(out)
+	elapsed := time.Since(started)
+
+	var oks []time.Duration
+	failures := map[string]int{}
+	for o := range out {
+		if o.err == nil {
+			oks = append(oks, o.took)
+			continue
+		}
+		failures[normalize(o.err.Error())]++
+	}
+
+	pct := func(n int) float64 { return float64(n) * 100 / float64(count) }
+	fmt.Printf("         %v elapsed, %.0f handshakes/sec\n", elapsed.Round(time.Millisecond), float64(count)/elapsed.Seconds())
+
+	if len(oks) > 0 {
+		sort.Slice(oks, func(i, j int) bool { return oks[i] < oks[j] })
+		fmt.Printf("ok       %d (%.1f%%)  median %v  p95 %v  max %v\n",
+			len(oks), pct(len(oks)),
+			oks[len(oks)/2].Round(time.Millisecond),
+			oks[(len(oks)*95)/100].Round(time.Millisecond),
+			oks[len(oks)-1].Round(time.Millisecond))
+	}
+	if len(failures) == 0 {
+		fmt.Println("fail     0")
+		fmt.Println()
+		fmt.Println("Nothing failed at this volume. If the real workload fails, raise -n")
+		fmt.Println("and -c until they match it — the failure lives in the concurrency,")
+		fmt.Println("not in the handshake.")
+		return
+	}
+
+	total := 0
+	for _, n := range failures {
+		total += n
+	}
+	fmt.Printf("fail     %d (%.1f%%)\n", total, pct(total))
+
+	type bucket struct {
+		msg string
+		n   int
+	}
+	buckets := make([]bucket, 0, len(failures))
+	for msg, n := range failures {
+		buckets = append(buckets, bucket{msg, n})
+	}
+	sort.Slice(buckets, func(i, j int) bool { return buckets[i].n > buckets[j].n })
+	for _, b := range buckets {
+		fmt.Printf("  %5d  %s\n", b.n, b.msg)
+	}
+
+	fmt.Println()
+	if singleOK {
+		fmt.Println("This profile completed its single handshake and fails here, so the")
+		fmt.Println("failure is about volume rather than the ClientHello: the edge is")
+		fmt.Println("shedding load. Lower -c until it disappears — that number is the")
+		fmt.Println("target's ceiling for this source address, and no fingerprint change")
+		fmt.Println("moves it.")
+		return
+	}
+	fmt.Println("The single handshake above failed too, so this is not about volume.")
+	fmt.Println("Read the verdict there: repeating a rejection only counts it.")
+}
+
+// normalize collapses the endpoint addresses in transport errors so the same
+// failure does not land in a hundred buckets, one per ephemeral port.
+var addrPattern = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b`)
+
+func normalize(msg string) string {
+	return addrPattern.ReplaceAllString(msg, "IP:PORT")
 }
 
 type result struct {
