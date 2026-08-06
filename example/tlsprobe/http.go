@@ -37,6 +37,12 @@ type httpResult struct {
 	signal   edgeSignal
 }
 
+// clean reports whether this response is the target simply answering: a 2xx
+// with nothing in it that names an edge decision.
+func (r httpResult) clean() bool {
+	return r.err == nil && r.signal.kind == "" && r.status >= 200 && r.status < 300
+}
+
 // edgeSignal is what the response says about who answered and why. vendor is
 // empty when nothing recognisable answered; kind is empty when the response
 // carries no sign of an edge decision at all.
@@ -46,8 +52,10 @@ type edgeSignal struct {
 	why    string // the evidence, quoted back
 }
 
-// httpRun requests target once per profile and reports each response.
-func httpRun(reqURL, proxyURL string, profiles []string, pinned bool, insecure bool, timeout time.Duration) {
+// httpRun requests target once per profile and reports each response. The
+// results are returned because the load leg needs them: whether one request was
+// already refused decides whether repeating it is measuring volume at all.
+func httpRun(reqURL, proxyURL string, profiles []string, pinned bool, insecure bool, timeout time.Duration) map[string]httpResult {
 	fmt.Printf("http     GET %s  (redirects not followed)\n", reqURL)
 	if pinned {
 		// -target pinned an address that the client cannot be told to use, so
@@ -65,6 +73,7 @@ func httpRun(reqURL, proxyURL string, profiles []string, pinned bool, insecure b
 
 	fmt.Println()
 	httpVerdict(profiles, results)
+	return results
 }
 
 // newProbeClient builds the client the HTTP legs request with. Both legs use
@@ -149,7 +158,7 @@ type bucketRow struct {
 // nothing about what the origin does once those connections start asking it
 // for pages, and an edge that never challenges a single request may well
 // challenge the five hundredth from the same address.
-func httpLoad(reqURL, proxyURL, profile string, count, conc int, insecure bool, timeout time.Duration) {
+func httpLoad(reqURL, proxyURL, profile string, count, conc int, singleClean, insecure bool, timeout time.Duration) {
 	if conc < 1 {
 		conc = 1
 	}
@@ -168,6 +177,7 @@ func httpLoad(reqURL, proxyURL, profile string, count, conc int, insecure bool, 
 
 	type outcome struct {
 		took time.Duration
+		at   time.Duration // when it finished, from the start of the run
 		key  string
 		ok   bool
 	}
@@ -185,11 +195,11 @@ func httpLoad(reqURL, proxyURL, profile string, count, conc int, insecure bool, 
 					start := time.Now()
 					resp, err := client.Get(reqURL)
 					if err != nil {
-						return outcome{time.Since(start), "error: " + normalize(err.Error()), false}
+						return outcome{time.Since(start), time.Since(started), "error: " + normalize(err.Error()), false}
 					}
 					defer resp.Close()
 					body, _ := resp.Bytes()
-					took := time.Since(start)
+					took, at := time.Since(start), time.Since(started)
 
 					status := resp.StatusCode()
 					key := fmt.Sprintf("%d %s", status, http.StatusText(status))
@@ -200,7 +210,7 @@ func httpLoad(reqURL, proxyURL, profile string, count, conc int, insecure bool, 
 						}
 						key += fmt.Sprintf(" — %s %s", who, sig.kind)
 					}
-					return outcome{took, key, status >= 200 && status < 300}
+					return outcome{took, at, key, status >= 200 && status < 300}
 				}()
 			}
 		}()
@@ -214,9 +224,11 @@ func httpLoad(reqURL, proxyURL, profile string, count, conc int, insecure bool, 
 	elapsed := time.Since(started)
 
 	var oks []time.Duration
+	done := make([]outcome, 0, count)
 	buckets := map[string]int{}
 	for o := range out {
 		buckets[o.key]++
+		done = append(done, o)
 		if o.ok {
 			oks = append(oks, o.took)
 		}
@@ -244,14 +256,46 @@ func httpLoad(reqURL, proxyURL, profile string, count, conc int, insecure bool, 
 		fmt.Printf("  %5d  %s\n", r.n, r.key)
 	}
 
+	// A limiter answers the request that crossed its threshold, not the ones
+	// before it. The count that got through first is the actual ceiling, and
+	// totals hide it: 83 of 500 says nothing about whether they were the first
+	// 83 or scattered through the run.
+	sort.Slice(done, func(i, j int) bool { return done[i].at < done[j].at })
+	okBefore, onset := 0, time.Duration(-1)
+	var onsetKey string
+	for _, o := range done {
+		if o.ok {
+			okBefore++
+			continue
+		}
+		onset, onsetKey = o.at, o.key
+		break
+	}
+	if onset >= 0 {
+		fmt.Printf("onset    first %s at %v, after %d clean responses\n",
+			shortKey(onsetKey), onset.Round(time.Millisecond), okBefore)
+	}
+
 	fmt.Println()
-	loadVerdict(rows, len(oks), count)
+	loadVerdict(rows, len(oks), count, singleClean)
+}
+
+// shortKey trims a bucket label to its status for the onset line, where the
+// vendor and the decision have already been printed above.
+func shortKey(key string) string {
+	if strings.HasPrefix(key, "error") {
+		return "error"
+	}
+	if i := strings.Index(key, " — "); i >= 0 {
+		key = key[:i]
+	}
+	return key
 }
 
 // loadVerdict reads the split of outcomes. What matters is not how many failed
 // but which way they failed: the edge, the origin and the connection each fail
 // differently and only one of them has anything to do with the fingerprint.
-func loadVerdict(rows []bucketRow, okCount, total int) {
+func loadVerdict(rows []bucketRow, okCount, total int, singleClean bool) {
 	var sawChallenge, sawRateLimit, sawServerErr, sawTransport bool
 	for _, r := range rows {
 		switch {
@@ -274,6 +318,15 @@ func loadVerdict(rows []bucketRow, okCount, total int) {
 		fmt.Println("proxies, run this through the same ones (-proxy) — a pool that")
 		fmt.Println("fails is invisible from a direct connection.")
 
+	case !singleClean:
+		// One request already got this answer, so repeating it five hundred
+		// times only counted it. Saying "the volume triggered it" here would
+		// send the reader to tune a rate that was never the reason.
+		fmt.Println("The single request above was refused the same way, so this is not")
+		fmt.Println("about volume: the target answers this request like that whether it")
+		fmt.Println("arrives once or two thousand times. Read the verdict there — and if")
+		fmt.Println("the path is the difference, compare it against one that works.")
+
 	case sawChallenge:
 		fmt.Println("The edge challenged some of these but not the single request above,")
 		fmt.Println("so the trigger is the volume from this address, not the ClientHello.")
@@ -282,9 +335,11 @@ func loadVerdict(rows []bucketRow, okCount, total int) {
 
 	case sawRateLimit:
 		fmt.Println("This is rate limiting, and it is a count per address rather than")
-		fmt.Println("anything about the client. The number of requests that got through")
-		fmt.Println("before it started is the ceiling here; nothing in the fingerprint")
-		fmt.Println("raises it.")
+		fmt.Println("anything about the client. The onset line above is the ceiling: that")
+		fmt.Println("many requests got through before the limiter engaged, and nothing in")
+		fmt.Println("the fingerprint raises it. Note that the limit outlives the run — a")
+		fmt.Println("probe started right after this one measures the penalty, not the")
+		fmt.Println("target.")
 
 	case sawServerErr:
 		fmt.Println("The 5xx replies are the origin behind the edge running out, not a")
@@ -364,7 +419,7 @@ func httpVerdict(profiles []string, results map[string]httpResult) {
 			continue
 		}
 		statuses = append(statuses, fmt.Sprintf("%s %d", name, res.status))
-		if res.signal.kind == "" && res.status >= 200 && res.status < 300 {
+		if res.clean() {
 			passed++
 			continue
 		}

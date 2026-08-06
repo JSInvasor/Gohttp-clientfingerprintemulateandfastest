@@ -148,6 +148,7 @@ func main() {
 	fmt.Println()
 	verdict(control, results, *doHTTP)
 
+	httpResults := map[string]httpResult{}
 	if *doHTTP {
 		// Only profiles that completed a handshake can carry a request; the
 		// others already have their answer above.
@@ -163,7 +164,7 @@ func main() {
 			fmt.Println("         there is no response to read.")
 		} else {
 			reqURL, pinned := requestURL(addr, name, *path)
-			httpRun(reqURL, *proxyURL, ready, pinned, *insecure, *timeout)
+			httpResults = httpRun(reqURL, *proxyURL, ready, pinned, *insecure, *timeout)
 		}
 	}
 
@@ -174,7 +175,8 @@ func main() {
 			// loading the handshake again would only re-measure what the leg
 			// above already established.
 			reqURL, _ := requestURL(addr, name, *path)
-			httpLoad(reqURL, *proxyURL, *profile, *count, *conc, *insecure, *timeout)
+			httpLoad(reqURL, *proxyURL, *profile, *count, *conc,
+				httpResults[*profile].clean(), *insecure, *timeout)
 		} else {
 			singleOK := control.ok
 			if res, ok := results[*profile]; ok {

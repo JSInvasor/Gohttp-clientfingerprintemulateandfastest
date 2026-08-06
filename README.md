@@ -358,7 +358,14 @@ ok       470 (94.0%)  median 88ms  p95 210ms  max 1.9s
     470  200 OK
      27  429 Too Many Requests — Cloudflare rate limit
       3  502 Bad Gateway
+onset    first 429 Too Many Requests at 1.61s, after 61 clean responses
 ```
+
+The `onset` line is the number that matters against a limiter: totals cannot
+say whether the successes came before the threshold or after the window reset,
+and the count that got through first is the ceiling. A limit also outlives the
+run, so a probe started straight after another one measures the penalty rather
+than the target.
 
 This is where a workload that survives every handshake still falls over: a
 challenge that only appears at volume is about the address, not the ClientHello;

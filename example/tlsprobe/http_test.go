@@ -228,3 +228,41 @@ func TestRequestURL(t *testing.T) {
 		}
 	}
 }
+
+func TestShortKey(t *testing.T) {
+	tests := []struct{ key, want string }{
+		{"429 Too Many Requests — Cloudflare rate limit", "429 Too Many Requests"},
+		{"200 OK", "200 OK"},
+		{"error: dial tcp IP:PORT: i/o timeout", "error"},
+	}
+	for _, tt := range tests {
+		if got := shortKey(tt.key); got != tt.want {
+			t.Errorf("shortKey(%q) = %q, want %q", tt.key, got, tt.want)
+		}
+	}
+}
+
+// The load leg's verdict turns on this: a response that one request already got
+// is not evidence about volume, however many times it is repeated.
+func TestHTTPResultClean(t *testing.T) {
+	tests := []struct {
+		name string
+		res  httpResult
+		want bool
+	}{
+		{"plain 200", httpResult{status: 200}, true},
+		{"200 with an edge signal", httpResult{status: 200, signal: edgeSignal{kind: "challenge"}}, false},
+		{"403", httpResult{status: 403, signal: edgeSignal{kind: "block"}}, false},
+		{"transport error", httpResult{err: errStub{}}, false},
+		{"304 is not 2xx", httpResult{status: 304}, false},
+	}
+	for _, tt := range tests {
+		if got := tt.res.clean(); got != tt.want {
+			t.Errorf("%s: clean() = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+type errStub struct{}
+
+func (errStub) Error() string { return "boom" }
