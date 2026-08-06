@@ -297,6 +297,25 @@ and is stable.
 - `sec-ch-ua: "Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"`
   — both the greased brand spelling and the list order are version-bound
 
+## Diagnosing a failed handshake
+
+`server alert: handshake_failure (40)` says the target refused the ClientHello,
+not whether it refused *this* one or would have refused any. `example/tlsprobe`
+settles that by handshaking against the same endpoint with each emulated
+profile and, as a control, with Go's stock `crypto/tls`:
+
+```bash
+go run ./example/tlsprobe -target example.com
+go run ./example/tlsprobe -target example.com -proxy http://user:pass@host:8080
+go run ./example/tlsprobe -target 1.2.3.4:443 -sni example.com
+```
+
+If the control completes and the emulated profiles do not, the rejection is
+about the fingerprint. If nothing completes, the target is refusing everyone on
+that path. Run it from the host that sees the failures — anything terminating
+TLS in between answers with its own certificate, which the printed issuer will
+show.
+
 ## Performance claims
 
 The "200-300k+ RPS" figure above is a design target, not a measured result.
