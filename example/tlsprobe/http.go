@@ -12,8 +12,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
@@ -64,8 +67,10 @@ func httpRun(reqURL, proxyURL string, profiles []string, pinned bool, insecure b
 	httpVerdict(profiles, results)
 }
 
-// httpProbe sends the request with one emulated profile.
-func httpProbe(reqURL, proxyURL, profile string, insecure bool, timeout time.Duration) httpResult {
+// newProbeClient builds the client the HTTP legs request with. Both legs use
+// the same one so a result under load is comparable to the single request
+// above it.
+func newProbeClient(profile, proxyURL string, insecure bool, timeout time.Duration) (*gofire.Client, error) {
 	var browser gofire.BrowserProfile
 	switch profile {
 	case "chrome":
@@ -73,7 +78,7 @@ func httpProbe(reqURL, proxyURL, profile string, insecure bool, timeout time.Dur
 	case "safari":
 		browser = gofire.SafariIOS18
 	default:
-		return httpResult{err: fmt.Errorf("no HTTP profile for %q", profile)}
+		return nil, fmt.Errorf("no HTTP profile for %q (chrome or safari)", profile)
 	}
 
 	opts := []gofire.Option{
@@ -89,8 +94,12 @@ func httpProbe(reqURL, proxyURL, profile string, insecure bool, timeout time.Dur
 	if insecure {
 		opts = append(opts, gofire.WithInsecureSkipVerify())
 	}
+	return gofire.Emulate(browser, opts...)
+}
 
-	client, err := gofire.Emulate(browser, opts...)
+// httpProbe sends the request with one emulated profile.
+func httpProbe(reqURL, proxyURL, profile string, insecure bool, timeout time.Duration) httpResult {
+	client, err := newProbeClient(profile, proxyURL, insecure, timeout)
 	if err != nil {
 		return httpResult{err: err}
 	}
@@ -127,6 +136,171 @@ func httpProbe(reqURL, proxyURL, profile string, insecure bool, timeout time.Dur
 	}
 	res.signal = classify(res.status, resp.Headers(), body)
 	return res
+}
+
+// bucketRow is one outcome of the load run and how often it happened.
+type bucketRow struct {
+	key string
+	n   int
+}
+
+// httpLoad repeats the request the way a workload does: one client, one
+// connection pool, keep-alive on. A handshake that survives 500 dials says
+// nothing about what the origin does once those connections start asking it
+// for pages, and an edge that never challenges a single request may well
+// challenge the five hundredth from the same address.
+func httpLoad(reqURL, proxyURL, profile string, count, conc int, insecure bool, timeout time.Duration) {
+	if conc < 1 {
+		conc = 1
+	}
+	if conc > count {
+		conc = count
+	}
+
+	client, err := newProbeClient(profile, proxyURL, insecure, timeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(2)
+	}
+	defer client.Close()
+
+	fmt.Printf("load     %d requests, %d concurrent, %s (one client, keep-alive, body read)\n", count, conc, profile)
+
+	type outcome struct {
+		took time.Duration
+		key  string
+		ok   bool
+	}
+	jobs := make(chan struct{})
+	out := make(chan outcome, count)
+
+	var wg sync.WaitGroup
+	started := time.Now()
+	for i := 0; i < conc; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range jobs {
+				out <- func() outcome {
+					start := time.Now()
+					resp, err := client.Get(reqURL)
+					if err != nil {
+						return outcome{time.Since(start), "error: " + normalize(err.Error()), false}
+					}
+					defer resp.Close()
+					body, _ := resp.Bytes()
+					took := time.Since(start)
+
+					status := resp.StatusCode()
+					key := fmt.Sprintf("%d %s", status, http.StatusText(status))
+					if sig := classify(status, resp.Headers(), body); sig.kind != "" {
+						who := sig.vendor
+						if who == "" {
+							who = "unnamed edge"
+						}
+						key += fmt.Sprintf(" — %s %s", who, sig.kind)
+					}
+					return outcome{took, key, status >= 200 && status < 300}
+				}()
+			}
+		}()
+	}
+	for i := 0; i < count; i++ {
+		jobs <- struct{}{}
+	}
+	close(jobs)
+	wg.Wait()
+	close(out)
+	elapsed := time.Since(started)
+
+	var oks []time.Duration
+	buckets := map[string]int{}
+	for o := range out {
+		buckets[o.key]++
+		if o.ok {
+			oks = append(oks, o.took)
+		}
+	}
+
+	pct := func(n int) float64 { return float64(n) * 100 / float64(count) }
+	fmt.Printf("         %v elapsed, %.0f requests/sec\n", elapsed.Round(time.Millisecond), float64(count)/elapsed.Seconds())
+	if len(oks) > 0 {
+		sort.Slice(oks, func(i, j int) bool { return oks[i] < oks[j] })
+		fmt.Printf("ok       %d (%.1f%%)  median %v  p95 %v  max %v\n",
+			len(oks), pct(len(oks)),
+			oks[len(oks)/2].Round(time.Millisecond),
+			oks[(len(oks)*95)/100].Round(time.Millisecond),
+			oks[len(oks)-1].Round(time.Millisecond))
+	} else {
+		fmt.Printf("ok       0 (0.0%%)\n")
+	}
+
+	rows := make([]bucketRow, 0, len(buckets))
+	for k, n := range buckets {
+		rows = append(rows, bucketRow{k, n})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].n > rows[j].n })
+	for _, r := range rows {
+		fmt.Printf("  %5d  %s\n", r.n, r.key)
+	}
+
+	fmt.Println()
+	loadVerdict(rows, len(oks), count)
+}
+
+// loadVerdict reads the split of outcomes. What matters is not how many failed
+// but which way they failed: the edge, the origin and the connection each fail
+// differently and only one of them has anything to do with the fingerprint.
+func loadVerdict(rows []bucketRow, okCount, total int) {
+	var sawChallenge, sawRateLimit, sawServerErr, sawTransport bool
+	for _, r := range rows {
+		switch {
+		case strings.Contains(r.key, "challenge"):
+			sawChallenge = true
+		case strings.Contains(r.key, "rate limit"), strings.HasPrefix(r.key, "429"):
+			sawRateLimit = true
+		case strings.HasPrefix(r.key, "error: "):
+			sawTransport = true
+		case len(r.key) > 0 && r.key[0] == '5':
+			sawServerErr = true
+		}
+	}
+
+	switch {
+	case okCount == total:
+		fmt.Println("Every request came back clean at this volume, so the workload's")
+		fmt.Println("failure is not in the request itself. Raise -n and -c until they")
+		fmt.Println("match what actually runs, and if the real thing goes through")
+		fmt.Println("proxies, run this through the same ones (-proxy) — a pool that")
+		fmt.Println("fails is invisible from a direct connection.")
+
+	case sawChallenge:
+		fmt.Println("The edge challenged some of these but not the single request above,")
+		fmt.Println("so the trigger is the volume from this address, not the ClientHello.")
+		fmt.Println("Lower the rate, spread it over more addresses, and carry the")
+		fmt.Println("clearance cookie instead of earning a new one per request.")
+
+	case sawRateLimit:
+		fmt.Println("This is rate limiting, and it is a count per address rather than")
+		fmt.Println("anything about the client. The number of requests that got through")
+		fmt.Println("before it started is the ceiling here; nothing in the fingerprint")
+		fmt.Println("raises it.")
+
+	case sawServerErr:
+		fmt.Println("The 5xx replies are the origin behind the edge running out, not a")
+		fmt.Println("bot decision — the request was accepted and then could not be")
+		fmt.Println("served. Back off to the rate it can hold; a different fingerprint")
+		fmt.Println("only changes who is asking, not how much it can take.")
+
+	case sawTransport:
+		fmt.Println("These failed below HTTP, after the connection was already up. At")
+		fmt.Println("this concurrency that is the connection ceiling — the edge, the")
+		fmt.Println("proxy, or the local socket limit — and the errors above name which.")
+
+	default:
+		fmt.Println("Read the split above: the buckets are the target's own answers, and")
+		fmt.Println("they arrived over connections it had already accepted.")
+	}
 }
 
 func reportHTTP(label string, res httpResult) {
@@ -377,6 +551,15 @@ func classify(status int, h http.Header, body []byte) edgeSignal {
 	}
 
 	server := h.Get("Server")
+
+	// A refusal that says why it refused is usually a quota rather than a
+	// firewall — GitHub's API answers an exhausted rate limit with 403 — and
+	// the two want opposite responses: wait, or stop asking from here.
+	if (status == http.StatusForbidden || status == http.StatusTooManyRequests) &&
+		(has("rate limit") || has("too many requests") || has("quota exceeded")) {
+		return edgeSignal{server, "rate limit", "body says the rate limit was exceeded"}
+	}
+
 	switch {
 	case status == http.StatusTooManyRequests:
 		return edgeSignal{server, "rate limit", "429 with no vendor header"}

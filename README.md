@@ -343,6 +343,28 @@ User-Agent, or the HTTP/2 settings fingerprint.
 
 Redirects are not followed, so a 302 into a challenge path shows up as itself.
 
+`-n` alongside `-http` repeats the request instead of the handshake, over one
+client and one connection pool the way a workload does, and buckets the
+responses:
+
+```bash
+go run ./example/tlsprobe -target example.com -http -n 500 -c 64
+```
+
+```
+load     500 requests, 64 concurrent, chrome (one client, keep-alive, body read)
+         3.21s elapsed, 156 requests/sec
+ok       470 (94.0%)  median 88ms  p95 210ms  max 1.9s
+    470  200 OK
+     27  429 Too Many Requests — Cloudflare rate limit
+      3  502 Bad Gateway
+```
+
+This is where a workload that survives every handshake still falls over: a
+challenge that only appears at volume is about the address, not the ClientHello;
+5xx is the origin behind the edge running out; and transport errors at that
+point are a connection ceiling. All three are invisible to a handshake-only run.
+
 ## Performance claims
 
 The "200-300k+ RPS" figure above is a design target, not a measured result.

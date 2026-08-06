@@ -32,6 +32,13 @@
 //
 //	go run ./example/tlsprobe -target example.com -http
 //	go run ./example/tlsprobe -target example.com -http -path /api/session
+//
+// -n with -http repeats the request rather than the handshake, over one client
+// and one connection pool, and buckets the responses by status and by the edge
+// decision behind it — which is where a workload that survives every handshake
+// still falls over:
+//
+//	go run ./example/tlsprobe -target example.com -http -n 500 -c 64
 package main
 
 import (
@@ -74,7 +81,7 @@ func main() {
 	proxyURL := flag.String("proxy", "", "http:// or socks5:// proxy to reach the target through")
 	insecure := flag.Bool("insecure", false, "skip certificate verification")
 	timeout := flag.Duration("timeout", 10*time.Second, "per-attempt timeout")
-	count := flag.Int("n", 0, "after the single pass, run this many handshakes to reproduce a failure that only appears under load")
+	count := flag.Int("n", 0, "after the single pass, run this many handshakes — or requests, with -http — to reproduce a failure that only appears under load")
 	conc := flag.Int("c", 32, "concurrent handshakes during the -n run")
 	profile := flag.String("profile", "chrome", "profile for the -n run: chrome, safari or stdlib")
 	doHTTP := flag.Bool("http", false, "after the handshakes, send one real request per profile and report what came back")
@@ -161,12 +168,20 @@ func main() {
 	}
 
 	if *count > 0 {
-		singleOK := control.ok
-		if res, ok := results[*profile]; ok {
-			singleOK = res.ok
-		}
 		fmt.Println()
-		loadRun(dial, addr, name, *profile, *count, *conc, singleOK, *insecure, *timeout)
+		if *doHTTP {
+			// With -http the workload being reproduced is requests, not dials:
+			// loading the handshake again would only re-measure what the leg
+			// above already established.
+			reqURL, _ := requestURL(addr, name, *path)
+			httpLoad(reqURL, *proxyURL, *profile, *count, *conc, *insecure, *timeout)
+		} else {
+			singleOK := control.ok
+			if res, ok := results[*profile]; ok {
+				singleOK = res.ok
+			}
+			loadRun(dial, addr, name, *profile, *count, *conc, singleOK, *insecure, *timeout)
+		}
 	}
 }
 

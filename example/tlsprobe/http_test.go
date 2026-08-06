@@ -99,6 +99,14 @@ func TestClassify(t *testing.T) {
 			kind:   "challenge",
 		},
 		{
+			name:   "403 that says it is a quota is a rate limit",
+			status: 403,
+			header: http.Header{"Server": {"Varnish"}},
+			body:   `{"message":"API rate limit exceeded for 1.2.3.4."}`,
+			vendor: "Varnish",
+			kind:   "rate limit",
+		},
+		{
 			name:   "plain 403 with no vendor",
 			status: 403,
 			header: http.Header{"Server": {"nginx"}},
