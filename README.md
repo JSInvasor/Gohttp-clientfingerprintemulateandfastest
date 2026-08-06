@@ -343,6 +343,31 @@ User-Agent, or the HTTP/2 settings fingerprint.
 
 Redirects are not followed, so a 302 into a challenge path shows up as itself.
 
+A deep path refused while `/` is answered has two possible reasons, and they are
+not the same problem: the path, or the fact that a client asking for it has
+never seen the site. `-warm` removes the second one by fetching `/` first and
+carrying its cookies and its URL as the `Referer`, the way a browser arrives at
+a link:
+
+```bash
+go run ./example/tlsprobe -target example.com -http -path /catalog/item/1 -warm
+```
+
+```
+http     GET https://example.com/catalog/item/1  (redirects not followed)
+         warm  / first, its cookies kept and its URL sent as Referer
+chrome   403 Forbidden  h2  38ms  Cloudflare challenge
+         why   cf-mitigated: challenge
+         warm  200 OK on /
+         seen  server cloudflare; cf-cache DYNAMIC; ray 9a2c...
+```
+
+If the warm-up is answered and the request after it is not, on the same
+connection with the same cookies, the path is the difference. The `cf-cache`
+line matters for the opposite reading: a `/` served as a cache HIT and a deep
+path served DYNAMIC are not the same code path at the edge, so a clean homepage
+may say less about the site than it appears to.
+
 `-n` alongside `-http` repeats the request instead of the handshake, over one
 client and one connection pool the way a workload does, and buckets the
 responses:

@@ -33,6 +33,13 @@
 //	go run ./example/tlsprobe -target example.com -http
 //	go run ./example/tlsprobe -target example.com -http -path /api/session
 //
+// A browser does not arrive at a deep link cold. -warm fetches / first and
+// carries its cookies and its URL as the Referer into the -path request, which
+// separates "this path is refused" from "a client that has never seen the site
+// is refused":
+//
+//	go run ./example/tlsprobe -target example.com -http -path /catalog/item/1 -warm
+//
 // -n with -http repeats the request rather than the handshake, over one client
 // and one connection pool, and buckets the responses by status and by the edge
 // decision behind it — which is where a workload that survives every handshake
@@ -86,6 +93,7 @@ func main() {
 	profile := flag.String("profile", "chrome", "profile for the -n run: chrome, safari or stdlib")
 	doHTTP := flag.Bool("http", false, "after the handshakes, send one real request per profile and report what came back")
 	path := flag.String("path", "/", "path to request during the -http run")
+	warm := flag.Bool("warm", false, "fetch / first and carry its cookies and Referer into the -path request, the way a browser arrives at a deep link")
 	flag.Parse()
 
 	if *target == "" {
@@ -164,7 +172,7 @@ func main() {
 			fmt.Println("         there is no response to read.")
 		} else {
 			reqURL, pinned := requestURL(addr, name, *path)
-			httpResults = httpRun(reqURL, *proxyURL, ready, pinned, *insecure, *timeout)
+			httpResults = httpRun(reqURL, *proxyURL, ready, pinned, *warm, *insecure, *timeout)
 		}
 	}
 
@@ -176,7 +184,7 @@ func main() {
 			// above already established.
 			reqURL, _ := requestURL(addr, name, *path)
 			httpLoad(reqURL, *proxyURL, *profile, *count, *conc,
-				httpResults[*profile].clean(), *insecure, *timeout)
+				httpResults[*profile].clean(), *warm, *insecure, *timeout)
 		} else {
 			singleOK := control.ok
 			if res, ok := results[*profile]; ok {

@@ -35,6 +35,12 @@ type httpResult struct {
 	bodyType string
 	title    string
 	signal   edgeSignal
+	cache    string // cf-cache-status: whether the edge answered from cache
+	ray      string
+	// warmStatus and warmSignal record what the warm-up request to / got, so a
+	// warm run that fails at the first step is not read as a verdict on -path.
+	warmStatus int
+	warmSignal edgeSignal
 }
 
 // clean reports whether this response is the target simply answering: a 2xx
@@ -55,8 +61,11 @@ type edgeSignal struct {
 // httpRun requests target once per profile and reports each response. The
 // results are returned because the load leg needs them: whether one request was
 // already refused decides whether repeating it is measuring volume at all.
-func httpRun(reqURL, proxyURL string, profiles []string, pinned bool, insecure bool, timeout time.Duration) map[string]httpResult {
+func httpRun(reqURL, proxyURL string, profiles []string, pinned, warm, insecure bool, timeout time.Duration) map[string]httpResult {
 	fmt.Printf("http     GET %s  (redirects not followed)\n", reqURL)
+	if warm {
+		fmt.Printf("%-8s warm  / first, its cookies kept and its URL sent as Referer\n", "")
+	}
 	if pinned {
 		// -target pinned an address that the client cannot be told to use, so
 		// this leg resolves the name itself. Saying so beats printing a result
@@ -66,7 +75,7 @@ func httpRun(reqURL, proxyURL string, profiles []string, pinned bool, insecure b
 
 	results := make(map[string]httpResult, len(profiles))
 	for _, name := range profiles {
-		res := httpProbe(reqURL, proxyURL, name, insecure, timeout)
+		res := httpProbe(reqURL, proxyURL, name, warm, insecure, timeout)
 		results[name] = res
 		reportHTTP(name, res)
 	}
@@ -106,28 +115,53 @@ func newProbeClient(profile, proxyURL string, insecure bool, timeout time.Durati
 	return gofire.Emulate(browser, opts...)
 }
 
-// httpProbe sends the request with one emulated profile.
-func httpProbe(reqURL, proxyURL, profile string, insecure bool, timeout time.Duration) httpResult {
+// httpProbe sends the request with one emulated profile. With warm set it
+// walks in the way a browser does — the site root first, then the link — so the
+// request under test carries the session cookie and the Referer that a real
+// arrival at a deep page would have. Without that walk a deep path is being
+// asked for by a client that has never seen the site, which is itself something
+// an edge can decide on, and the result would be read as a verdict on the path.
+func httpProbe(reqURL, proxyURL, profile string, warm, insecure bool, timeout time.Duration) httpResult {
 	client, err := newProbeClient(profile, proxyURL, insecure, timeout)
 	if err != nil {
 		return httpResult{err: err}
 	}
 	defer client.Close()
 
+	var res httpResult
+	headers := map[string]string{}
+	if warm {
+		root := originOf(reqURL)
+		if root != "" && root != reqURL {
+			warmResp, warmErr := client.Get(root)
+			if warmErr == nil {
+				warmBody, _ := warmResp.Bytes()
+				res.warmStatus = warmResp.StatusCode()
+				res.warmSignal = classify(res.warmStatus, warmResp.Headers(), warmBody)
+				warmResp.Close()
+				headers["Referer"] = root
+			} else {
+				res.warmSignal = edgeSignal{kind: "warm-up failed", why: warmErr.Error()}
+			}
+		}
+	}
+
 	start := time.Now()
-	resp, err := client.Get(reqURL)
+	resp, err := client.Do("GET", reqURL, nil, headers)
 	if err != nil {
-		return httpResult{err: err, took: time.Since(start)}
+		res.err, res.took = err, time.Since(start)
+		return res
 	}
 	defer resp.Close()
 
-	res := httpResult{
-		status:   resp.StatusCode(),
-		proto:    protoName(resp.Response),
-		server:   resp.GetHeader("Server"),
-		location: resp.GetHeader("Location"),
-		bodyType: mediaType(resp.GetHeader("Content-Type")),
-	}
+	res.status = resp.StatusCode()
+	res.proto = protoName(resp.Response)
+	res.server = resp.GetHeader("Server")
+	res.location = resp.GetHeader("Location")
+	res.bodyType = mediaType(resp.GetHeader("Content-Type"))
+	res.cache = resp.GetHeader("Cf-Cache-Status")
+	res.ray = resp.GetHeader("Cf-Ray")
+
 	for _, c := range resp.GetCookies() {
 		res.cookies = append(res.cookies, c.Name)
 	}
@@ -158,7 +192,7 @@ type bucketRow struct {
 // nothing about what the origin does once those connections start asking it
 // for pages, and an edge that never challenges a single request may well
 // challenge the five hundredth from the same address.
-func httpLoad(reqURL, proxyURL, profile string, count, conc int, singleClean, insecure bool, timeout time.Duration) {
+func httpLoad(reqURL, proxyURL, profile string, count, conc int, singleClean, warm, insecure bool, timeout time.Duration) {
 	if conc < 1 {
 		conc = 1
 	}
@@ -173,7 +207,25 @@ func httpLoad(reqURL, proxyURL, profile string, count, conc int, singleClean, in
 	}
 	defer client.Close()
 
-	fmt.Printf("load     %d requests, %d concurrent, %s (one client, keep-alive, body read)\n", count, conc, profile)
+	// The warm-up runs once, before the workers: the jar and the pool are
+	// shared, so every request that follows carries the session the walk
+	// earned. A workload that walks in does not re-walk per request either.
+	headers := map[string]string{}
+	if warm {
+		root := originOf(reqURL)
+		if root != "" && root != reqURL {
+			if warmResp, warmErr := client.Get(root); warmErr == nil {
+				warmResp.Close()
+				headers["Referer"] = root
+			}
+		}
+	}
+
+	shape := "one client, keep-alive, body read"
+	if warm {
+		shape += ", warmed"
+	}
+	fmt.Printf("load     %d requests, %d concurrent, %s (%s)\n", count, conc, profile, shape)
 
 	type outcome struct {
 		took time.Duration
@@ -193,7 +245,7 @@ func httpLoad(reqURL, proxyURL, profile string, count, conc int, singleClean, in
 			for range jobs {
 				out <- func() outcome {
 					start := time.Now()
-					resp, err := client.Get(reqURL)
+					resp, err := client.Do("GET", reqURL, nil, headers)
 					if err != nil {
 						return outcome{time.Since(start), time.Since(started), "error: " + normalize(err.Error()), false}
 					}
@@ -378,13 +430,32 @@ func reportHTTP(label string, res httpResult) {
 	if res.signal.why != "" {
 		fmt.Printf("%-8s why   %s\n", "", res.signal.why)
 	}
+	if res.warmStatus != 0 || res.warmSignal.kind != "" {
+		warm := fmt.Sprintf("%d %s on /", res.warmStatus, http.StatusText(res.warmStatus))
+		if res.warmSignal.kind != "" {
+			warm = strings.TrimSpace(res.warmSignal.vendor + " " + res.warmSignal.kind + " on /")
+			if res.warmStatus != 0 {
+				warm = fmt.Sprintf("%d — %s", res.warmStatus, warm)
+			}
+		}
+		fmt.Printf("%-8s warm  %s\n", "", warm)
+	}
 	if res.location != "" {
 		fmt.Printf("%-8s to    %s\n", "", res.location)
 	}
-	if res.server != "" || len(res.cookies) > 0 {
-		parts := make([]string, 0, 2)
+	if res.server != "" || len(res.cookies) > 0 || res.cache != "" {
+		parts := make([]string, 0, 4)
 		if res.server != "" {
 			parts = append(parts, "server "+res.server)
+		}
+		// Whether the edge answered from its own cache decides how much of this
+		// result is even about the origin — and on Cloudflare, bot checks and a
+		// cache hit are not the same code path.
+		if res.cache != "" {
+			parts = append(parts, "cf-cache "+res.cache)
+		}
+		if res.ray != "" {
+			parts = append(parts, "ray "+res.ray)
 		}
 		if len(res.cookies) > 0 {
 			parts = append(parts, "set-cookie "+strings.Join(res.cookies, ", "))
@@ -403,11 +474,12 @@ func reportHTTP(label string, res httpResult) {
 // same way the handshake verdict does.
 func httpVerdict(profiles []string, results map[string]httpResult) {
 	var (
-		failed   int
-		passed   int
-		signals  = map[string]int{}
-		lastSig  edgeSignal
-		statuses []string
+		failed    int
+		passed    int
+		warmClean int
+		signals   = map[string]int{}
+		lastSig   edgeSignal
+		statuses  []string
 	)
 	for _, name := range profiles {
 		res, ok := results[name]
@@ -419,6 +491,9 @@ func httpVerdict(profiles []string, results map[string]httpResult) {
 			continue
 		}
 		statuses = append(statuses, fmt.Sprintf("%s %d", name, res.status))
+		if res.warmStatus >= 200 && res.warmStatus < 300 && res.warmSignal.kind == "" {
+			warmClean++
+		}
 		if res.clean() {
 			passed++
 			continue
@@ -442,6 +517,15 @@ func httpVerdict(profiles []string, results map[string]httpResult) {
 		fmt.Println("the cookies it carries, or the rate it runs at.")
 
 	case len(signals) == 1 && passed == 0:
+		// The warm-up removes the two things a cold request to a deep link is
+		// missing, so if it was answered and this was not, only the path is
+		// left to explain the difference.
+		if warmClean > 0 && warmClean == len(statuses) {
+			fmt.Println("The warm-up was answered and this was not, by the same client on")
+			fmt.Println("the same connection, carrying the cookies / just set and naming /")
+			fmt.Println("as the Referer. The path is the difference.")
+			fmt.Println()
+		}
 		describeSignal(lastSig)
 
 	case len(signals) > 0 && passed > 0:
@@ -711,6 +795,17 @@ func size(n int) string {
 	default:
 		return fmt.Sprintf("%.1f MB", float64(n)/(1024*1024))
 	}
+}
+
+// originOf returns the site root for a request URL — where a browser would
+// have come from before following a link to it.
+func originOf(reqURL string) string {
+	u, err := url.Parse(reqURL)
+	if err != nil {
+		return ""
+	}
+	u.Path, u.RawQuery, u.Fragment = "/", "", ""
+	return u.String()
 }
 
 // requestURL builds the URL for the HTTP leg from the probe's target. It also
