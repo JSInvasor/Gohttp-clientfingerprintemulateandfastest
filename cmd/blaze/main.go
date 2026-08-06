@@ -234,6 +234,13 @@ func formatTestResult(tag string, statusCode int, err error) string {
 		errMsg := err.Error()
 		var reason string
 		switch {
+		// Check the specific causes before the generic handshake bucket:
+		// "server alert: unrecognized_name (112)" says what to fix,
+		// "tls handshake failed" does not.
+		case strings.Contains(errMsg, "server alert: "):
+			reason = "tls rejected: " + errMsg[strings.Index(errMsg, "server alert: ")+len("server alert: "):]
+		case strings.Contains(errMsg, "not a TLS record"):
+			reason = errMsg[strings.Index(errMsg, "not a TLS record"):]
 		case strings.Contains(errMsg, "tls handshake") || strings.Contains(errMsg, "handshake"):
 			reason = "tls handshake failed"
 		case strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "Timeout"):
@@ -242,9 +249,9 @@ func formatTestResult(tag string, statusCode int, err error) string {
 			reason = "connection refused"
 		default:
 			reason = errMsg
-			if len(reason) > 80 {
-				reason = reason[:80]
-			}
+		}
+		if len(reason) > 80 {
+			reason = reason[:80]
 		}
 		return fmt.Sprintf("%sImpersonate %s %s>%s %s%s%s", white, label, gray, reset, red, reason, reset)
 	}

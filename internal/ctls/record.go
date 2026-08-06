@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 )
 
 // tlsRecord represents a TLS record layer message.
@@ -40,7 +41,16 @@ func readRawRecord(r io.Reader) (*tlsRecord, error) {
 	}
 
 	typ := header[0]
+	vers := binary.BigEndian.Uint16(header[1:3])
 	length := binary.BigEndian.Uint16(header[3:])
+
+	// Reject anything that is not a TLS record before trusting the length
+	// field. A cleartext reply on the socket (a proxy answering CONNECT with
+	// "HTTP/1.1 407 ...", a captive portal) otherwise reads its own ASCII as a
+	// length and reports a nonsense "record too large" instead of the bytes.
+	if typ < recordTypeChangeCipherSpec || typ > recordTypeApplicationData || vers>>8 != 0x03 {
+		return nil, fmt.Errorf("not a TLS record: header %s (%q)", hexBytes(header), printableBytes(header))
+	}
 
 	if length > 16384+256 {
 		return nil, fmt.Errorf("record too large: %d bytes", length)
@@ -52,6 +62,32 @@ func readRawRecord(r io.Reader) (*tlsRecord, error) {
 	}
 
 	return &tlsRecord{typ: typ, data: data}, nil
+}
+
+// hexBytes renders bytes as space-separated lowercase hex for error messages.
+func hexBytes(b []byte) string {
+	var sb strings.Builder
+	for i, c := range b {
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
+		fmt.Fprintf(&sb, "%02x", c)
+	}
+	return sb.String()
+}
+
+// printableBytes renders bytes as text with non-printables as '.', so a
+// cleartext reply is recognizable at a glance.
+func printableBytes(b []byte) string {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		if c < 0x20 || c > 0x7e {
+			out[i] = '.'
+			continue
+		}
+		out[i] = c
+	}
+	return string(out)
 }
 
 // encryptedRecord handles AEAD encryption/decryption of TLS 1.3 records.

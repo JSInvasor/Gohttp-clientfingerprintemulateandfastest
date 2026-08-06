@@ -89,7 +89,7 @@ func (c *Conn) Read(b []byte) (int, error) {
 		case recordTypeAlert:
 			if len(plaintext) >= 2 {
 				if plaintext[0] == alertLevelFatal {
-					c.readErr = fmt.Errorf("tls alert: %d", plaintext[1])
+					c.readErr = fmt.Errorf("tls alert: %s", alertText(plaintext[1]))
 					return 0, c.readErr
 				}
 				if plaintext[1] == alertCloseNotify {

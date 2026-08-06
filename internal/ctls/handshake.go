@@ -75,13 +75,36 @@ func (hs *handshakeState) run() (*Conn, error) {
 		return nil, fmt.Errorf("send client hello: %w", err)
 	}
 
-	// Read ServerHello
-	rec, err := readRawRecord(hs.conn)
-	if err != nil {
-		return nil, fmt.Errorf("read server hello record: %w", err)
-	}
-	if rec.typ != recordTypeHandshake {
-		return nil, fmt.Errorf("expected handshake record, got %d", rec.typ)
+	// Read ServerHello. A server that rejects the ClientHello answers with an
+	// alert record (type 21) instead of a handshake record (22) - report the
+	// description, since that is the only thing that says *why* it refused.
+	var rec *tlsRecord
+	var lastWarning string
+	for {
+		rec, err = readRawRecord(hs.conn)
+		if err != nil {
+			return nil, withAlertContext(fmt.Errorf("read server hello record: %w", err), lastWarning)
+		}
+		if rec.typ == recordTypeChangeCipherSpec {
+			continue
+		}
+		if rec.typ == recordTypeAlert {
+			fatal, text, ok := parseAlert(rec.data)
+			if !ok {
+				return nil, fmt.Errorf("malformed alert record (%d bytes)", len(rec.data))
+			}
+			if fatal {
+				return nil, fmt.Errorf("server alert: %s", text)
+			}
+			// Warning alerts are skipped per RFC 8446 §6.1, but kept so a
+			// following EOF reports the reason instead of a bare read error.
+			lastWarning = text
+			continue
+		}
+		if rec.typ != recordTypeHandshake {
+			return nil, fmt.Errorf("expected handshake record, got %d", rec.typ)
+		}
+		break
 	}
 
 	suite, dhe, serverHelloMsg, negotiatedALPN, err := hs.parseServerHello(rec.data)
@@ -117,11 +140,25 @@ func (hs *handshakeState) run() (*Conn, error) {
 	for {
 		rec, err = readRawRecord(hs.conn)
 		if err != nil {
-			return nil, fmt.Errorf("read handshake: %w", err)
+			return nil, withAlertContext(fmt.Errorf("read handshake: %w", err), lastWarning)
 		}
 
 		// Skip ChangeCipherSpec records (middlebox compat)
 		if rec.typ == recordTypeChangeCipherSpec {
+			continue
+		}
+
+		// A plaintext alert here means the server gave up after ServerHello -
+		// typically a certificate or extension it could not satisfy.
+		if rec.typ == recordTypeAlert {
+			fatal, text, ok := parseAlert(rec.data)
+			if !ok {
+				return nil, fmt.Errorf("malformed alert record (%d bytes)", len(rec.data))
+			}
+			if fatal {
+				return nil, fmt.Errorf("server alert: %s", text)
+			}
+			lastWarning = text
 			continue
 		}
 
@@ -136,9 +173,14 @@ func (hs *handshakeState) run() (*Conn, error) {
 		}
 
 		if innerType == recordTypeAlert {
-			if len(plaintext) >= 2 && plaintext[0] == alertLevelFatal {
-				return nil, fmt.Errorf("server alert: %d", plaintext[1])
+			fatal, text, ok := parseAlert(plaintext)
+			if !ok {
+				return nil, fmt.Errorf("malformed alert record (%d bytes)", len(plaintext))
 			}
+			if fatal {
+				return nil, fmt.Errorf("server alert: %s", text)
+			}
+			lastWarning = text
 			continue
 		}
 
