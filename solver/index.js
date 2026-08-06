@@ -15,8 +15,9 @@
 //
 // Design (one-shot, no server):
 //   - puppeteer-real-browser launches a real Chromium with stealth patches.
-//   - We pin the UA to Chrome 147 to match what the gofire client emulates.
-//     UAM binds cf_clearance to (UA, JA3/JA4, IP); UA drift = instant 403.
+//   - We pin the UA to the one the gofire client sends (Chrome150UserAgent in
+//     headers.go). UAM binds cf_clearance to (UA, JA3/JA4, IP); UA drift =
+//     instant 403, so the two have to move together.
 //   - After cf_clearance appears we perform human-like behavior (mouse moves,
 //     smoothed scroll, dwell time) BEFORE reading the cookie. CF assigns a
 //     "human signal" score during the first few seconds after issuance; a
@@ -34,12 +35,13 @@ const timeoutSec = parseInt(process.argv[3] || "75", 10);
 const TIMEOUT_MS = timeoutSec * 1000;
 const MAX_ATTEMPTS = 2;
 
-// Match blaze's emulated Chrome 147. Override via env if your VPS Chrome is
-// a different major version - drift between solver UA and gofire UA causes
-// "all mitigated" because cf_clearance is bound to UA + JA4.
+// Must stay byte-identical to Chrome150UserAgent in headers.go: the cookie this
+// solver returns is replayed by that client, and cf_clearance is bound to UA +
+// JA4, so a stale major here means every replayed request is mitigated.
+// Override via env if your VPS Chrome is a different major version.
 const TARGET_UA =
   process.env.SOLVER_UA ||
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 
 if (!url) {
   console.error(
@@ -206,7 +208,7 @@ async function launch() {
 
   // Read the actual Chromium build so the caller (blaze) can compare to the
   // emulated Chrome major. cf_clearance is bound to the JA4 of the session
-  // that issued it — if our Chromium is e.g. 138 but gofire replays as 147,
+  // that issued it — if our Chromium is e.g. 138 but gofire replays as 150,
   // the cookie dies under load. Surfacing the version lets blaze warn loudly
   // instead of silently failing.
   let chromiumVersion = "";

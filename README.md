@@ -316,6 +316,33 @@ that path. Run it from the host that sees the failures — anything terminating
 TLS in between answers with its own certificate, which the printed issuer will
 show.
 
+When every handshake completes, the answer is in the response instead. `-http`
+sends one real request per profile through this client and reports the status,
+the edge that answered, and whether it challenged, blocked or rate limited:
+
+```bash
+go run ./example/tlsprobe -target example.com -http
+go run ./example/tlsprobe -target example.com -http -path /api/session
+```
+
+```
+http     GET https://example.com/  (redirects not followed)
+chrome   403 Forbidden  h2  188ms  Cloudflare challenge
+         why   cf-mitigated: challenge
+         seen  server cloudflare; set-cookie __cf_bm
+         body  4.3 KB text/html — "Just a moment..."
+```
+
+The distinction it exists to draw is challenge vs block. A challenge means the
+fingerprint got through and the edge wants a token no HTTP client can mint —
+run `solver/index.js`, then replay `cf_clearance` from the same profile, the
+same User-Agent and the same address, because the cookie is bound to all three.
+A block is a decision about the caller, and no ClientHello changes it. Profiles
+disagreeing (one 200, one 403) puts the decision above TLS: header order, the
+User-Agent, or the HTTP/2 settings fingerprint.
+
+Redirects are not followed, so a 302 into a challenge path shows up as itself.
+
 ## Performance claims
 
 The "200-300k+ RPS" figure above is a design target, not a measured result.

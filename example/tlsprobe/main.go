@@ -24,6 +24,14 @@
 // the outcomes, so the two are told apart by counting rather than by guessing:
 //
 //	go run ./example/tlsprobe -target example.com -n 500 -c 64
+//
+// When every handshake completes, the failure is above TLS and the response is
+// what names it. -http sends one real request per profile through this
+// package's own client and reports the status, the edge that answered and
+// whether it challenged, blocked or rate limited:
+//
+//	go run ./example/tlsprobe -target example.com -http
+//	go run ./example/tlsprobe -target example.com -http -path /api/session
 package main
 
 import (
@@ -50,6 +58,16 @@ import (
 
 var alpn = []string{"h2", "http/1.1"}
 
+// profiles is the emulated set, in report order. The HTTP leg reuses the same
+// labels so a handshake line and a response line name the same client.
+var profiles = []struct {
+	label   string
+	browser ctls.BrowserType
+}{
+	{"chrome", ctls.BrowserChrome},
+	{"safari", ctls.BrowserSafari},
+}
+
 func main() {
 	target := flag.String("target", "", "host, host:port or URL to probe (required)")
 	sni := flag.String("sni", "", "server name to send (default: the target host)")
@@ -59,6 +77,8 @@ func main() {
 	count := flag.Int("n", 0, "after the single pass, run this many handshakes to reproduce a failure that only appears under load")
 	conc := flag.Int("c", 32, "concurrent handshakes during the -n run")
 	profile := flag.String("profile", "chrome", "profile for the -n run: chrome, safari or stdlib")
+	doHTTP := flag.Bool("http", false, "after the handshakes, send one real request per profile and report what came back")
+	path := flag.String("path", "/", "path to request during the -http run")
 	flag.Parse()
 
 	if *target == "" {
@@ -112,20 +132,33 @@ func main() {
 	report("stdlib", control)
 
 	results := map[string]result{}
-	for _, p := range []struct {
-		label   string
-		browser ctls.BrowserType
-	}{
-		{"chrome", ctls.BrowserChrome},
-		{"safari", ctls.BrowserSafari},
-	} {
+	for _, p := range profiles {
 		res := probeCtls(dial, addr, name, p.browser, *insecure, *timeout)
 		results[p.label] = res
 		report(p.label, res)
 	}
 
 	fmt.Println()
-	verdict(control, results)
+	verdict(control, results, *doHTTP)
+
+	if *doHTTP {
+		// Only profiles that completed a handshake can carry a request; the
+		// others already have their answer above.
+		var ready []string
+		for _, p := range profiles {
+			if results[p.label].ok {
+				ready = append(ready, p.label)
+			}
+		}
+		fmt.Println()
+		if len(ready) == 0 {
+			fmt.Println("http     skipped — no emulated profile finished its handshake, so")
+			fmt.Println("         there is no response to read.")
+		} else {
+			reqURL, pinned := requestURL(addr, name, *path)
+			httpRun(reqURL, *proxyURL, ready, pinned, *insecure, *timeout)
+		}
+	}
 
 	if *count > 0 {
 		singleOK := control.ok
@@ -351,7 +384,9 @@ func report(label string, res result) {
 }
 
 // verdict turns the three outcomes into the one sentence worth acting on.
-func verdict(control result, results map[string]result) {
+// httpRequested suppresses the pointer at -http when the run is already about
+// to do it.
+func verdict(control result, results map[string]result, httpRequested bool) {
 	var okCount int
 	for _, r := range results {
 		if r.ok {
@@ -370,6 +405,10 @@ func verdict(control result, results map[string]result) {
 		fmt.Println("look at the HTTP response — a challenge or a block page is not a")
 		fmt.Println("handshake error. Check the certificate issuer above is the target's")
 		fmt.Println("own CA and not a middlebox terminating TLS on the way.")
+		if !httpRequested {
+			fmt.Println("Re-run with -http to send one request per profile and read what")
+			fmt.Println("comes back.")
+		}
 
 	case control.ok && okCount == 0:
 		fmt.Println("The target completes a handshake with a stock Go client and refuses")
