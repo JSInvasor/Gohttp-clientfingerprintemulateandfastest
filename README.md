@@ -166,6 +166,49 @@ fmt.Println(pipeline.Stats.TotalErr.Load())
 client.PreConnect(ctx, "https://target.com", 100)
 ```
 
+`PreConnect` opens the sockets, runs the TLS handshake and exchanges HTTP/2
+SETTINGS, then parks the connections — the same thing a browser's
+`<link rel="preconnect">` does. It sends no HTTP request, so nothing appears in
+the target's logs until you make one.
+
+## Verifying the fingerprint
+
+The tests check the bytes this client emits against fingerprints captured from
+real devices, but they can only prove it still emits what it was written to
+emit. To check what a server actually sees — including through a proxy — run:
+
+```bash
+go run ./cmd/fpcheck                    # both profiles against tls.peet.ws
+go run ./cmd/fpcheck -profile chrome
+go run ./cmd/fpcheck -proxy socks5://user:pass@host:1080
+go run ./cmd/fpcheck -frames            # also print the HTTP/2 frames
+```
+
+Each layer is reported as PASS or FAIL against the reference values in
+`reference.go`, and the exit status is non-zero if anything drifted, so it can
+gate CI.
+
+### Refreshing a reference from a real device
+
+Browsers ship every six weeks or so, and a fingerprint pinned to an old release
+eventually becomes its own signal. To re-capture:
+
+1. Open <https://tls.peet.ws/api/all> in the real browser — Safari on the
+   iPhone, or Chrome on Windows — and save the JSON (`iphone.json` say).
+2. Diff this client against it:
+
+   ```bash
+   go run ./cmd/fpcheck -profile safari -compare iphone.json
+   ```
+
+Everything that differs is listed with both values. The TLS half is then updated
+in `internal/ctls/reference.go` plus the corresponding builder, and the HTTP/2
+and header halves in `fingerprint.go` and `headers.go`.
+
+Capture on the same OS you intend to emulate, over a normal Wi-Fi or cellular
+connection, and in a fresh tab: a reloaded page resumes the TLS session and
+carries `pre_shared_key`, which adds an extension and shifts JA4.
+
 ## Options
 
 | Option | Default | Description |
@@ -186,6 +229,7 @@ client.PreConnect(ctx, "https://target.com", 100)
 | `WithAcceptLanguage` | en-US,en;q=0.9 | Accept-Language header |
 | `WithWriteBufferSize` | 64KB | Per-connection write buffer |
 | `WithReadBufferSize` | 64KB | Per-connection read buffer |
+| `WithTCPFastOpen` | off | TCP Fast Open on Linux — saves an RTT, but no browser uses it |
 
 ## Performance Tuning
 
@@ -259,6 +303,10 @@ Extension order is fixed — Apple does not permute it, unlike Chrome.
 - Pseudo-header order: :method :scheme :authority :path (m,s,a,p)
 - Akamai fingerprint: `2:0;3:100;4:2097152;9:1|10420225|0|m,s,a,p`
 - Akamai hash: `c52879e43202aeb92740be6e8c86ea96`
+- HEADERS frames carry **no** priority block. `NO_RFC7540_PRIORITIES: 1` says
+  Safari does not use the RFC 7540 priority scheme, so attaching one anyway
+  would contradict its own SETTINGS on every request. Priority travels in the
+  `priority` request header instead. (Chrome is the opposite — see below.)
 
 ### Headers
 - Exact Safari header order
@@ -269,6 +317,11 @@ Extension order is fixed — Apple does not permute it, unlike Chrome.
 - `accept-encoding` LAST (Firefox/Chrome place it earlier)
 - `accept-encoding: gzip, deflate, br, zstd`
 - No `Upgrade-Insecure-Requests`, no `Sec-Fetch-User`, no `Sec-Ch-Ua`, no `TE`
+- On HTTP/1.1 the header order is restored on the wire (net/http sorts
+  alphabetically with no hook to intervene) and `Connection: keep-alive` is
+  emitted right after `Host`. Go omits it — HTTP/1.1 is keep-alive by default —
+  but every browser sends it, and its absence is a cheap library-not-a-browser
+  tell on any h1-only host.
 
 ## Chrome 150 Fingerprint Details
 
@@ -296,6 +349,30 @@ and is stable.
 - HEADERS frame carries the priority flag: weight 256, depends_on 0, exclusive
 - `sec-ch-ua: "Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"`
   — both the greased brand spelling and the list order are version-bound
+
+## Known gaps
+
+The TLS, HTTP/2 and header layers match the reference devices. These do not, and
+no amount of work inside this package closes them:
+
+- **The TCP/IP layer says whatever OS you run on.** Initial TTL, MSS, window
+  size and the order of TCP options are set by the kernel, and Akamai and
+  Cloudflare both read them (`tls.peet.ws` reports them under `tcpip`). A
+  request from Linux claiming to be an iPhone is internally inconsistent no
+  matter how exact the ClientHello is. If that matters for your target, run from
+  the OS you are emulating — or behind a proxy running on it, since the exit
+  host is what the origin measures.
+- **TCP Fast Open is off by default** for the same reason: no browser uses it,
+  so a SYN carrying payload contradicts the browser above it. `WithTCPFastOpen()`
+  turns it back on when throughput matters more.
+- **ECH GREASE payload length is a constant (144 bytes).** Real Chrome derives it
+  from the padded inner ClientHello, so it varies with the server name's length.
+  JA3 and JA4 hash extension IDs only and cannot see it; a byte-level check on
+  the raw ClientHello could. Fixing this needs captures against hostnames of
+  several different lengths to recover the formula.
+- **The HTTP/2 transport pings an idle connection every 15s.** That keeps dead
+  connections out of the pool, but browsers have no such fixed heartbeat. It only
+  shows up on connections held open between requests, not on a single fetch.
 
 ## Performance claims
 

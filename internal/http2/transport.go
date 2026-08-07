@@ -387,6 +387,47 @@ func (t *Transport) initConnPool() {
 	}
 }
 
+// AdoptConn hands an already-established connection to the pool under addr
+// ("host:port"). It performs the HTTP/2 preface, SETTINGS and WINDOW_UPDATE
+// exchange on the connection and then parks it, ready for the next request.
+//
+// This is what a browser's <link rel="preconnect"> does: open the socket, run
+// the TLS handshake, exchange HTTP/2 SETTINGS, and stop. Warming the pool by
+// firing a throwaway HTTP request instead puts a request on the wire that the
+// emulated browser would never have made.
+//
+// Unlike addConnIfNeeded — which exists to discard the duplicates net/http
+// creates when it races two dials for an unknown protocol — this always keeps
+// the connection. A caller pre-warming n connections asked for n; deduplicating
+// against the pool would hand back one and silently drop the rest.
+//
+// On error c is left open and the caller owns closing it.
+//
+// Fork addition: upstream only reaches the pool through ConfigureTransports'
+// TLSNextProto hook, which is unavailable to a transport that dials for itself
+// via DialTLSContext.
+func (t *Transport) AdoptConn(addr string, c net.Conn) error {
+	p, ok := t.connPool().(*clientConnPool)
+	if !ok {
+		// A caller-supplied ConnPool owns its own admission policy; there is no
+		// portable way to inject into it.
+		return errors.New("http2: AdoptConn requires the default connection pool")
+	}
+
+	cc, err := t.NewClientConn(c)
+	if err != nil {
+		return err
+	}
+
+	// getConnCalled is left false on purpose: it suppresses the httptrace
+	// GetConn hook for connections net/http already traced, and nothing traced
+	// this one. Leaving it set would swallow the hook on the first real request.
+	p.mu.Lock()
+	p.addConnLocked(addr, cc)
+	p.mu.Unlock()
+	return nil
+}
+
 // ClientConn is the state of a single HTTP/2 client connection to an
 // HTTP/2 server.
 type ClientConn struct {

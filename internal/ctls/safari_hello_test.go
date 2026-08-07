@@ -18,11 +18,10 @@ import (
 // client. Two past regressions would have been caught here — a padding
 // extension that pushed JA4_a from 2013 to 2014, and a "deduplication" of the
 // repeated 0x0805 signature algorithm that changed JA4_c.
-const (
-	realSafariJA3 = "771,4866-4867-4865-49196-49195-52393-49200-49199-52392-49162-49161-49172-49171-157-156-53-47-49160-49170-10," +
-		"0-23-65281-10-11-16-5-13-18-51-45-43-27,4588-29-23-24-25,0"
-	realSafariJA3Hash = "ecdf4f49dd59effc439639da29186671"
-	realSafariJA4     = "t13d2013h2_a09f3c656075_7f0f34a4126d"
+var (
+	realSafariJA3     = SafariReference.JA3
+	realSafariJA3Hash = SafariReference.JA3Hash
+	realSafariJA4     = SafariReference.JA4
 )
 
 func TestSafariClientHelloMatchesRealDevice(t *testing.T) {

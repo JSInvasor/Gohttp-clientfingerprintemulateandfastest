@@ -55,11 +55,11 @@ func TestChromeExtensionsShuffle(t *testing.T) {
 // The extension count is 16, not the 17 an earlier revision documented: that
 // figure came from a resumed-session capture carrying pre_shared_key (0x0029),
 // which this builder never sends. The device confirms 16.
-const realChromeJA4 = "t13d1516h2_8daaf6152771_806a8c22fdea"
+var realChromeJA4 = ChromeReference.JA4
 
 // realChromeJA4RExts is the sorted extension list the device reports in ja4_r.
 // It matches this builder exactly, which is what makes the count above certain.
-const realChromeJA4RExts = "0005,000a,000b,000d,0012,0017,001b,0023,002b,002d,0033,44cd,fe0d,ff01"
+var realChromeJA4RExts = ChromeReference.JA4RExtensions
 
 func TestChromeClientHelloJA4(t *testing.T) {
 	km, err := generateKeyMaterial()

@@ -67,6 +67,7 @@ func TestH1OrderConnReordersHeaders(t *testing.T) {
 	got := headerNames(fc.buf.String())
 	want := []string{
 		"Host",
+		"Connection",
 		"Sec-Fetch-Dest",
 		"User-Agent",
 		"Accept",
@@ -80,9 +81,71 @@ func TestH1OrderConnReordersHeaders(t *testing.T) {
 		t.Fatalf("header order:\n got %v\nwant %v", got, want)
 	}
 
-	// Reordering must not lose or invent bytes.
+	// Reordering may only add the injected Connection line; nothing else is
+	// lost or invented.
+	if want := len(head) + injectedKeepAliveLen; fc.buf.Len() != want {
+		t.Fatalf("rewrote %d bytes, want %d (input %d + one Connection line)",
+			fc.buf.Len(), want, len(head))
+	}
+}
+
+// injectedKeepAliveLen is how many bytes reorderRequestHead adds per request
+// head when the caller did not set Connection itself.
+var injectedKeepAliveLen = len(keepAliveLine) + 2 // + CRLF
+
+// TestH1OrderConnAddsKeepAlive covers the Connection header directly.
+//
+// net/http omits it (HTTP/1.1 is keep-alive by default, so the header carries
+// no information), but every browser sends it right after Host, and its absence
+// is a cheap library-not-a-browser tell on any h1-only host.
+func TestH1OrderConnAddsKeepAlive(t *testing.T) {
+	head := "GET / HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"User-Agent: TestAgent\r\n" +
+		"\r\n"
+
+	fc := &fakeConn{}
+	conn := newH1OrderConn(fc, safariIOS18HeaderOrder)
+	if _, err := conn.Write([]byte(head)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	out := fc.buf.String()
+	if !strings.Contains(out, "Host: example.com\r\nConnection: keep-alive\r\n") {
+		t.Errorf("Connection: keep-alive is not immediately after Host:\n%s", out)
+	}
+	if n := strings.Count(out, "Connection:"); n != 1 {
+		t.Errorf("got %d Connection headers, want exactly 1:\n%s", n, out)
+	}
+}
+
+// TestH1OrderConnKeepsCallerConnection checks that an explicit Connection
+// header wins. net/http writes "Connection: close" when keep-alives are
+// disabled or the server asked to close, and overwriting that with keep-alive
+// would contradict the transport's own connection handling.
+func TestH1OrderConnKeepsCallerConnection(t *testing.T) {
+	head := "GET / HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"Connection: close\r\n" +
+		"User-Agent: TestAgent\r\n" +
+		"\r\n"
+
+	fc := &fakeConn{}
+	conn := newH1OrderConn(fc, safariIOS18HeaderOrder)
+	if _, err := conn.Write([]byte(head)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	out := fc.buf.String()
+	if strings.Contains(out, "keep-alive") {
+		t.Errorf("caller's Connection: close was replaced with keep-alive:\n%s", out)
+	}
+	if n := strings.Count(out, "Connection:"); n != 1 {
+		t.Errorf("got %d Connection headers, want exactly 1:\n%s", n, out)
+	}
 	if fc.buf.Len() != len(head) {
-		t.Fatalf("rewrote %d bytes, input was %d", fc.buf.Len(), len(head))
+		t.Errorf("rewrote %d bytes, want %d — nothing should have been injected",
+			fc.buf.Len(), len(head))
 	}
 }
 
@@ -127,8 +190,10 @@ func TestH1OrderConnBodyPassthrough(t *testing.T) {
 			if !strings.Contains(out, body) {
 				t.Fatalf("request body missing from the wire: %q", out)
 			}
-			if fc.buf.Len() != len(payload) {
-				t.Fatalf("wrote %d bytes, input was %d", fc.buf.Len(), len(payload))
+			// Two request heads, so two injected Connection lines.
+			if want := len(payload) + 2*injectedKeepAliveLen; fc.buf.Len() != want {
+				t.Fatalf("wrote %d bytes, want %d (input %d + two Connection lines)",
+					fc.buf.Len(), want, len(payload))
 			}
 			// User-Agent precedes Accept in Safari order; alphabetical would
 			// have put Accept first. Both requests must show the fix.
@@ -169,8 +234,10 @@ func TestH1OrderConnChunkedBody(t *testing.T) {
 	if !strings.Contains(out, "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n") {
 		t.Fatalf("chunk framing was altered:\n%q", out)
 	}
-	if fc.buf.Len() != len(payload) {
-		t.Fatalf("wrote %d bytes, input was %d", fc.buf.Len(), len(payload))
+	// Two request heads, so two injected Connection lines.
+	if want := len(payload) + 2*injectedKeepAliveLen; fc.buf.Len() != want {
+		t.Fatalf("wrote %d bytes, want %d (input %d + two Connection lines)",
+			fc.buf.Len(), want, len(payload))
 	}
 	if strings.Count(out, "User-Agent: TestAgent\r\nAccept:") != 2 {
 		t.Fatalf("request after the chunked body was not reordered:\n%s", out)
@@ -194,7 +261,7 @@ func TestH1OrderConnLeavesUnknownHeadersAtEnd(t *testing.T) {
 	}
 
 	got := headerNames(fc.buf.String())
-	want := []string{"Host", "Accept", "X-Zulu", "X-Alpha"}
+	want := []string{"Host", "Connection", "Accept", "X-Zulu", "X-Alpha"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("header order:\n got %v\nwant %v", got, want)
 	}

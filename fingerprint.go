@@ -18,8 +18,18 @@ type H2Settings struct {
 
 // H2Profile holds the complete HTTP/2 fingerprint.
 type H2Profile struct {
-	Settings          H2Settings
-	PseudoHeaders     []string
+	Settings      H2Settings
+	PseudoHeaders []string
+
+	// PrioritySignals reports whether the browser attaches an RFC 7540 priority
+	// block (exclusive flag + stream dependency + weight) to every HEADERS
+	// frame. It is not merely a formatting choice: a client that sends
+	// SETTINGS_NO_RFC7540_PRIORITIES=1 and then keeps emitting the priority
+	// block is contradicting its own SETTINGS, which is a shape no shipping
+	// browser produces.
+	//
+	// PriorityWeight and PriorityExclusive are only read when this is true.
+	PrioritySignals   bool
 	PriorityWeight    uint8
 	PriorityExclusive bool
 }
@@ -45,12 +55,25 @@ func SafariIOS18PseudoHeaderOrder() []string {
 	return []string{":method", ":scheme", ":authority", ":path"}
 }
 
+// SafariIOS18H2Profile returns Safari's HTTP/2 fingerprint.
+//
+// PrioritySignals is false, and that is load-bearing. Safari advertises
+// SETTINGS_NO_RFC7540_PRIORITIES=1 (the "9:1" in the Akamai string above),
+// which per RFC 9218 §2.1 means it does not use the RFC 7540 priority scheme at
+// all — so its HEADERS frames carry flags EndStream|EndHeaders and no priority
+// block, and stream priority travels in the `priority` request header instead.
+//
+// An earlier revision set PriorityWeight: 255 here. PriorityParam.IsZero() was
+// then false, so the framer set FlagHeadersPriority and appended
+// 00 00 00 00 ff to every HEADERS frame — a client announcing it does not speak
+// RFC 7540 priorities and then speaking them on every single request. No
+// shipping browser emits that combination, and it is visible in the sent_frames
+// list any HTTP/2 fingerprinter records.
 func SafariIOS18H2Profile() H2Profile {
 	return H2Profile{
-		Settings:          SafariIOS18H2Settings(),
-		PseudoHeaders:     SafariIOS18PseudoHeaderOrder(),
-		PriorityWeight:    255, // weight 256 is encoded as 255
-		PriorityExclusive: false,
+		Settings:        SafariIOS18H2Settings(),
+		PseudoHeaders:   SafariIOS18PseudoHeaderOrder(),
+		PrioritySignals: false,
 	}
 }
 
@@ -80,12 +103,34 @@ func Chrome146PseudoHeaderOrder() []string {
 	return []string{":method", ":authority", ":scheme", ":path"}
 }
 
+// Chrome146H2Profile returns Chrome's HTTP/2 fingerprint.
+//
+// Chrome does NOT send SETTINGS_NO_RFC7540_PRIORITIES, so unlike Safari it
+// still attaches the RFC 7540 priority block to every HEADERS frame:
+// exclusive=1, depends_on=0, weight=256. The wire encoding of weight is
+// value-1, hence 255.
 func Chrome146H2Profile() H2Profile {
 	return H2Profile{
 		Settings:          Chrome146H2Settings(),
 		PseudoHeaders:     Chrome146PseudoHeaderOrder(),
+		PrioritySignals:   true,
 		PriorityWeight:    255, // weight 256 is encoded as 255
 		PriorityExclusive: true,
+	}
+}
+
+// headerPriorityFor returns the priority block to attach to every HEADERS
+// frame, or the zero PriorityParam when the profile sends none. The framer
+// keys off PriorityParam.IsZero() to decide whether to set FlagHeadersPriority,
+// so the zero value is exactly "no priority block on the wire".
+func headerPriorityFor(p H2Profile) http2.PriorityParam {
+	if !p.PrioritySignals {
+		return http2.PriorityParam{}
+	}
+	return http2.PriorityParam{
+		StreamDep: 0,
+		Weight:    p.PriorityWeight,
+		Exclusive: p.PriorityExclusive,
 	}
 }
 

@@ -228,6 +228,21 @@ func WithSocketBuffers(rcv, snd int) Option {
 	}
 }
 
+// WithTCPFastOpen enables TCP_FASTOPEN_CONNECT on Linux, saving one RTT on
+// repeat dials to a host the kernel holds a cookie for. No-op on other
+// platforms.
+//
+// It is off by default because no shipping browser uses TFO — Chrome dropped
+// client support in 2020 — so a SYN carrying payload contradicts, at the
+// transport layer, the browser this client impersonates everywhere above it.
+// Enable it when throughput against a permissive target matters more than
+// looking like a browser end to end.
+func WithTCPFastOpen() Option {
+	return func(c *clientConfig) {
+		c.transport.TCPFastOpen = true
+	}
+}
+
 // WithWriteByteTimeout caps how long an HTTP/2 frame write may block.
 // Default 30s is browser-lenient; for high-RPS workloads with proxies that
 // occasionally stall, 5-10s prevents a slow peer from pinning a worker.

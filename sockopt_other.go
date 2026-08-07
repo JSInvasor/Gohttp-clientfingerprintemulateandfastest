@@ -2,8 +2,9 @@
 
 package gofire
 
-func setSocketOpts(fd uintptr, rcvBuf, sndBuf int) error {
+func setSocketOpts(fd uintptr, rcvBuf, sndBuf int, fastOpen bool) error {
 	_ = rcvBuf
 	_ = sndBuf
+	_ = fastOpen
 	return nil
 }

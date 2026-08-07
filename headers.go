@@ -3,6 +3,7 @@ package gofire
 import (
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -517,12 +518,32 @@ func sameRegistrableDomain(a, b string) bool {
 	return aSite == bSite
 }
 
-// OrderHeaders returns headers sorted in Safari iOS 18 order.
-// Headers not in the canonical order are appended at the end.
+// OrderHeaders returns headers in Safari iOS 18 order. Headers outside the
+// canonical order are appended at the end, sorted by name.
+//
+// Deprecated: prefer OrderHeadersFor, which takes the browser profile. This
+// function is hardwired to Safari and returns the wrong order for a client
+// built with Emulate(Chrome150).
 func OrderHeaders(h http.Header) []HeaderKV {
+	return OrderHeadersFor(h, SafariIOS18)
+}
+
+// OrderHeadersFor returns headers in the given browser's order. Headers outside
+// that browser's canonical order are appended at the end, sorted by name.
+//
+// The tail is sorted rather than left in map order: ranging over an http.Header
+// visits keys in a random order that changes per call, so the same request
+// produced a different header sequence every time — the one property a header
+// fingerprint must not have. The h1 and h2 paths order headers themselves and
+// never called this, so the randomness only reached callers using this helper
+// to build their own requests.
+func OrderHeadersFor(h http.Header, browser BrowserProfile) []HeaderKV {
+	order := headerOrderFor(browser)
 	result := make([]HeaderKV, 0, len(h))
 
-	for _, key := range safariIOS18HeaderOrder {
+	known := make(map[string]bool, len(order))
+	for _, key := range order {
+		known[key] = true
 		if values, ok := h[key]; ok {
 			for _, v := range values {
 				result = append(result, HeaderKV{Key: key, Value: v})
@@ -530,19 +551,28 @@ func OrderHeaders(h http.Header) []HeaderKV {
 		}
 	}
 
-	seen := make(map[string]bool, len(safariIOS18HeaderOrder))
-	for _, k := range safariIOS18HeaderOrder {
-		seen[k] = true
+	rest := make([]string, 0, len(h))
+	for key := range h {
+		if !known[key] {
+			rest = append(rest, key)
+		}
 	}
-	for key, values := range h {
-		if !seen[key] {
-			for _, v := range values {
-				result = append(result, HeaderKV{Key: key, Value: v})
-			}
+	sort.Strings(rest)
+	for _, key := range rest {
+		for _, v := range h[key] {
+			result = append(result, HeaderKV{Key: key, Value: v})
 		}
 	}
 
 	return result
+}
+
+// headerOrderFor returns the canonical header order for a browser profile.
+func headerOrderFor(browser BrowserProfile) []string {
+	if browser == Chrome150 {
+		return chromeHeaderOrder
+	}
+	return safariIOS18HeaderOrder
 }
 
 // HeaderKV is a key-value pair for ordered headers.

@@ -212,10 +212,20 @@ func splitHeaderLines(head []byte) [][]byte {
 	return lines[1:]
 }
 
+// keepAliveLine is the Connection header browsers send on HTTP/1.1.
+//
+// net/http omits it entirely: HTTP/1.1 keeps the connection alive by default,
+// so the header is redundant on the wire and Go leaves it out. Every browser
+// sends it anyway, immediately after Host, and its absence is one of the
+// cheapest "this is a library, not a browser" checks there is — no TLS or
+// HTTP/2 work upstream compensates for it on an h1-only host.
+var keepAliveLine = []byte("Connection: keep-alive")
+
 // reorderRequestHead permutes the header lines of head into the browser's
-// order. The request line stays first and Host stays immediately after it,
-// which is where every browser puts it on HTTP/1.1. Headers not named in order
-// keep their relative positions at the end.
+// order. The request line stays first, Host stays immediately after it, and
+// Connection: keep-alive follows Host — which is where every browser puts both
+// on HTTP/1.1. Headers not named in order keep their relative positions at the
+// end.
 //
 // The head is returned unchanged if it uses obsolete line folding, since
 // reordering folded continuations would change their meaning. Go never emits
@@ -268,6 +278,23 @@ func reorderRequestHead(head []byte, order []string) []byte {
 			emit(i)
 		}
 	}
+
+	// Connection goes straight after Host. It is emitted from here rather than
+	// set on the request because HTTP/2 forbids connection-specific headers —
+	// the h2 transport rejects a request carrying one — and both paths share
+	// the same *http.Request.
+	var hasConnection bool
+	for i := range parsed {
+		if parsed[i].key == "Connection" {
+			emit(i)
+			hasConnection = true
+		}
+	}
+	if !hasConnection {
+		out = append(out, keepAliveLine...)
+		out = append(out, '\r', '\n')
+	}
+
 	for _, key := range order {
 		for i := range parsed {
 			if !used[i] && parsed[i].key == key {

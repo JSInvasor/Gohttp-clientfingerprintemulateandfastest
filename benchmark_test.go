@@ -3,6 +3,7 @@ package gofire
 import (
 	"context"
 	cryptotls "crypto/tls"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -532,12 +533,26 @@ func TestRetryExhaustionPreservesResponse(t *testing.T) {
 	}
 }
 
+// TestPreConnect checks that pre-warming opens connections and, just as
+// importantly, that it sends no HTTP request while doing so. A browser's
+// <link rel="preconnect"> opens the socket and stops; an implementation that
+// warms the pool with a throwaway HEAD puts a request on the wire that the
+// emulated browser would never have made.
 func TestPreConnect(t *testing.T) {
-	var connCount atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		connCount.Add(1)
+	var (
+		connCount atomic.Int64
+		reqCount  atomic.Int64
+	)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqCount.Add(1)
 		w.WriteHeader(200)
 	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connCount.Add(1)
+		}
+	}
+	server.Start()
 	defer server.Close()
 
 	client, err := Emulate(SafariIOS18, WithForceHTTP1(), WithTimeout(5*time.Second))
@@ -552,10 +567,20 @@ func TestPreConnect(t *testing.T) {
 		t.Fatalf("PreConnect error: %v", err)
 	}
 
+	// ConnState fires on the server's per-connection goroutine, which is not
+	// synchronised with the dial returning, so poll rather than sampling once.
+	deadline := time.Now().Add(2 * time.Second)
+	for connCount.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
 	if connCount.Load() == 0 {
 		t.Error("PreConnect made no connections")
 	}
-	t.Logf("PreConnect: %d connections warmed", connCount.Load())
+	if n := reqCount.Load(); n != 0 {
+		t.Errorf("PreConnect sent %d HTTP request(s); it must warm the connection without one", n)
+	}
+	t.Logf("PreConnect: %d connections warmed, %d requests sent", connCount.Load(), reqCount.Load())
 }
 
 // Benchmarks

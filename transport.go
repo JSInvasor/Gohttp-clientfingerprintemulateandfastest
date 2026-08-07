@@ -110,6 +110,17 @@ type TransportConfig struct {
 	// is browser-lenient; for high-RPS workloads with proxies that occasionally
 	// stall, 5-10s prevents a slow peer from pinning a worker.
 	WriteByteTimeout time.Duration
+	// TCPFastOpen enables TCP_FASTOPEN_CONNECT on Linux, letting the kernel put
+	// payload in the SYN when reconnecting to a host it holds a cookie for. It
+	// saves one RTT per repeat dial.
+	//
+	// Default off, and deliberately so: no shipping browser uses TFO. Chrome
+	// removed client support in 2020 and neither Safari nor Firefox enables it
+	// for HTTPS, so a SYN carrying TLS bytes contradicts the browser the TLS
+	// and HTTP/2 layers claim to be — and it is visible to the target's edge
+	// even though nothing above the transport can see it. Turn it on only when
+	// throughput matters more than blending in.
+	TCPFastOpen bool
 }
 
 func defaultTransportConfig() TransportConfig {
@@ -171,7 +182,7 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		Control: func(network, address string, c syscall.RawConn) error {
 			var err error
 			c.Control(func(fd uintptr) {
-				err = setSocketOpts(fd, rcvBuf, sndBuf)
+				err = setSocketOpts(fd, rcvBuf, sndBuf, cfg.TCPFastOpen)
 			})
 			return err
 		},
@@ -231,10 +242,10 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 			ConnectionFlow:            t.h2Settings.ConnectionWindowSize,
 			PseudoHeaderOrder:         h2p.PseudoHeaders,
 			HeaderOrder:               t.headerOrder,
-			HeaderPriority: http2.PriorityParam{
-				Weight:    h2p.PriorityWeight,
-				Exclusive: h2p.PriorityExclusive,
-			},
+			// Left at the zero value for Safari, which advertises
+			// NO_RFC7540_PRIORITIES=1 and therefore sends HEADERS with no
+			// priority block at all. See H2Profile.PrioritySignals.
+			HeaderPriority:             headerPriorityFor(h2p),
 			StrictMaxConcurrentStreams: false,
 			ReadIdleTimeout:            15 * time.Second,
 			PingTimeout:                5 * time.Second,
@@ -937,18 +948,29 @@ func socks5ReplyMsg(rep byte) string {
 	}
 }
 
-// PreConnect pre-warms n TLS connections to the given host.
-func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
+// PreConnect pre-warms n connections to the given URL.
+//
+// It opens each connection and runs the TLS handshake plus the HTTP/2
+// preface/SETTINGS/WINDOW_UPDATE exchange, then parks the connection in the
+// pool. No HTTP request is sent — which is precisely what a browser's
+// <link rel="preconnect"> does.
+//
+// The previous implementation fired n concurrent `HEAD /` requests carrying
+// only User-Agent and Accept: */*. That leaked a request shape the emulated
+// browser cannot produce (Chrome without any sec-ch-ua/sec-fetch-* header,
+// Safari without accept-language, and a HEAD for a document neither of them
+// ever issues), landing it in the target's logs right beside a handshake that
+// claims to be that browser. It also could not reliably open n connections: the
+// HTTP/2 pool hands an existing connection to any request that still has stream
+// capacity, so the burst frequently collapsed onto one connection.
+func (t *Transport) PreConnect(ctx context.Context, rawURL string, n int) error {
 	if n <= 0 {
 		n = 10
 	}
 
-	// Use the browser profile's User-Agent so the pre-warm HEAD doesn't show
-	// up in logs/fingerprinters as a "Mozilla/5.0" mismatch against the
-	// Chrome/Safari TLS handshake we just performed.
-	ua := SafariIOS18UserAgent
-	if t.browser == Chrome150 {
-		ua = Chrome150UserAgent
+	addr, isTLS, err := preconnectAddr(rawURL)
+	if err != nil {
+		return err
 	}
 
 	var (
@@ -956,35 +978,19 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 		mu   sync.Mutex
 		errs []error
 	)
+	fail := func(err error) {
+		mu.Lock()
+		errs = append(errs, err)
+		mu.Unlock()
+	}
 
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req, err := http.NewRequestWithContext(ctx, "HEAD", host, nil)
-			if err != nil {
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
-				return
+			if err := t.preconnectOne(ctx, addr, isTLS); err != nil {
+				fail(err)
 			}
-			req.Header.Set("User-Agent", ua)
-			req.Header.Set("Accept", "*/*")
-
-			resp, err := t.RoundTrip(req)
-			if err != nil {
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
-				return
-			}
-			// Drain before closing so the HTTP/2 stream ends with END_STREAM.
-			// Closing an unfinished body makes the transport emit RST_STREAM,
-			// which Cloudflare and Akamai score as an abusive client — and a
-			// pre-warm burst would fire n of them back to back, which is a
-			// worse first impression than not pre-warming at all.
-			io.Copy(io.Discard, resp.Body) //nolint:errcheck
-			resp.Body.Close()
 		}()
 	}
 
@@ -994,6 +1000,79 @@ func (t *Transport) PreConnect(ctx context.Context, host string, n int) error {
 		return fmt.Errorf("preconnect: %d/%d failed, first: %w", len(errs), n, errs[0])
 	}
 	return nil
+}
+
+// preconnectAddr resolves a URL to the dial target and whether it is TLS.
+func preconnectAddr(rawURL string) (addr string, isTLS bool, err error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", false, fmt.Errorf("preconnect: invalid URL: %w", err)
+	}
+	if u.Host == "" {
+		return "", false, fmt.Errorf("preconnect: URL %q has no host", rawURL)
+	}
+
+	port := u.Port()
+	switch u.Scheme {
+	case "https":
+		isTLS = true
+		if port == "" {
+			port = "443"
+		}
+	case "http":
+		if port == "" {
+			port = "80"
+		}
+	default:
+		return "", false, fmt.Errorf("preconnect: unsupported scheme %q", u.Scheme)
+	}
+	return net.JoinHostPort(u.Hostname(), port), isTLS, nil
+}
+
+// preconnectOne opens a single warmed connection and registers it.
+//
+// An HTTP/2 connection is handed to the h2 pool, which runs the preface and
+// SETTINGS exchange as part of adopting it. Anything else (cleartext, or a host
+// whose ALPN selects http/1.1) has no equivalent injection point in
+// net/http.Transport, so the connection is closed again after the handshake:
+// the DNS entry, the TCP path and — for TLS — the session ticket are warm even
+// though the socket itself is not reused.
+func (t *Transport) preconnectOne(ctx context.Context, addr string, isTLS bool) error {
+	if !isTLS || t.h2Transport == nil || t.forceH1 {
+		conn, err := t.dialPreconnect(ctx, addr, isTLS)
+		if err != nil {
+			return err
+		}
+		return conn.Close()
+	}
+
+	conn, err := t.dialTLSForH2(ctx, "tcp", addr)
+	if err != nil {
+		if errors.Is(err, errAlpnHTTP1) {
+			// dialTLSForH2 has already cached host->http/1.1 and closed the
+			// conn; the h1 path will take it from here.
+			return nil
+		}
+		return err
+	}
+
+	if err := t.h2Transport.AdoptConn(addr, conn); err != nil {
+		conn.Close()
+		return err
+	}
+	return nil
+}
+
+// dialPreconnect opens a connection without registering it anywhere.
+func (t *Transport) dialPreconnect(ctx context.Context, addr string, isTLS bool) (net.Conn, error) {
+	if isTLS {
+		return t.dialTLS(ctx, "tcp", addr, []string{"http/1.1"})
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	return t.dialRaw(ctx, "tcp", host, port)
 }
 
 // CloseIdleConnections closes all idle connections.
