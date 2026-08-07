@@ -92,7 +92,13 @@ func main() {
 }
 
 // runFingerprintCheck prints Safari iOS 18's live JA3/JA4 + HTTP/2 (Akamai)
-// fingerprint as observed by a fingerprint echo service.
+// fingerprint as observed by a fingerprint echo service, and says whether each
+// one still matches the reference device.
+//
+// Printing the three strings alone left the operator to eyeball them against a
+// value in the README, which nobody does under load — a drifted fingerprint
+// then shows up as an unexplained wall of 403s instead. For the full per-layer
+// diff, including header order and the HTTP/2 frames, use cmd/fpcheck.
 func runFingerprintCheck(fpURL string) {
 	fmt.Printf("%sfingerprint kaynagi: %s%s\n", gray, fpURL, reset)
 
@@ -141,7 +147,34 @@ func runFingerprintCheck(fpURL string) {
 		fmt.Printf("%sSafariIOS18: parse edilemedi (status=%d, len=%d): %v | ham: %.160s%s\n", red, status, len(body), errJSON, body, reset)
 		return
 	}
-	fmt.Printf("%sSafariIOS18%s (status=%d)\n  ja4=%s\n  ja3_hash=%s\n  h2=%s\n", white, reset, status, d.TLS.JA4, d.TLS.JA3Hash, d.HTTP2.Akamai)
+	ref := gofire.ReferenceFor(gofire.SafariIOS18)
+	fmt.Printf("%sSafariIOS18%s (status=%d)  referans: %s\n", white, reset, status, ref.Device)
+	drift := 0
+	drift += reportFP("ja4", d.TLS.JA4, ref.JA4)
+	drift += reportFP("ja3_hash", d.TLS.JA3Hash, ref.JA3Hash)
+	drift += reportFP("h2", d.HTTP2.Akamai, ref.AkamaiFingerprint)
+	if drift > 0 {
+		fmt.Printf("%s%d fingerprint kaydi referanstan sapti — tam karsilastirma icin: go run ./cmd/fpcheck%s\n",
+			red, drift, reset)
+	}
+}
+
+// reportFP prints one fingerprint line and returns 1 when it drifted.
+//
+// An empty want means the value cannot be checked rather than that it matched —
+// Chrome's JA3 is the case that matters, since it permutes extensions per
+// connection by design — so it is never reported as OK.
+func reportFP(name, got, want string) int {
+	switch {
+	case want == "":
+		fmt.Printf("  %-9s %s %s(kontrol edilemiyor)%s\n", name+"=", got, gray, reset)
+	case got == want:
+		fmt.Printf("  %-9s %s %sOK%s\n", name+"=", got, white, reset)
+	default:
+		fmt.Printf("  %-9s %s %sDRIFT%s (beklenen: %s)\n", name+"=", got, red, reset, want)
+		return 1
+	}
+	return 0
 }
 
 type clientGroup struct {
