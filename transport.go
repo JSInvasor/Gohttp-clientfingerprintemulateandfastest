@@ -24,7 +24,7 @@ import (
 )
 
 // Transport is a high-performance HTTP transport with browser fingerprint
-// emulation. Safari iOS 18 and Chrome 150 are supported.
+// emulation. Safari iOS 18 and Chrome 151 are supported.
 //
 // It emulates both TLS (JA3/JA4) and HTTP/2 (Akamai) fingerprints using a custom
 // TLS 1.3 implementation (internal/ctls) - no uTLS dependency. Everything below
@@ -158,7 +158,7 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 
 	// Per-browser fingerprint tables.
 	switch browser {
-	case Chrome150:
+	case Chrome151:
 		t.h2Settings = Chrome146H2Settings()
 		t.headerOrder = chromeHeaderOrder
 		t.ctlsBrowser = ctls.BrowserChrome
@@ -218,7 +218,7 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 	// HTTP/2 transport with the selected browser's fingerprint.
 	if !cfg.ForceHTTP1 {
 		h2p := SafariIOS18H2Profile()
-		if browser == Chrome150 {
+		if browser == Chrome151 {
 			h2p = Chrome146H2Profile()
 		}
 

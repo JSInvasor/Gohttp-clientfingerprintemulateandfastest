@@ -92,9 +92,9 @@ func selectProfiles(name string) ([]gofire.BrowserProfile, error) {
 	case "safari", "ios":
 		return []gofire.BrowserProfile{gofire.SafariIOS18}, nil
 	case "chrome":
-		return []gofire.BrowserProfile{gofire.Chrome150}, nil
+		return []gofire.BrowserProfile{gofire.Chrome151}, nil
 	case "both", "all", "":
-		return []gofire.BrowserProfile{gofire.SafariIOS18, gofire.Chrome150}, nil
+		return []gofire.BrowserProfile{gofire.SafariIOS18, gofire.Chrome151}, nil
 	default:
 		return nil, fmt.Errorf("unknown profile %q (want safari, chrome, or both)", name)
 	}
@@ -531,7 +531,7 @@ func withSuffix(path, suffix string) string {
 }
 
 func profileSlug(p gofire.BrowserProfile) string {
-	if p == gofire.Chrome150 {
+	if p == gofire.Chrome151 {
 		return "chrome"
 	}
 	return "safari"

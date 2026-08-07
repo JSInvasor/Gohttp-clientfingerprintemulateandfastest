@@ -256,38 +256,53 @@ func applySafariHeaders(req *http.Request, accept, lang string, mode fetchMode) 
 	// advertising it is safe.
 }
 
-// ========== Chrome 150 Headers ==========
+// ========== Chrome 151 Headers ==========
 
-// Chrome150UserAgent is the User-Agent string sent by Chrome 150 on Windows 10 x64.
-// Verified against a real Chrome 150 capture from tls.peet.ws.
-const Chrome150UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+// Chrome151UserAgent is the User-Agent string sent by Chrome 151 on Windows 10
+// x64. Verified against a real Chrome 151 capture from tls.peet.ws.
+const Chrome151UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 
-// Chrome147UserAgent and Chrome146UserAgent are backward-compatible aliases.
-// They resolve to the Chrome 150 User-Agent so callers pinning an older name
-// still get a UA consistent with the TLS/H2 fingerprint this package emits.
+// Chrome150UserAgent, Chrome147UserAgent and Chrome146UserAgent are
+// backward-compatible aliases. They resolve to the Chrome 151 User-Agent so a
+// caller pinning an older name still gets a UA consistent with the sec-ch-ua
+// and TLS/H2 fingerprint this package emits — a UA whose major version
+// disagrees with sec-ch-ua is a worse signal than an out-of-date name.
 const (
-	Chrome147UserAgent = Chrome150UserAgent
-	Chrome146UserAgent = Chrome150UserAgent
+	Chrome150UserAgent = Chrome151UserAgent
+	Chrome147UserAgent = Chrome151UserAgent
+	Chrome146UserAgent = Chrome151UserAgent
 )
 
-// Chrome150SecChUa is the sec-ch-ua header value for Chrome 150 on Windows.
+// Chrome151SecChUa is the sec-ch-ua header value for Chrome 151 on Windows,
+// captured from a real device:
 //
-// Both the greased brand string and the list order are version-bound, and both
-// are checked by UAM/bot scoring against the UA's major version. Chrome 150
-// emits the greased entry first:
+//	"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"
 //
-//	"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"
+// All three parts of this move between releases and all three are checked by
+// UAM/bot scoring against the UA's major version:
 //
-// Earlier releases differ in both respects — the Chrome 147 profile had
-// "Google Chrome" first with a "Not.A/Brand" spelling, and Chrome 146 used
-// "Not-A.Brand";v="24" — so this string must move whenever the UA does.
-const Chrome150SecChUa = `"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"`
+//   - the greased brand's spelling. Chrome rotates it through a fixed set of
+//     punctuation permutations ("Not=A?Brand", "Not;A=Brand", "Not.A/Brand",
+//     "Not-A.Brand", ...), one per release.
+//   - the greased brand's version. 99 here; earlier profiles carried 8 and 24.
+//   - the list order. Chrome 151 puts the greased entry first, then
+//     "Google Chrome", then "Chromium". The previous profile had Chromium
+//     before Google Chrome, which no capture supports.
+//
+// The profile shipped "Not;A=Brand";v="8", "Chromium";v="150",
+// "Google Chrome";v="150" — wrong in all three respects against the device, and
+// paired with a UA claiming 150 while the device reports 151.
+const Chrome151SecChUa = `"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"`
 
-// Chrome147SecChUa is a backward-compatible alias for Chrome150SecChUa.
-const Chrome147SecChUa = Chrome150SecChUa
+// Chrome150SecChUa and Chrome147SecChUa are backward-compatible aliases.
+const (
+	Chrome150SecChUa = Chrome151SecChUa
+	Chrome147SecChUa = Chrome151SecChUa
+)
 
 // chromeHeaderOrder defines the exact header order Chrome sends in an
-// HTTP/2 HEADERS frame. Verified unchanged against real Chrome 150.
+// HTTP/2 HEADERS frame. Verified against a real Chrome 151 capture, which
+// reproduces this order exactly for a top-level navigation.
 //
 //	:method, :authority, :scheme, :path (pseudo-headers)
 //	sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform
@@ -322,7 +337,7 @@ var chromeHeaderOrder = []string{
 	"Priority",
 }
 
-// applyChromeHeaders sets exact Chrome 150 default headers on the request.
+// applyChromeHeaders sets exact Chrome 151 default headers on the request.
 // Only sets headers that are not already present, preserving user overrides.
 func applyChromeHeaders(req *http.Request, accept, lang string, mode fetchMode) {
 	h := req.Header
@@ -332,7 +347,7 @@ func applyChromeHeaders(req *http.Request, accept, lang string, mode fetchMode) 
 	}
 
 	// Chrome-specific Client Hints (Safari doesn't support them at all)
-	setIfEmpty(h, "Sec-Ch-Ua", Chrome150SecChUa)
+	setIfEmpty(h, "Sec-Ch-Ua", Chrome151SecChUa)
 	setIfEmpty(h, "Sec-Ch-Ua-Mobile", "?0")
 	setIfEmpty(h, "Sec-Ch-Ua-Platform", `"Windows"`)
 	if mode == modeNavigate {
@@ -341,7 +356,7 @@ func applyChromeHeaders(req *http.Request, accept, lang string, mode fetchMode) 
 		// user-activated navigation; neither appears on a fetch or XHR.
 		setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	}
-	setIfEmpty(h, "User-Agent", Chrome150UserAgent)
+	setIfEmpty(h, "User-Agent", Chrome151UserAgent)
 	setIfEmpty(h, "Accept", acceptFor(accept, mode))
 	if origin := originFor(req, mode); origin != "" {
 		setIfEmpty(h, "Origin", origin)
@@ -369,7 +384,7 @@ func applyChromeHeaders(req *http.Request, accept, lang string, mode fetchMode) 
 func applyBrowserHeaders(req *http.Request, browser BrowserProfile, accept, lang string) {
 	mode := fetchModeFor(req)
 	switch browser {
-	case Chrome150:
+	case Chrome151:
 		applyChromeHeaders(req, accept, lang, mode)
 	default:
 		applySafariHeaders(req, accept, lang, mode)
@@ -523,7 +538,7 @@ func sameRegistrableDomain(a, b string) bool {
 //
 // Deprecated: prefer OrderHeadersFor, which takes the browser profile. This
 // function is hardwired to Safari and returns the wrong order for a client
-// built with Emulate(Chrome150).
+// built with Emulate(Chrome151).
 func OrderHeaders(h http.Header) []HeaderKV {
 	return OrderHeadersFor(h, SafariIOS18)
 }
@@ -569,7 +584,7 @@ func OrderHeadersFor(h http.Header, browser BrowserProfile) []HeaderKV {
 
 // headerOrderFor returns the canonical header order for a browser profile.
 func headerOrderFor(browser BrowserProfile) []string {
-	if browser == Chrome150 {
+	if browser == Chrome151 {
 		return chromeHeaderOrder
 	}
 	return safariIOS18HeaderOrder

@@ -166,10 +166,23 @@ func buildECHGrease() ([]byte, error) {
 
 	// Chrome derives this length from the padded ClientHelloInner, so it is not
 	// a constant across all sites — but it is deterministic for a given target,
-	// not a coin flip. A real Chrome 150 capture against tls.peet.ws carries 144
-	// bytes, so use that rather than the arbitrary 128/223 alternation an earlier
-	// revision picked (neither of which was ever observed).
-	const payloadLen = 144
+	// not a coin flip.
+	//
+	// 208 is measured: a real Chrome 151 against tls.peet.ws (an 11-character
+	// hostname) sends payload_len = 0x00d0. The shape is consistent with the ECH
+	// padding rule — pad the inner hello to a multiple of 32, then add the
+	// 16-byte AEAD tag — since 208 = 6*32 + 16.
+	//
+	// An earlier revision used 144 (= 4*32 + 16) on the same claim of being
+	// captured. The device says otherwise, so it was either misread or from a
+	// release that has since moved.
+	//
+	// This is still a single data point at one hostname length. Modelling the
+	// hostname dependency needs captures against several, and until then a
+	// constant is the honest choice: JA3 and JA4 hash extension IDs only and
+	// cannot see this, so the exposure is limited to a byte-level check on the
+	// raw ClientHello.
+	const payloadLen = 208
 
 	payload := make([]byte, payloadLen)
 	if _, err := rand.Read(payload); err != nil {

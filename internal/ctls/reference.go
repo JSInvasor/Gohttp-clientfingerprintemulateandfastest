@@ -71,22 +71,29 @@ var SafariReference = TLSReference{
 	PeetPrintHash: "62b834de729e78a9f0ebd1dd099314a7",
 }
 
-// ChromeReference is a real Chrome 150 on Windows.
+// ChromeReference is a real Chrome 151 on Windows.
 //
 // The extension count in JA4_a is 16. An earlier revision documented 17, read
 // off a capture of a RESUMED session that carried pre_shared_key (0x0029) as a
 // seventeenth counted extension; this package never sends PSK on an initial
-// connection, so it emits 16 and can never produce the 17-extension hash.
+// connection, so it emits 16 and can never produce the 17-extension hash. The
+// device confirms 16 — and confirms application_settings is the 0x44CD
+// codepoint alone, with no second 0x4469 entry.
 //
-// JA4R and PeetPrintHash are not filled in: the Chrome reference predates the
-// device capture that would supply them, and a guessed value is worse than an
-// absent one — fpcheck reports an empty reference as unverifiable, but a wrong
-// one would fail every correct run. Capture them with
-// `fpcheck -profile chrome -compare <capture>.json` and fill them in.
+// JA3 and JA3Hash stay empty: the capture reports
+// e4a965cf74d922620ea020ec4aec14db, but that is one draw from the per-connection
+// extension permutation and the next connection produces a different one.
+// Pinning it would fail every correct run. JA4R and PeetPrint are safe to pin
+// because both sort the extension list before rendering.
 var ChromeReference = TLSReference{
-	Device:         "Chrome 150, Windows 10 x64",
+	Device:         "Chrome 151, Windows 10 x64",
 	JA4:            "t13d1516h2_8daaf6152771_806a8c22fdea",
 	JA4RExtensions: "0005,000a,000b,000d,0012,0017,001b,0023,002b,002d,0033,44cd,fe0d,ff01",
+	JA4R: "t13d1516h2_" +
+		"002f,0035,009c,009d,1301,1302,1303,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_" +
+		"0005,000a,000b,000d,0012,0017,001b,0023,002b,002d,0033,44cd,fe0d,ff01_" +
+		"0904,0905,0906,0403,0804,0401,0503,0805,0501,0806,0601",
+	PeetPrintHash: "67c3e9111bed9e7f03d2f21d6d88994b",
 }
 
 // ReferenceFor returns the TLS reference for a browser type.

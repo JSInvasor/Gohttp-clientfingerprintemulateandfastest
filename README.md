@@ -1,13 +1,15 @@
 # gofire
 
-Ultra high-performance Go HTTP client with **Safari (iPhone)** and **Chrome 150 (Windows)** TLS fingerprint emulation. Designed for **200-300k+ RPS** with full JA3/JA4 + HTTP/2 + header fingerprint bypass.
+Ultra high-performance Go HTTP client with **Safari (iPhone)** and **Chrome 151 (Windows)** TLS fingerprint emulation. Designed for **200-300k+ RPS** with full JA3/JA4 + HTTP/2 + header fingerprint bypass.
 
-Both profiles are verified against real devices via tls.peet.ws and pinned by tests in `internal/ctls`.
+Both profiles are verified against real devices via tls.peet.ws. The captures are
+committed under `cmd/fpcheck/testdata` and re-checked on every `go test`, so the
+reference values are evidence rather than assertion.
 
 ## Features
 
 - **Safari TLS Fingerprint** — Exact JA3/JA4 via custom TLS 1.3 (cipher suites, GREASE at 6 positions, X25519MLKEM768 + X25519 key share, no padding)
-- **Chrome 150 TLS Fingerprint** — Per-connection extension shuffle, ALPS, ECH GREASE, ML-DSA signature algorithms
+- **Chrome 151 TLS Fingerprint** — Per-connection extension shuffle, ALPS, ECH GREASE, ML-DSA signature algorithms
 - **Safari HTTP/2 Fingerprint** — SETTINGS (MAX_CONCURRENT_STREAMS=100, NO_RFC7540_PRIORITIES=1), WINDOW_UPDATE, pseudo-header order (m,s,a,p)
 - **Safari Headers** — Correct order, Sec-Fetch-* (no Sec-Fetch-User), Priority
 - **200-300k+ RPS** — Worker pool pipeline, connection pre-warming, DNS cache
@@ -90,7 +92,7 @@ for i := 0; i < 1000000; i++ {
 ```go
 // Recommended: Emulate a real browser
 client, err := gofire.Emulate(gofire.SafariIOS18)
-client, err := gofire.Emulate(gofire.Chrome150)
+client, err := gofire.Emulate(gofire.Chrome151)
 client, err := gofire.Emulate(gofire.SafariIOS18, gofire.WithProxy("socks5://..."))
 
 // Or with NewClient (defaults to Safari)
@@ -209,14 +211,18 @@ Capture on the same OS you intend to emulate, over a normal Wi-Fi or cellular
 connection, and in a fresh tab: a reloaded page resumes the TLS session and
 carries `pre_shared_key`, which adds an extension and shifts JA4.
 
-The Safari capture used to build the current reference is committed at
-`cmd/fpcheck/testdata/iphone-ios26.json` (iPhone 13, iOS 26.5.2), and
-`TestReferenceMatchesRealDevice` runs the same checker over it on every `go
-test`. That is what makes the Safari numbers evidence rather than assertion —
-including the HEADERS frame carrying `EndStream|EndHeaders` and no `Priority`,
-which is where the `PrioritySignals: false` above comes from. There is no
-equivalent capture for Chrome yet, so its `ja4_r` and `peetprint` are reported
-as unverifiable rather than compared.
+Both captures behind the current references are committed —
+`cmd/fpcheck/testdata/iphone-ios26.json` (iPhone 13, iOS 26.5.2) and
+`chrome151-windows.json` (Chrome 151, Windows) — and the same checker runs over
+them on every `go test`. That is what makes these numbers evidence rather than
+assertion. Two things in the profiles come directly from those frames: Safari's
+HEADERS carries `EndStream|EndHeaders` and no `Priority`, while Chrome's carries
+`Priority` with weight 256, depends_on 0, exclusive 1.
+
+Chrome's `ja3_hash` is deliberately not pinned. The capture reports one, but it
+is a single draw from the per-connection extension permutation and the next
+connection yields another; `ja4_r` and `peetprint` are pinned instead, since
+both sort the extension list before rendering and so survive the shuffle.
 
 One thing the capture shows that is *not* a constant: `accept-language`. The
 reference device sends `tr-TR,tr;q=0.9` because it is a Turkish phone. The
@@ -337,10 +343,11 @@ Extension order is fixed — Apple does not permute it, unlike Chrome.
   but every browser sends it, and its absence is a cheap library-not-a-browser
   tell on any h1-only host.
 
-## Chrome 150 Fingerprint Details
+## Chrome 151 Fingerprint Details
 
-Verified against a real Chrome 150 on Windows via tls.peet.ws, and pinned by
-`internal/ctls/chrome_hello_test.go`:
+Verified against a real Chrome 151 on Windows via tls.peet.ws. The capture is
+committed at `cmd/fpcheck/testdata/chrome151-windows.json` and checked on every
+`go test`, alongside `internal/ctls/chrome_hello_test.go`:
 
 - JA4: `t13d1516h2_8daaf6152771_806a8c22fdea`
 - Akamai H2: `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`
@@ -360,9 +367,15 @@ and is stable.
 - 11 signature algorithms led by ML-DSA (`0x0904`, `0x0905`, `0x0906`), no SHA1
 - `compress_certificate`: brotli. Plus ALPS (`17613`, h2 only), ECH GREASE
   (`65037`), and `session_ticket` (`35`) — none of which Safari sends
-- HEADERS frame carries the priority flag: weight 256, depends_on 0, exclusive
-- `sec-ch-ua: "Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"`
-  — both the greased brand spelling and the list order are version-bound
+- HEADERS frame carries the priority flag: weight 256, depends_on 0, exclusive.
+  Chrome does not send `NO_RFC7540_PRIORITIES`, so unlike Safari it still speaks
+  the RFC 7540 priority scheme
+- `sec-ch-ua: "Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"`
+  — the greased brand's spelling, its version, and the order of the three
+  entries all move between releases, and all three are scored against the UA's
+  major version. This must change whenever the User-Agent does
+- ECH GREASE payload length 208 bytes (`0x00d0`), measured against an
+  11-character hostname; see Known gaps
 
 ## Known gaps
 
@@ -381,11 +394,15 @@ no amount of work inside this package closes them:
 - **TCP Fast Open is off by default** for the same reason: no browser uses it,
   so a SYN carrying payload contradicts the browser above it. `WithTCPFastOpen()`
   turns it back on when throughput matters more.
-- **ECH GREASE payload length is a constant (144 bytes).** Real Chrome derives it
-  from the padded inner ClientHello, so it varies with the server name's length.
+- **ECH GREASE payload length is a constant (208 bytes).** That value is
+  measured — a real Chrome 151 against `tls.peet.ws`, an 11-character hostname,
+  sends `payload_len = 0x00d0`, and 208 = 6*32 + 16 fits the ECH padding rule
+  (pad the inner hello to a multiple of 32, add the 16-byte AEAD tag). But real
+  Chrome derives it from the padded inner ClientHello, so it moves with the
+  server name's length, and one data point cannot recover that relationship.
   JA3 and JA4 hash extension IDs only and cannot see it; a byte-level check on
-  the raw ClientHello could. Fixing this needs captures against hostnames of
-  several different lengths to recover the formula.
+  the raw ClientHello could. Captures against two or three more hostnames of
+  different lengths would settle it.
 - **The HTTP/2 transport pings an idle connection every 15s.** That keeps dead
   connections out of the pool, but browsers have no such fixed heartbeat. It only
   shows up on connections held open between requests, not on a single fetch.

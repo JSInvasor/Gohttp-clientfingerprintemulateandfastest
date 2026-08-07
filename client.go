@@ -1,11 +1,11 @@
 // Package gofire provides a high-performance HTTP client with browser TLS
-// fingerprint emulation (Safari iOS 18 and Chrome 150). Designed for 200-300k+
+// fingerprint emulation (Safari iOS 18 and Chrome 151). Designed for 200-300k+
 // RPS with full JA3/JA4 + HTTP/2 + header fingerprint bypass.
 //
 // Usage:
 //
 //	client, _ := gofire.Emulate(gofire.SafariIOS18)
-//	client, _ := gofire.Emulate(gofire.Chrome150)
+//	client, _ := gofire.Emulate(gofire.Chrome151)
 //	resp, _ := client.Get("https://example.com")
 //	text, _ := resp.Text()
 package gofire

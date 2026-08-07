@@ -79,7 +79,7 @@ func SafariIOS18H2Profile() H2Profile {
 
 // ========== Chrome ==========
 //
-// Chrome HTTP/2 fingerprint. Verified byte-for-byte against a real Chrome 150
+// Chrome HTTP/2 fingerprint. Verified byte-for-byte against a real Chrome 151
 // capture (SETTINGS order, WINDOW_UPDATE increment, pseudo-header order, and
 // the HEADERS priority flag: weight 256, depends_on 0, exclusive).
 //
@@ -87,7 +87,7 @@ func SafariIOS18H2Profile() H2Profile {
 // Akamai hash: 52d84b11737d980aef856699f885ca86
 //
 // The Chrome146* function names are retained for API compatibility; the HTTP/2
-// layer is unchanged from Chrome 146 through 150.
+// layer is unchanged from Chrome 146 through 151.
 
 func Chrome146H2Settings() H2Settings {
 	return H2Settings{

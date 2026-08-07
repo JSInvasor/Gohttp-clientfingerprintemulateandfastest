@@ -16,21 +16,25 @@ const (
 	// "iPhone OS 18_7" token in Safari's User-Agent; see SafariIOS18UserAgent.
 	// Every browser on iOS produces this same TLS fingerprint.
 	SafariIOS18 BrowserProfile = iota
-	// Chrome150 emulates Chrome 150 on Windows with full TLS/HTTP2/header
+	// Chrome151 emulates Chrome 151 on Windows with full TLS/HTTP2/header
 	// fingerprint (JA4 t13d1516h2_8daaf6152771_806a8c22fdea, Akamai H2
-	// 52d84b1...), verified against a real Chrome 150 capture.
+	// 52d84b1...), verified against a real Chrome 151 capture.
 	//
 	// This is desktop Chrome. For Chrome on an iPhone use SafariIOS18 with a
 	// CriOS User-Agent override — iOS forces every browser onto Apple's TLS
 	// stack, so Chrome-on-iOS emits the Safari fingerprint, not this one.
-	Chrome150
+	Chrome151
 
-	// Chrome147 and Chrome146 are backward-compatible aliases for Chrome150.
-	// The cipher list, extension set, and HTTP/2 fingerprint are unchanged
-	// across those releases; the signature algorithms, UA, and sec-ch-ua moved,
-	// and callers get the current verified values under any of these names.
-	Chrome147 = Chrome150
-	Chrome146 = Chrome150
+	// Chrome151, Chrome147 and Chrome146 are backward-compatible aliases for
+	// Chrome151. The TLS layer is identical across those releases — the device
+	// capture confirms the cipher list, extension set, signature algorithms and
+	// HTTP/2 fingerprint are unchanged — while the User-Agent and sec-ch-ua
+	// moved. Callers get the current verified values under any of these names,
+	// because a UA that disagrees with the sec-ch-ua version is worse than an
+	// out-of-date name.
+	Chrome150 = Chrome151
+	Chrome147 = Chrome151
+	Chrome146 = Chrome151
 )
 
 // String returns the browser profile name.
@@ -38,8 +42,8 @@ func (b BrowserProfile) String() string {
 	switch b {
 	case SafariIOS18:
 		return "Safari/26.5.2"
-	case Chrome150:
-		return "Chrome/150.0"
+	case Chrome151:
+		return "Chrome/151.0"
 	default:
 		return "Unknown"
 	}
@@ -50,11 +54,11 @@ func (b BrowserProfile) String() string {
 // Usage:
 //
 //	client, err := gofire.Emulate(gofire.SafariIOS18)
-//	client, err := gofire.Emulate(gofire.Chrome150)
-//	client, err := gofire.Emulate(gofire.Chrome150, gofire.WithProxy("socks5://..."))
+//	client, err := gofire.Emulate(gofire.Chrome151)
+//	client, err := gofire.Emulate(gofire.Chrome151, gofire.WithProxy("socks5://..."))
 func Emulate(profile BrowserProfile, opts ...Option) (*Client, error) {
 	switch profile {
-	case SafariIOS18, Chrome150:
+	case SafariIOS18, Chrome151:
 		allOpts := make([]Option, 0, len(opts)+1)
 		allOpts = append(allOpts, withBrowserProfile(profile))
 		allOpts = append(allOpts, opts...)
@@ -74,7 +78,7 @@ func withBrowserProfile(profile BrowserProfile) Option {
 		// profile defaults and swap them for */* on a fetch/XHR. Inlining the
 		// strings here is what let the Chrome default drift out of that set.
 		switch profile {
-		case Chrome150:
+		case Chrome151:
 			c.acceptLanguage = "en-US,en;q=0.9"
 			c.accept = chromeNavigateAccept
 		default:

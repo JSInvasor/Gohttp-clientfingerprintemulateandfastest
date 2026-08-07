@@ -99,6 +99,104 @@ func TestReferenceMatchesRealDevice(t *testing.T) {
 	}
 }
 
+// TestChromeReferenceMatchesRealDevice is the Chrome half: an unedited capture
+// from a real Chrome 151 on Windows, with the same redactions.
+//
+// JA3 is expected to be skipped here, not compared. Chrome permutes its
+// extension order per connection, so the ja3_hash in the fixture
+// (e4a965cf74d922620ea020ec4aec14db) is one draw among many and the next
+// connection produces a different one. ja4_r and peetprint are compared,
+// because both sort the extension list before rendering and so survive the
+// shuffle.
+func TestChromeReferenceMatchesRealDevice(t *testing.T) {
+	got, err := loadCapture("testdata/chrome151-windows.json")
+	if err != nil {
+		t.Fatalf("load device capture: %v", err)
+	}
+
+	ref := gofire.ReferenceFor(gofire.Chrome151)
+	var checked int
+	for _, c := range checkAgainstReference(ref, *got) {
+		if c.skipped {
+			t.Logf("SKIP %s: %s", c.name, c.note)
+			continue
+		}
+		checked++
+		if !c.ok() {
+			t.Errorf("the reference disagrees with the real device on %q\n device: %s\n ours:   %s",
+				c.name, c.got, c.want)
+		}
+	}
+	if checked < 8 {
+		t.Errorf("only %d checks ran against the device capture; the fixture or the "+
+			"checker has lost coverage", checked)
+	}
+}
+
+// TestChromeDeviceCaptureSendsHeadersPriority states the device behaviour that
+// Chrome146H2Profile's PrioritySignals=true is derived from. Chrome does not
+// send NO_RFC7540_PRIORITIES, so unlike Safari it does attach the block.
+func TestChromeDeviceCaptureSendsHeadersPriority(t *testing.T) {
+	got, err := loadCapture("testdata/chrome151-windows.json")
+	if err != nil {
+		t.Fatalf("load device capture: %v", err)
+	}
+	hf := got.headersFrame()
+	if hf == nil {
+		t.Fatal("device capture has no HEADERS frame")
+	}
+	if want, p := "weight=256 depends_on=0 exclusive=1", describePriority(hf); p != want {
+		t.Errorf("real Chrome HEADERS priority = %q, want %q", p, want)
+	}
+}
+
+// TestChromeSecChUaMatchesDevice pins the sec-ch-ua value against the capture.
+//
+// All three of its moving parts are version-bound and all three are scored
+// against the UA's major version: the greased brand's spelling, that brand's
+// version number, and the order of the three entries. The profile previously
+// shipped "Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150" —
+// wrong in every one of them, and paired with a UA claiming 150.
+func TestChromeSecChUaMatchesDevice(t *testing.T) {
+	got, err := loadCapture("testdata/chrome151-windows.json")
+	if err != nil {
+		t.Fatalf("load device capture: %v", err)
+	}
+	hf := got.headersFrame()
+	if hf == nil {
+		t.Fatal("device capture has no HEADERS frame")
+	}
+
+	device := headerValue(hf, "sec-ch-ua")
+	if device == "" {
+		t.Fatal("device capture carries no sec-ch-ua")
+	}
+	if device != gofire.Chrome151SecChUa {
+		t.Errorf("sec-ch-ua mismatch\n device: %s\n ours:   %s", device, gofire.Chrome151SecChUa)
+	}
+
+	// The UA's major version has to agree with the one inside sec-ch-ua, or the
+	// pair contradicts itself regardless of which is right.
+	if ua := headerValue(hf, "user-agent"); ua != gofire.Chrome151UserAgent {
+		t.Errorf("user-agent mismatch\n device: %s\n ours:   %s", ua, gofire.Chrome151UserAgent)
+	}
+	if !strings.Contains(gofire.Chrome151SecChUa, `v="151"`) ||
+		!strings.Contains(gofire.Chrome151UserAgent, "Chrome/151.") {
+		t.Error("sec-ch-ua and User-Agent disagree on the Chrome major version")
+	}
+}
+
+// headerValue returns the value of the named header from a captured frame.
+func headerValue(f *frame, name string) string {
+	for _, h := range f.Headers {
+		k, v, ok := strings.Cut(h, ": ")
+		if ok && strings.EqualFold(k, name) {
+			return v
+		}
+	}
+	return ""
+}
+
 // TestDeviceCaptureSendsNoHeadersPriority states the device's own behaviour
 // directly, so the reason the Safari profile sends no priority block does not
 // depend on reading it back out of a checker result.
@@ -192,7 +290,7 @@ func assertFails(t *testing.T, name string, ref gofire.Reference, got capture) {
 // Chrome permutes its extension order per connection, so its JA3 is a different
 // value every time; asserting a fixed one would fail on a correct client.
 func TestChromeJA3IsNotChecked(t *testing.T) {
-	ref := gofire.ReferenceFor(gofire.Chrome150)
+	ref := gofire.ReferenceFor(gofire.Chrome151)
 	if ref.JA3Hash != "" {
 		t.Fatal("Chrome reference carries a JA3 hash; it cannot have a stable one")
 	}

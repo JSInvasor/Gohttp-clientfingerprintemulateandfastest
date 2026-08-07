@@ -72,13 +72,13 @@ type Reference struct {
 
 // ReferenceFor returns the expected fingerprint for a browser profile.
 func ReferenceFor(profile BrowserProfile) Reference {
-	if profile == Chrome150 {
+	if profile == Chrome151 {
 		tls := ctls.ChromeReference
 		h2 := Chrome146H2Profile()
 		return Reference{
-			Profile:           Chrome150,
+			Profile:           Chrome151,
 			Device:            tls.Device,
-			UserAgent:         Chrome150UserAgent,
+			UserAgent:         Chrome151UserAgent,
 			JA3:               tls.JA3,
 			JA3Hash:           tls.JA3Hash,
 			JA4:               tls.JA4,

@@ -12,7 +12,7 @@ import (
 )
 
 // Reference Akamai HTTP/2 fingerprints, captured alongside the TLS references
-// pinned in internal/ctls: a real iPhone 13 on iOS 26.5.2 and a real Chrome 150
+// pinned in internal/ctls: a real iPhone 13 on iOS 26.5.2 and a real Chrome 151
 // on Windows.
 //
 // Format (Akamai's "HTTP/2 fingerprint"):

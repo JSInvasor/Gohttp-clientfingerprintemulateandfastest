@@ -1,7 +1,9 @@
 package ctls
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"testing"
 )
@@ -48,7 +50,7 @@ func TestChromeExtensionsShuffle(t *testing.T) {
 	t.Logf("observed %d distinct extension orderings across %d builds", len(seen), iterations)
 }
 
-// realChromeJA4 is the JA4 of a real Chrome 150, captured via tls.peet.ws.
+// realChromeJA4 is the JA4 of a real Chrome 151, captured via tls.peet.ws.
 // JA4 sorts extensions before hashing, so unlike JA3 it survives the
 // per-connection shuffle and is stable.
 //
@@ -93,6 +95,13 @@ func TestChromeClientHelloJA4(t *testing.T) {
 		}
 		if got := joinHexSorted(hashed); got != realChromeJA4RExts {
 			t.Fatalf("ja4_r extension list mismatch\n got: %s\nwant: %s", got, realChromeJA4RExts)
+		}
+
+		// The full ja4_r is unhashed, so a failure names the exact cipher,
+		// extension or signature algorithm that drifted. It survives the
+		// per-connection shuffle because it sorts the extension list.
+		if got := ch.ja4R(); got != ChromeReference.JA4R {
+			t.Fatalf("JA4_r mismatch on build %d\n got: %s\nwant: %s", i, got, ChromeReference.JA4R)
 		}
 	}
 }
@@ -222,5 +231,72 @@ func TestChromeGreaseExtensionShapes(t *testing.T) {
 		if len(last.data) != 1 || last.data[0] != 0x00 {
 			t.Errorf("last GREASE extension carries %v, want a single 0x00 byte", last.data)
 		}
+	}
+}
+
+// TestChromeECHGreaseShape pins the layout and payload length of the ECH GREASE
+// extension against a real Chrome 151 capture, whose extension body was:
+//
+//	00 0001 0001 4e 0020 <32-byte enc> 00d0 <208-byte payload>
+//
+// JA3 and JA4 hash extension IDs only, so neither can see any of this — but the
+// raw ClientHello can, and Chrome's payload length is deterministic for a given
+// target rather than random. An earlier revision used 144 on the same claim of
+// being captured; the device says 208.
+func TestChromeECHGreaseShape(t *testing.T) {
+	data, err := buildECHGrease()
+	if err != nil {
+		t.Fatalf("buildECHGrease: %v", err)
+	}
+
+	const (
+		wantEncLen     = 32
+		wantPayloadLen = 208
+		// type(1) + kdf(2) + aead(2) + config_id(1) + enc_len(2) + enc + payload_len(2) + payload
+		wantTotal = 1 + 2 + 2 + 1 + 2 + wantEncLen + 2 + wantPayloadLen
+	)
+
+	if len(data) != wantTotal {
+		t.Fatalf("ECH GREASE body = %d bytes, want %d", len(data), wantTotal)
+	}
+	if data[0] != 0x00 {
+		t.Errorf("client_hello_type = %d, want 0 (outer)", data[0])
+	}
+	if got := binary.BigEndian.Uint16(data[1:]); got != 0x0001 {
+		t.Errorf("kdf_id = 0x%04x, want 0x0001 (HKDF-SHA256)", got)
+	}
+	if got := binary.BigEndian.Uint16(data[3:]); got != 0x0001 {
+		t.Errorf("aead_id = 0x%04x, want 0x0001 (AES-128-GCM)", got)
+	}
+	if got := binary.BigEndian.Uint16(data[6:]); got != wantEncLen {
+		t.Fatalf("enc_len = %d, want %d", got, wantEncLen)
+	}
+	if got := binary.BigEndian.Uint16(data[8+wantEncLen:]); got != wantPayloadLen {
+		t.Errorf("payload_len = %d, want %d — a real Chrome 151 against an "+
+			"11-character hostname sends 0x00d0", got, wantPayloadLen)
+	}
+
+	// The padding rule the length follows: inner hello padded to a multiple of
+	// 32, plus the 16-byte AEAD tag. Stated so a future adjustment has to stay
+	// on the grid rather than picking an arbitrary number.
+	if (wantPayloadLen-16)%32 != 0 {
+		t.Errorf("payload_len %d is not 32*k + 16", wantPayloadLen)
+	}
+}
+
+// TestChromeECHGreaseIsRandomPerHello checks the config_id, HPKE key and payload
+// are freshly drawn each time. They are GREASE: a constant would make every
+// connection from this client linkable to every other.
+func TestChromeECHGreaseIsRandomPerHello(t *testing.T) {
+	first, err := buildECHGrease()
+	if err != nil {
+		t.Fatalf("buildECHGrease: %v", err)
+	}
+	second, err := buildECHGrease()
+	if err != nil {
+		t.Fatalf("buildECHGrease: %v", err)
+	}
+	if bytes.Equal(first, second) {
+		t.Error("two ECH GREASE bodies are identical; config_id, enc and payload must be random")
 	}
 }

@@ -218,8 +218,8 @@ func TestBrowserProfile(t *testing.T) {
 	if got := SafariIOS18.String(); got != "Safari/26.5.2" {
 		t.Errorf("SafariIOS18.String() = %q, want 'Safari/26.5.2'", got)
 	}
-	if got := Chrome150.String(); got != "Chrome/150.0" {
-		t.Errorf("Chrome150.String() = %q, want 'Chrome/150.0'", got)
+	if got := Chrome151.String(); got != "Chrome/151.0" {
+		t.Errorf("Chrome151.String() = %q, want 'Chrome/151.0'", got)
 	}
 	// The legacy names must keep resolving to the current profiles.
 	if Chrome147 != Chrome150 || Chrome146 != Chrome150 {
