@@ -144,7 +144,14 @@ func WithDialTimeout(d time.Duration) Option {
 	}
 }
 
-// WithAcceptLanguage sets the Accept-Language header. Default: "en-US,en;q=0.5".
+// WithAcceptLanguage sets the Accept-Language header. Default:
+// "en-US,en;q=0.9".
+//
+// Worth setting. The default is a device-locale value, not a browser constant —
+// the iPhone the Safari profile is modelled on reports "tr-TR,tr;q=0.9" — and
+// bot scoring compares it against the exit IP's geolocation. Requesting English
+// from a Turkish residential address is a small inconsistency that costs
+// nothing to remove: match the language to wherever your proxies exit.
 func WithAcceptLanguage(lang string) Option {
 	return func(c *clientConfig) {
 		c.acceptLanguage = lang

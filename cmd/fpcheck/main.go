@@ -308,6 +308,28 @@ func checkAgainstReference(ref gofire.Reference, got capture) []check {
 		add("tls.ja4", ref.JA4, got.TLS.JA4)
 	}
 
+	// ja4_r is the unhashed form, so a mismatch names the cipher, extension or
+	// signature algorithm that moved instead of just showing a different hash.
+	switch {
+	case ref.JA4R == "":
+		skip("tls.ja4_r", "no device capture for this profile yet — run with -compare to record one")
+	case got.TLS.JA4R == "":
+		skip("tls.ja4_r", "endpoint did not report ja4_r")
+	default:
+		add("tls.ja4_r", ref.JA4R, got.TLS.JA4R)
+	}
+
+	// peetprint covers supported_versions, ALPN and PSK modes, which neither
+	// JA3 nor JA4 hashes.
+	switch {
+	case ref.PeetPrintHash == "":
+		skip("tls.peetprint_hash", "no device capture for this profile yet")
+	case got.TLS.PeetPrint == "":
+		skip("tls.peetprint_hash", "endpoint did not report peetprint_hash")
+	default:
+		add("tls.peetprint_hash", ref.PeetPrintHash, got.TLS.PeetPrint)
+	}
+
 	if got.HTTP2.AkamaiFingerprint == "" {
 		skip("http2.akamai_fingerprint", "endpoint did not report an HTTP/2 fingerprint")
 	} else {

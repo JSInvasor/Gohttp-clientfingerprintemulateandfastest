@@ -48,6 +48,11 @@ func TestSafariClientHelloMatchesRealDevice(t *testing.T) {
 	if got := ch.ja4(); got != realSafariJA4 {
 		t.Errorf("JA4 mismatch\n got: %s\nwant: %s", got, realSafariJA4)
 	}
+	// ja4_r is unhashed, so a failure here names the exact cipher, extension or
+	// signature algorithm that drifted instead of just showing a moved hash.
+	if got := ch.ja4R(); got != SafariReference.JA4R {
+		t.Errorf("JA4_r mismatch\n got: %s\nwant: %s", got, SafariReference.JA4R)
+	}
 }
 
 // TestSafariClientHelloStableAcrossConnections guards the other half of the
@@ -448,6 +453,28 @@ func (h *parsedHello) ja4() string {
 	b := trunc12(joinHexSorted(ciphers))
 	c := trunc12(joinHexSorted(hashed) + "_" + joinHex(h.sigAlgs))
 	return a + "_" + b + "_" + c
+}
+
+// ja4R renders the raw, unhashed JA4 — the same inputs as ja4() with the two
+// SHA-256 truncations left off. A device reports it verbatim, so comparing it
+// says which cipher, extension or signature algorithm differs rather than only
+// that a hash moved.
+func (h *parsedHello) ja4R() string {
+	full := h.ja4()
+	a := full[:strings.IndexByte(full, '_')]
+
+	ciphers := dropGrease(h.ciphers)
+	hashed := make([]uint16, 0, len(h.extTypes))
+	for _, e := range dropGrease(h.extTypes) {
+		if e == extServerName || e == extALPN {
+			continue
+		}
+		hashed = append(hashed, e)
+	}
+
+	return a + "_" + joinHexSorted(ciphers) +
+		"_" + joinHexSorted(hashed) +
+		"_" + joinHex(h.sigAlgs)
 }
 
 func trunc12(s string) string {

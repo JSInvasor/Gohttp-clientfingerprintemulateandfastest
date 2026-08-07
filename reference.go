@@ -37,6 +37,16 @@ type Reference struct {
 	// JA4 is stable for both profiles: it sorts before hashing.
 	JA4 string
 
+	// JA4R is the unhashed JA4. Checking it alongside JA4 is what turns
+	// "something moved" into "this cipher moved". Empty when no device capture
+	// has supplied it yet, in which case it is reported as unverifiable rather
+	// than compared.
+	JA4R string
+
+	// PeetPrintHash covers supported_versions, ALPN and PSK modes, which
+	// neither JA3 nor JA4 hashes. Empty means not yet captured.
+	PeetPrintHash string
+
 	// AkamaiFingerprint is the HTTP/2 fingerprint:
 	//
 	//	SETTINGS (id:value, in send order) | WINDOW_UPDATE | PRIORITY frames | pseudo-header order
@@ -72,6 +82,8 @@ func ReferenceFor(profile BrowserProfile) Reference {
 			JA3:               tls.JA3,
 			JA3Hash:           tls.JA3Hash,
 			JA4:               tls.JA4,
+			JA4R:              tls.JA4R,
+			PeetPrintHash:     tls.PeetPrintHash,
 			AkamaiFingerprint: AkamaiFingerprint(h2),
 			AkamaiHash:        akamaiHash(AkamaiFingerprint(h2)),
 			HeadersPriority:   h2.PrioritySignals,
@@ -95,6 +107,8 @@ func ReferenceFor(profile BrowserProfile) Reference {
 		JA3:               tls.JA3,
 		JA3Hash:           tls.JA3Hash,
 		JA4:               tls.JA4,
+		JA4R:              tls.JA4R,
+		PeetPrintHash:     tls.PeetPrintHash,
 		AkamaiFingerprint: AkamaiFingerprint(h2),
 		AkamaiHash:        akamaiHash(AkamaiFingerprint(h2)),
 		HeadersPriority:   h2.PrioritySignals,

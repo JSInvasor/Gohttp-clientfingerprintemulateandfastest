@@ -61,6 +61,62 @@ func quote(s string) string {
 	return string(b)
 }
 
+// TestReferenceMatchesRealDevice runs the checker over an unedited capture from
+// a real iPhone 13 on iOS 26.5.2 (only the client random, session id and IP are
+// redacted, and the key_share blobs elided — none of which any check reads).
+//
+// This is the test that makes the Safari reference evidence rather than
+// assertion. Every other test here proves the client emits what it was written
+// to emit; this one proves what it was written to emit is what the device
+// sends. In particular the device's HEADERS frame carries flags
+// EndStream|EndHeaders and no Priority — confirming that a profile advertising
+// NO_RFC7540_PRIORITIES=1 must not attach an RFC 7540 priority block.
+//
+// Re-capture with `fpcheck -profile safari -save iphone.json` from the phone and
+// replace this file when the reference moves.
+func TestReferenceMatchesRealDevice(t *testing.T) {
+	got, err := loadCapture("testdata/iphone-ios26.json")
+	if err != nil {
+		t.Fatalf("load device capture: %v", err)
+	}
+
+	ref := gofire.ReferenceFor(gofire.SafariIOS18)
+	var checked int
+	for _, c := range checkAgainstReference(ref, *got) {
+		if c.skipped {
+			t.Logf("SKIP %s: %s", c.name, c.note)
+			continue
+		}
+		checked++
+		if !c.ok() {
+			t.Errorf("the reference disagrees with the real device on %q\n device: %s\n ours:   %s",
+				c.name, c.got, c.want)
+		}
+	}
+	if checked < 8 {
+		t.Errorf("only %d checks ran against the device capture; the fixture or the "+
+			"checker has lost coverage", checked)
+	}
+}
+
+// TestDeviceCaptureSendsNoHeadersPriority states the device's own behaviour
+// directly, so the reason the Safari profile sends no priority block does not
+// depend on reading it back out of a checker result.
+func TestDeviceCaptureSendsNoHeadersPriority(t *testing.T) {
+	got, err := loadCapture("testdata/iphone-ios26.json")
+	if err != nil {
+		t.Fatalf("load device capture: %v", err)
+	}
+	hf := got.headersFrame()
+	if hf == nil {
+		t.Fatal("device capture has no HEADERS frame")
+	}
+	if p := describePriority(hf); p != "absent" {
+		t.Errorf("real iOS Safari HEADERS priority = %q, want absent — "+
+			"the profile's PrioritySignals=false is derived from this", p)
+	}
+}
+
 func TestCheckAgainstReferencePasses(t *testing.T) {
 	ref := gofire.ReferenceFor(gofire.SafariIOS18)
 	for _, c := range checkAgainstReference(ref, safariCapture(t)) {

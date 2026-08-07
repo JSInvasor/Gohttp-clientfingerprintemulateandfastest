@@ -37,6 +37,19 @@ type TLSReference struct {
 	// Pinning it separately localises a failure to the extension set rather
 	// than leaving it ambiguous with the signature algorithms.
 	JA4RExtensions string
+
+	// JA4R is the full unhashed JA4: the a-part, then the sorted ciphers, the
+	// sorted extensions and the signature algorithms in wire order.
+	//
+	// Worth checking alongside JA4 precisely because it is not hashed. A JA4
+	// mismatch says only that something moved; a JA4_r mismatch shows which
+	// cipher, extension or signature algorithm it was.
+	JA4R string
+
+	// PeetPrintHash is tls.peet.ws's own fingerprint. It covers fields JA3 and
+	// JA4 both ignore — supported_versions, ALPN, PSK modes and the
+	// ec_point_formats list — so it catches drift the other two cannot see.
+	PeetPrintHash string
 }
 
 // SafariReference is a real iPhone 13 running iOS 26.5.2 (Safari 26.5.2).
@@ -51,6 +64,11 @@ var SafariReference = TLSReference{
 	JA3Hash:        "ecdf4f49dd59effc439639da29186671",
 	JA4:            "t13d2013h2_a09f3c656075_7f0f34a4126d",
 	JA4RExtensions: "0005,000a,000b,000d,0012,0017,001b,002b,002d,0033,ff01",
+	JA4R: "t13d2013h2_" +
+		"000a,002f,0035,009c,009d,1301,1302,1303,c008,c009,c00a,c012,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_" +
+		"0005,000a,000b,000d,0012,0017,001b,002b,002d,0033,ff01_" +
+		"0403,0804,0401,0503,0805,0805,0501,0806,0601,0201",
+	PeetPrintHash: "62b834de729e78a9f0ebd1dd099314a7",
 }
 
 // ChromeReference is a real Chrome 150 on Windows.
@@ -59,6 +77,12 @@ var SafariReference = TLSReference{
 // off a capture of a RESUMED session that carried pre_shared_key (0x0029) as a
 // seventeenth counted extension; this package never sends PSK on an initial
 // connection, so it emits 16 and can never produce the 17-extension hash.
+//
+// JA4R and PeetPrintHash are not filled in: the Chrome reference predates the
+// device capture that would supply them, and a guessed value is worse than an
+// absent one — fpcheck reports an empty reference as unverifiable, but a wrong
+// one would fail every correct run. Capture them with
+// `fpcheck -profile chrome -compare <capture>.json` and fill them in.
 var ChromeReference = TLSReference{
 	Device:         "Chrome 150, Windows 10 x64",
 	JA4:            "t13d1516h2_8daaf6152771_806a8c22fdea",

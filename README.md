@@ -209,6 +209,20 @@ Capture on the same OS you intend to emulate, over a normal Wi-Fi or cellular
 connection, and in a fresh tab: a reloaded page resumes the TLS session and
 carries `pre_shared_key`, which adds an extension and shifts JA4.
 
+The Safari capture used to build the current reference is committed at
+`cmd/fpcheck/testdata/iphone-ios26.json` (iPhone 13, iOS 26.5.2), and
+`TestReferenceMatchesRealDevice` runs the same checker over it on every `go
+test`. That is what makes the Safari numbers evidence rather than assertion —
+including the HEADERS frame carrying `EndStream|EndHeaders` and no `Priority`,
+which is where the `PrioritySignals: false` above comes from. There is no
+equivalent capture for Chrome yet, so its `ja4_r` and `peetprint` are reported
+as unverifiable rather than compared.
+
+One thing the capture shows that is *not* a constant: `accept-language`. The
+reference device sends `tr-TR,tr;q=0.9` because it is a Turkish phone. The
+default here is `en-US,en;q=0.9`; set `WithAcceptLanguage` to match wherever
+your proxies exit, since bot scoring compares the two.
+
 ## Options
 
 | Option | Default | Description |
@@ -355,13 +369,15 @@ and is stable.
 The TLS, HTTP/2 and header layers match the reference devices. These do not, and
 no amount of work inside this package closes them:
 
-- **The TCP/IP layer says whatever OS you run on.** Initial TTL, MSS, window
-  size and the order of TCP options are set by the kernel, and Akamai and
-  Cloudflare both read them (`tls.peet.ws` reports them under `tcpip`). A
-  request from Linux claiming to be an iPhone is internally inconsistent no
-  matter how exact the ClientHello is. If that matters for your target, run from
-  the OS you are emulating — or behind a proxy running on it, since the exit
-  host is what the origin measures.
+- **The TCP/IP layer says whatever OS you run on.** MSS, window scale and the
+  order of TCP options in the SYN are set by the kernel, and a p0f-style
+  classifier reads them. Initial TTL is *not* the tell people assume — iOS and
+  Linux both start at 64, and the iPhone capture in
+  `cmd/fpcheck/testdata` shows 48 after 16 hops, which a Linux host on the same
+  path would also show. `tls.peet.ws` reports only TTL and a mid-stream window
+  under `tcpip`, so it will not surface this either way; judging it needs a SYN
+  capture. If your target scores it, run from the OS you are emulating — or
+  behind a proxy running on it, since the exit host is what the origin measures.
 - **TCP Fast Open is off by default** for the same reason: no browser uses it,
   so a SYN carrying payload contradicts the browser above it. `WithTCPFastOpen()`
   turns it back on when throughput matters more.
