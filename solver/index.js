@@ -15,8 +15,11 @@
 //
 // Design (one-shot, no server):
 //   - puppeteer-real-browser launches a real Chromium with stealth patches.
-//   - We pin the UA to Chrome 147 to match what the gofire client emulates.
-//     UAM binds cf_clearance to (UA, JA3/JA4, IP); UA drift = instant 403.
+//   - We pin the UA (profile.js TARGET_UA) to match what the gofire client
+//     emulates. UAM binds cf_clearance to (UA, JA3/JA4, IP); UA drift = instant
+//     403. `fpcheck -via-chromium` verifies the pin against the Go profile and
+//     against this box's actual Chromium, so the drift is caught before a run
+//     rather than diagnosed from a wall of 403s.
 //   - After cf_clearance appears we perform human-like behavior (mouse moves,
 //     smoothed scroll, dwell time) BEFORE reading the cookie. CF assigns a
 //     "human signal" score during the first few seconds after issuance; a
@@ -28,18 +31,16 @@
 
 import { connect } from "puppeteer-real-browser";
 import { execSync } from "node:child_process";
+import {
+  CONNECT_OPTIONS,
+  TARGET_UA,
+  chromiumMajor as parseChromiumMajor,
+} from "./profile.js";
 
 const url = process.argv[2];
 const timeoutSec = parseInt(process.argv[3] || "75", 10);
 const TIMEOUT_MS = timeoutSec * 1000;
 const MAX_ATTEMPTS = 2;
-
-// Match blaze's emulated Chrome 147. Override via env if your VPS Chrome is
-// a different major version - drift between solver UA and gofire UA causes
-// "all mitigated" because cf_clearance is bound to UA + JA4.
-const TARGET_UA =
-  process.env.SOLVER_UA ||
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 
 if (!url) {
   console.error(
@@ -175,24 +176,11 @@ function rand(a, b) {
 // Launch a fresh real-browser session with stealth shims layered on top of
 // puppeteer-real-browser's existing rebrowser-puppeteer-core patches.
 async function launch() {
-  const result = await connect({
-    headless: false,
-    turnstile: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-blink-features=AutomationControlled",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--window-size=1920,1080",
-    ],
-    connectOption: { defaultViewport: null },
-    disableXvfb: false,
-    ignoreAllFlags: false,
-  });
+  // Launch options live in profile.js so fingerprint.js measures the same
+  // browser configuration this solves with. A launch flag can move the TLS
+  // layer, and measuring a differently-flagged browser answers the wrong
+  // question.
+  const result = await connect(CONNECT_OPTIONS);
 
   const { browser, page } = result;
   currentBrowser = browser;
@@ -204,17 +192,15 @@ async function launch() {
     if (proc && proc.pid) trackPid(proc.pid);
   } catch {}
 
-  // Read the actual Chromium build so the caller (blaze) can compare to the
-  // emulated Chrome major. cf_clearance is bound to the JA4 of the session
-  // that issued it — if our Chromium is e.g. 138 but gofire replays as 147,
-  // the cookie dies under load. Surfacing the version lets blaze warn loudly
-  // instead of silently failing.
+  // Read the actual Chromium build so the caller can compare it to the emulated
+  // Chrome major. cf_clearance is bound to the JA4 of the session that issued
+  // it — if this Chromium is 147 but gofire replays as 151, the cookie dies
+  // under load. `fpcheck -via-chromium` measures that difference directly.
   let chromiumVersion = "";
-  let chromiumMajor = 0;
+  let chromiumMajorVersion = 0;
   try {
-    chromiumVersion = await browser.version(); // e.g. "HeadlessChrome/147.0.7390.54"
-    const m = chromiumVersion.match(/(\d+)\.\d+\.\d+\.\d+/);
-    if (m) chromiumMajor = parseInt(m[1], 10);
+    chromiumVersion = await browser.version(); // e.g. "HeadlessChrome/151.0.7204.50"
+    chromiumMajorVersion = parseChromiumMajor(chromiumVersion);
   } catch {}
 
   // Force the gofire-matching UA before any navigation.
@@ -258,7 +244,7 @@ async function launch() {
     } catch {}
   });
 
-  return { browser, page, chromiumVersion, chromiumMajor };
+  return { browser, page, chromiumVersion, chromiumMajor: chromiumMajorVersion };
 }
 
 // Wait until cf_clearance appears in the cookie jar OR the page leaves the

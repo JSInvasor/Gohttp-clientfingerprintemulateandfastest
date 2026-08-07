@@ -9,3 +9,7 @@ vendor/
 /test-single
 proxies.txt
 http.txt
+
+# solver deps: `npm install` in solver/ pulls ~100 packages plus a Chromium
+solver/node_modules/
+solver/package-lock.json

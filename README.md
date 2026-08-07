@@ -184,11 +184,39 @@ go run ./cmd/fpcheck                    # both profiles against tls.peet.ws
 go run ./cmd/fpcheck -profile chrome
 go run ./cmd/fpcheck -proxy socks5://user:pass@host:1080
 go run ./cmd/fpcheck -frames            # also print the HTTP/2 frames
+go run ./cmd/fpcheck -via-chromium -profile chrome   # diff against the solver's real browser
 ```
 
 Each layer is reported as PASS or FAIL against the reference values in
 `reference.go`, and the exit status is non-zero if anything drifted, so it can
 gate CI.
+
+### Checking against the browser the solver drives
+
+If you use `solver/` to earn `cf_clearance`, the browser it launches and the
+client that replays the cookie have to be the same browser. Cloudflare binds the
+cookie to the issuing session's (UA, JA3/JA4, IP), so a mismatch produces a
+cookie that works once, dies within seconds under load, and looks exactly like a
+solver bug. That agreement used to be maintained by hand — `index.js` pinned a
+User-Agent in a comment and nothing checked it, which is how it ended up pinned
+to Chrome 147 while the Go profile moved to 151.
+
+```bash
+cd solver && npm install && cd ..
+go run ./cmd/fpcheck -via-chromium -profile chrome
+```
+
+This launches the solver's own Chromium — same `puppeteer-real-browser` build,
+same flags, from `solver/profile.js` — sends it to the fingerprint endpoint, and
+reports two things: the browser against the pinned reference, then this client
+against that same browser, field by field.
+
+If Chromium is not on the default path, set `CHROME_PATH` to the binary.
+
+A version difference between the box's Chromium and the emulated Chrome is
+reported, not failed: Chrome's TLS layer went unchanged across 146–151, so what
+decides is the `chromium.ja4` line beneath it. Add `-save chromium.json` to keep
+the capture — it is a device capture like any other and can become the reference.
 
 ### Refreshing a reference from a real device
 

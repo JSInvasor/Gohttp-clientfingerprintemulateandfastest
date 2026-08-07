@@ -55,6 +55,10 @@ func main() {
 		save       = flag.String("save", "", "write the raw JSON response to this path")
 		timeout    = flag.Duration("timeout", 30*time.Second, "request timeout")
 		showFrames = flag.Bool("frames", false, "print the HTTP/2 frames the server recorded")
+
+		viaChromium = flag.Bool("via-chromium", false,
+			"also measure the real Chromium the solver drives, and diff this client against it")
+		solverDir = flag.String("solver-dir", "solver", "directory holding fingerprint.js and node_modules")
 	)
 	flag.Parse()
 
@@ -68,9 +72,26 @@ func main() {
 		fmt.Fprintln(os.Stderr, "fpcheck: -compare needs a single -profile (safari or chrome)")
 		os.Exit(2)
 	}
+	if *viaChromium {
+		// The probe launches a desktop Chromium, so only the Chrome profile has
+		// anything to compare against. Running it for Safari would report every
+		// field as different and mean nothing.
+		if len(profiles) != 1 || profiles[0] != gofire.Chrome151 {
+			fmt.Fprintln(os.Stderr, "fpcheck: -via-chromium requires -profile chrome")
+			os.Exit(2)
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+
+	if *viaChromium {
+		if err := runViaChromium(ctx, profiles[0], *url, *proxy, *save, *solverDir, *timeout); err != nil {
+			fmt.Fprintln(os.Stderr, "fpcheck:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	ok := true
 	for i, p := range profiles {
@@ -100,30 +121,60 @@ func selectProfiles(name string) ([]gofire.BrowserProfile, error) {
 	}
 }
 
-func run(ctx context.Context, profile gofire.BrowserProfile, url, proxy, compare, save string, showFrames bool) error {
+// buildClient creates the emulating client used for a live capture.
+func buildClient(profile gofire.BrowserProfile, proxy string) (*gofire.Client, error) {
 	opts := []gofire.Option{gofire.WithTimeout(25 * time.Second)}
 	if proxy != "" {
 		opts = append(opts, gofire.WithProxy(proxy))
 	}
-
 	client, err := gofire.Emulate(profile, opts...)
 	if err != nil {
-		return fmt.Errorf("create client: %w", err)
+		return nil, fmt.Errorf("create client: %w", err)
 	}
-	defer client.Close()
+	return client, nil
+}
 
+// fetchCapture requests url with client and parses the fingerprint response.
+func fetchCapture(ctx context.Context, client *gofire.Client, url string) (*capture, error) {
+	raw, err := fetchRaw(ctx, client, url)
+	if err != nil {
+		return nil, err
+	}
+	var got capture
+	if err := json.Unmarshal(raw, &got); err != nil {
+		return nil, fmt.Errorf("parse response (is %s a fingerprint API?): %w", url, err)
+	}
+	return &got, nil
+}
+
+// fetchRaw returns the response body, which callers may want to save verbatim.
+func fetchRaw(ctx context.Context, client *gofire.Client, url string) ([]byte, error) {
 	resp, err := client.GetWithContext(ctx, url)
 	if err != nil {
-		return fmt.Errorf("GET %s: %w", url, err)
+		return nil, fmt.Errorf("GET %s: %w", url, err)
 	}
 	defer resp.Close()
 
 	raw, err := resp.Bytes()
 	if err != nil {
-		return fmt.Errorf("read body: %w", err)
+		return nil, fmt.Errorf("read body: %w", err)
 	}
 	if code := resp.StatusCode(); code != 200 {
-		return fmt.Errorf("HTTP %d from %s: %s", code, url, truncate(string(raw), 300))
+		return nil, fmt.Errorf("HTTP %d from %s: %s", code, url, truncate(string(raw), 300))
+	}
+	return raw, nil
+}
+
+func run(ctx context.Context, profile gofire.BrowserProfile, url, proxy, compare, save string, showFrames bool) error {
+	client, err := buildClient(profile, proxy)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	raw, err := fetchRaw(ctx, client, url)
+	if err != nil {
+		return err
 	}
 
 	var got capture
