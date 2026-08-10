@@ -187,8 +187,10 @@ func buildSafariExtensions(serverName string, alpn []string, km *keyMaterial, gs
 	// 1. GREASE extension (empty)
 	out = appendExt(out, gs.extFirst, nil)
 
-	// 2. server_name (0)
-	out = appendExt(out, extServerName, buildSNI(serverName))
+	// 2. server_name (0) — omitted for an address-form target, see sendSNI.
+	if sendSNI(serverName) {
+		out = appendExt(out, extServerName, buildSNI(serverName))
+	}
 
 	// 3. extended_master_secret (23) - empty
 	out = appendExt(out, extExtendedMasterSecret, nil)

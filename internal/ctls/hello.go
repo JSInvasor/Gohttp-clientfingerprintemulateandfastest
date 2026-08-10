@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"net"
 
 	mlkem "github.com/cloudflare/circl/kem/mlkem/mlkem768"
 )
@@ -61,7 +62,7 @@ type greaseSet struct {
 	cipher   uint16 // GREASE in cipher suite list
 	extFirst uint16 // GREASE as first extension
 	extLast  uint16 // GREASE as second-to-last extension
-	keyShare uint16 // GREASE in key_share
+	keyShare uint16 // GREASE in key_share — always equal to group, see newGreaseSet
 	group    uint16 // GREASE in supported_groups
 	version  uint16 // GREASE in supported_versions
 }
@@ -99,14 +100,62 @@ func newGreaseSet() greaseSet {
 	// live in separate namespaces (a cipher, a named group, a version), so a
 	// repeat there is not a protocol violation.
 	extFirst := randomGrease()
+
+	// key_share and supported_groups share ONE draw, and must keep doing so.
+	//
+	// The GREASE entry in key_share is a NamedGroup, so it lands in the same
+	// namespace as the GREASE entry in supported_groups. RFC 8446 §4.2.8:
+	//
+	//	Clients MUST NOT offer any KeyShareEntry values for groups not listed
+	//	in the client's "supported_groups" extension. [...] Servers MAY check
+	//	for violations of these rules and abort the handshake with an
+	//	"illegal_parameter" alert if one is violated.
+	//
+	// Drawing them independently made 15 connections in 16 offer a key share
+	// for a group the hello never advertised. Most servers ignore it, which is
+	// why this only ever showed up on "some sites" — but the ones that do
+	// enforce §4.2.8 answer with a fatal illegal_parameter, surfacing as
+	// "tls handshake: server alert: 47" with no way to retry.
+	//
+	// Matching them is also what the emulated browsers do. BoringSSL fills both
+	// slots from a single ssl_grease_group index (there is no separate key_share
+	// index), so a real Chrome hello always repeats the same value in the two
+	// places, and so does Apple's stack. A mismatch is therefore a bot signal on
+	// top of being a protocol violation.
+	group := randomGrease()
+
 	return greaseSet{
 		cipher:   randomGrease(),
 		extFirst: extFirst,
 		extLast:  randomGreaseExcept(extFirst),
-		keyShare: randomGrease(),
-		group:    randomGrease(),
+		keyShare: group,
+		group:    group,
 		version:  randomGrease(),
 	}
+}
+
+// sendSNI reports whether server_name may carry serverName.
+//
+// RFC 6066 §3 is explicit: "Literal IPv4 and IPv6 addresses are not permitted
+// in 'HostName'." A server that enforces it answers a fatal alert — the same
+// illegal_parameter (47) class as the GREASE group mismatch above — so an
+// address-form request would fail the handshake outright rather than falling
+// back. Browsers omit the extension entirely in that case, which is also the
+// only way to reach a host that serves on an IP with no matching SNI vhost.
+//
+// An empty name is excluded for the same reason: a zero-length HostName is a
+// malformed ServerNameList, not an absent one.
+func sendSNI(serverName string) bool {
+	if serverName == "" {
+		return false
+	}
+	// SplitHostPort strips IPv6 brackets, but a caller that passed the address
+	// through untouched may not have, so both forms are checked.
+	host := serverName
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	return net.ParseIP(host) == nil
 }
 
 func buildSNI(serverName string) []byte {

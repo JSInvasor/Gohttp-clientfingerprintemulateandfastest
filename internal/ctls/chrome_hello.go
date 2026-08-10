@@ -131,13 +131,18 @@ func buildChromeExtensions(serverName string, alpn []string, km *keyMaterial, gs
 		{extSCT, nil},
 		{extRenegotiationInfo, []byte{0x00}},
 		{extALPN, buildALPN(alpn)},
-		{extServerName, buildSNI(serverName)},
 		{extSupportedGroups, buildChromeSupportedGroups(gs)},
 		{extALPS, buildALPS(alpsProtocols)},
 		{extSignatureAlgorithms, buildChromeSigAlgs()},
 		{extECH, echGrease},
 		{extStatusRequest, buildStatusRequest()},
 		{extSessionTicket, nil},
+	}
+	// server_name is omitted for an address-form target — see sendSNI. Chrome
+	// does the same, so the shuffled block simply carries one fewer extension
+	// rather than an SNI holding something RFC 6066 forbids.
+	if sendSNI(serverName) {
+		middle = append(middle, chromeExt{extServerName, buildSNI(serverName)})
 	}
 	if err := shuffleChromeExts(middle); err != nil {
 		return nil, err

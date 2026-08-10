@@ -181,15 +181,16 @@ func TestSafariKeyShareCarriesMLKEM(t *testing.T) {
 // ---------- minimal ClientHello parser + JA3/JA4 for tests ----------
 
 type parsedHello struct {
-	legacyVersion uint16
-	ciphers       []uint16
-	extTypes      []uint16
-	groups        []uint16
-	ecPointFmts   []byte
-	sigAlgs       []uint16
-	supportedVers []uint16
-	alpn          []string
-	hasSNI        bool
+	legacyVersion  uint16
+	ciphers        []uint16
+	extTypes       []uint16
+	groups         []uint16
+	keyShareGroups []uint16
+	ecPointFmts    []byte
+	sigAlgs        []uint16
+	supportedVers  []uint16
+	alpn           []string
+	hasSNI         bool
 }
 
 func parseClientHello(msg []byte) (*parsedHello, error) {
@@ -278,6 +279,17 @@ func parseClientHello(msg []byte) (*parsedHello, error) {
 				for i := 2; i+1 < len(data); i += 2 {
 					h.sigAlgs = append(h.sigAlgs, binary.BigEndian.Uint16(data[i:]))
 				}
+			}
+		case extKeyShare:
+			// client_shares length(2) + [ group(2) + key_exchange length(2) + key ]*
+			for i := 2; i+4 <= len(data); {
+				group := binary.BigEndian.Uint16(data[i:])
+				n := int(binary.BigEndian.Uint16(data[i+2:]))
+				if i+4+n > len(data) {
+					return nil, fmt.Errorf("key_share entry 0x%04x overruns", group)
+				}
+				h.keyShareGroups = append(h.keyShareGroups, group)
+				i += 4 + n
 			}
 		case extSupportedVersions:
 			if len(data) >= 1 {
