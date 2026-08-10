@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 
 	mlkem "github.com/cloudflare/circl/kem/mlkem/mlkem768"
 )
@@ -25,6 +26,64 @@ type keyMaterial struct {
 	mlkemPriv  *mlkem.PrivateKey
 	x25519Priv *ecdh.PrivateKey
 	p256Priv   *ecdh.PrivateKey
+
+	// retryGroup/retryPriv hold the key generated to answer a
+	// HelloRetryRequest, for the case where the group the server picked is not
+	// one of the two we keep ready. P-384 and P-521 keygen is expensive enough
+	// that doing it on every handshake to serve a path almost nothing takes
+	// would be a real cost, so it happens on demand.
+	retryGroup uint16
+	retryPriv  *ecdh.PrivateKey
+}
+
+// ecdhCurveForGroup maps a TLS NamedGroup to its curve, or nil for a group that
+// is not a plain ECDH curve (X25519MLKEM768, GREASE, anything unknown).
+func ecdhCurveForGroup(group uint16) ecdh.Curve {
+	switch group {
+	case groupX25519:
+		return ecdh.X25519()
+	case groupP256:
+		return ecdh.P256()
+	case groupP384:
+		return ecdh.P384()
+	case groupP521:
+		return ecdh.P521()
+	default:
+		return nil
+	}
+}
+
+// privateKeyFor returns the ECDH private key held for group, or nil.
+func (km *keyMaterial) privateKeyFor(group uint16) *ecdh.PrivateKey {
+	switch group {
+	case groupX25519:
+		return km.x25519Priv
+	case groupP256:
+		return km.p256Priv
+	}
+	if km.retryPriv != nil && km.retryGroup == group {
+		return km.retryPriv
+	}
+	return nil
+}
+
+// generateRetryKey makes a key for group available to privateKeyFor, and
+// returns the public key to put in the second ClientHello's key_share.
+func (km *keyMaterial) generateRetryKey(group uint16) ([]byte, error) {
+	if priv := km.privateKeyFor(group); priv != nil {
+		return priv.PublicKey().Bytes(), nil
+	}
+	curve := ecdhCurveForGroup(group)
+	if curve == nil {
+		return nil, fmt.Errorf("no key exchange for group 0x%04x", group)
+	}
+	priv, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate key for group 0x%04x: %w", group, err)
+	}
+	km.retryGroup = group
+	km.retryPriv = priv
+	return priv.PublicKey().Bytes(), nil
 }
 
 // generateKeyMaterial generates key pairs for X25519MLKEM768, X25519, and P-256.
@@ -134,28 +193,48 @@ func newGreaseSet() greaseSet {
 	}
 }
 
-// sendSNI reports whether server_name may carry serverName.
+// sniHostName normalises serverName into the HostName a server_name extension
+// may carry, and reports whether the extension should be sent at all.
 //
-// RFC 6066 §3 is explicit: "Literal IPv4 and IPv6 addresses are not permitted
-// in 'HostName'." A server that enforces it answers a fatal alert — the same
-// illegal_parameter (47) class as the GREASE group mismatch above — so an
-// address-form request would fail the handshake outright rather than falling
-// back. Browsers omit the extension entirely in that case, which is also the
-// only way to reach a host that serves on an IP with no matching SNI vhost.
+// Every rule here is one RFC 6066 §3 states and that a strict server enforces
+// with a fatal alert — the same class of unrecoverable handshake failure as an
+// illegal ClientHello field:
 //
-// An empty name is excluded for the same reason: a zero-length HostName is a
-// malformed ServerNameList, not an absent one.
-func sendSNI(serverName string) bool {
-	if serverName == "" {
-		return false
-	}
-	// SplitHostPort strips IPv6 brackets, but a caller that passed the address
-	// through untouched may not have, so both forms are checked.
+//   - Address literals are not permitted in HostName, so an IP target gets no
+//     server_name at all. That is also what browsers do, and the only way to
+//     reach a host serving on an IP with no matching SNI vhost. IPv6 brackets
+//     and a scope-zone suffix are stripped before the check, or "fe80::1%eth0"
+//     would not parse as an address and would go out as if it were a hostname.
+//   - HostName is the DNS name and carries no root label, so a trailing dot is
+//     stripped. "example.com." is a perfectly ordinary URL host that net/http
+//     passes through untouched, and it is not a legal HostName.
+//   - An empty name is dropped rather than encoded: a zero-length HostName is a
+//     malformed ServerNameList, not an absent one.
+//
+// The result is lower-cased. DNS and SNI comparison are both case-insensitive,
+// but browsers normalise the URL host before it ever reaches the TLS layer, so
+// a mixed-case HostName on the wire is a difference no real client produces.
+//
+// IDN needs no handling here: net/http converts the host to its A-label in
+// canonicalAddr before the dialer sees it, so this only ever receives ASCII.
+func sniHostName(serverName string) (string, bool) {
 	host := serverName
 	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
 		host = host[1 : len(host)-1]
 	}
-	return net.ParseIP(host) == nil
+	if i := strings.LastIndex(host, "%"); i > 0 {
+		host = host[:i]
+	}
+	if net.ParseIP(host) != nil {
+		return "", false
+	}
+	for len(host) > 0 && host[len(host)-1] == '.' {
+		host = host[:len(host)-1]
+	}
+	if host == "" {
+		return "", false
+	}
+	return strings.ToLower(host), true
 }
 
 func buildSNI(serverName string) []byte {
@@ -168,15 +247,34 @@ func buildSNI(serverName string) []byte {
 	return data
 }
 
+// buildALPN encodes a ProtocolNameList, returning nil when there is nothing
+// legal to encode.
+//
+// RFC 7301 gives both the list and each name a minimum length of one, so an
+// empty list or a zero-length name is a malformed extension that a strict
+// server rejects outright. A name over 255 bytes cannot be length-prefixed at
+// all and used to wrap silently through byte(), producing an extension whose
+// framing disagreed with its contents — which desynchronises the whole
+// extension block, not just this one entry. Callers pass constants today; this
+// keeps a future caller from turning bad input into a dead connection.
 func buildALPN(alpn []string) []byte {
+	usable := make([]string, 0, len(alpn))
 	total := 0
 	for _, proto := range alpn {
+		if len(proto) == 0 || len(proto) > 255 {
+			continue
+		}
+		usable = append(usable, proto)
 		total += 1 + len(proto)
 	}
+	if len(usable) == 0 || total > 0xFFFF {
+		return nil
+	}
+
 	data := make([]byte, 2+total)
 	binary.BigEndian.PutUint16(data[0:], uint16(total))
 	offset := 2
-	for _, proto := range alpn {
+	for _, proto := range usable {
 		data[offset] = byte(len(proto))
 		copy(data[offset+1:], proto)
 		offset += 1 + len(proto)

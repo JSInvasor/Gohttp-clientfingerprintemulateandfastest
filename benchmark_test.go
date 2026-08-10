@@ -2,7 +2,13 @@ package gofire
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	crand "crypto/rand"
 	cryptotls "crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -686,6 +692,78 @@ func BenchmarkSafariIOS18H2Settings(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = SafariIOS18H2Settings()
+	}
+}
+
+// TestALPNAbsentFallsBackToHTTP1 covers the harder half of the same failure:
+// a server that answers with no ALPN extension at all.
+//
+// TestALPNFallbackToHTTP1 below uses a server that explicitly selects
+// http/1.1, which the dispatcher always caught. A server that simply omits the
+// extension — common on older stacks and on origins with ALPN switched off —
+// reported an empty protocol, and the dispatcher read empty as "fine, h2" and
+// pumped the h2 preface into it. RFC 7301 §3.2 has the server echo what it
+// selected, so no extension means it selected nothing.
+//
+// httptest cannot express this (StartTLS fills NextProtos in when it is nil),
+// so the listener is built by hand.
+func TestALPNAbsentFallsBackToHTTP1(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(crand.Reader, tmpl, tmpl, key.Public(), key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	// NextProtos deliberately unset: the server negotiates no ALPN whatsoever.
+	tlsLn := cryptotls.NewListener(ln, &cryptotls.Config{
+		Certificates: []cryptotls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+		MinVersion:   cryptotls.VersionTLS13,
+	})
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Proto", r.Proto)
+		w.Write([]byte("ok"))
+	})}
+	go srv.Serve(tlsLn)
+	defer srv.Close()
+
+	client, err := Emulate(Chrome151, WithInsecureSkipVerify(), WithTimeout(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	resp, err := client.Get("https://" + ln.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("request to an ALPN-less server: %v", err)
+	}
+	defer resp.Close()
+
+	if resp.StatusCode() != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode())
+	}
+	if got := resp.GetHeader("X-Proto"); got != "HTTP/1.1" {
+		t.Errorf("X-Proto = %q, want HTTP/1.1", got)
 	}
 }
 

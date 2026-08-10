@@ -15,10 +15,15 @@ const (
 	handshakeTypeNewSessionTicket      = 4
 	handshakeTypeEncryptedExtensions   = 8
 	handshakeTypeCertificate           = 11
+	handshakeTypeCertificateRequest    = 13
 	handshakeTypeCertificateVerify     = 15
 	handshakeTypeFinished              = 20
 	handshakeTypeKeyUpdate             = 24
 	handshakeTypeCompressedCertificate = 25
+
+	// handshakeTypeMessageHash is the synthetic message RFC 8446 §4.4.1
+	// substitutes for ClientHello1 once a HelloRetryRequest has been exchanged.
+	handshakeTypeMessageHash = 254
 )
 
 // KeyUpdate request_update values (RFC 8446 §4.6.3).
@@ -85,7 +90,9 @@ const (
 	extSessionTicket        = 0x0023
 	extKeyShare             = 0x0033
 	extSupportedVersions    = 0x002B
+	extCookie               = 0x002C
 	extPSKKeyExchangeModes  = 0x002D
+	extPreSharedKey         = 0x0029
 	extALPS                 = 0x44CD // application_settings (Chrome-only)
 	extECH                  = 0xFE0D // ECH GREASE (Chrome-only)
 	extRenegotiationInfo    = 0xFF01
@@ -190,5 +197,6 @@ const (
 	alertCloseNotify      = 0
 	alertUnexpectedMsg    = 10
 	alertHandshakeFailure = 40
+	alertIllegalParameter = 47
 	alertDecryptError     = 51
 )

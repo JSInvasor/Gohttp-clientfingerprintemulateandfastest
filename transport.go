@@ -339,7 +339,14 @@ func (t *Transport) dialTLSForH2(ctx context.Context, network, addr string) (net
 		return nil, err
 	}
 	if alpnConn, ok := conn.(interface{ NegotiatedProtocol() string }); ok {
-		if proto := alpnConn.NegotiatedProtocol(); proto != "" && proto != "h2" {
+		// An absent ALPN counts as "not h2", not as "assume h2". RFC 7301 §3.2
+		// has the server echo the protocol it selected, so a response with no
+		// application_layer_protocol_negotiation extension means it selected
+		// none — which for a server offered h2 and http/1.1 means it speaks
+		// only the latter. Treating "" as h2 sent the h2 preface into HTTP/1.1
+		// servers that simply omit the extension, and every request on that
+		// conn died with no useful diagnosis.
+		if proto := alpnConn.NegotiatedProtocol(); proto != "h2" {
 			t.hostProto.Store(hostProtoKey(addr, "443"), hostProtoEntry{
 				proto:   "http/1.1",
 				expires: time.Now().Add(hostProtoTTL),

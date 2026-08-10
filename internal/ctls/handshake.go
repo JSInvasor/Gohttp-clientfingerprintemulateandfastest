@@ -54,6 +54,7 @@ type handshakeState struct {
 	negotiatedALPN string
 
 	clientHelloMsg []byte
+	ccsSent        bool
 }
 
 // handshake performs the full TLS 1.3 handshake and returns a *Conn.
@@ -131,30 +132,13 @@ func alertError(body []byte) error {
 	return nil
 }
 
-func (hs *handshakeState) run() (*Conn, error) {
-	var chMsg []byte
-	var err error
-	switch hs.browser {
-	case BrowserChrome:
-		chMsg, err = buildChromeClientHello(hs.serverName, hs.alpn, hs.km)
-	default:
-		chMsg, err = buildSafariClientHello(hs.serverName, hs.alpn, hs.km)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("build client hello: %w", err)
-	}
-	hs.clientHelloMsg = chMsg
-
-	if err := writeRawRecord(hs.conn, recordTypeHandshake, chMsg); err != nil {
-		return nil, fmt.Errorf("send client hello: %w", err)
-	}
-
-	// Read ServerHello, reassembling across records rather than assuming a
-	// single record carries the whole message.
+// readServerHelloMessage reads one ServerHello (or HelloRetryRequest, which
+// shares its message type), reassembling across records rather than assuming a
+// single record carries the whole message.
+func (hs *handshakeState) readServerHelloMessage() ([]byte, error) {
 	var shReader handshakeReader
-	var serverHelloMsg []byte
 	idleRecords := 0
-	for serverHelloMsg == nil {
+	for {
 		rec, err := readRawRecord(hs.br)
 		if err != nil {
 			return nil, fmt.Errorf("read server hello record: %w", err)
@@ -193,22 +177,81 @@ func (hs *handshakeState) run() (*Conn, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read server hello: %w", err)
 		}
-		serverHelloMsg = msg
+		if msg != nil {
+			return msg, nil
+		}
+	}
+}
+
+// sendChangeCipherSpec emits the dummy ChangeCipherSpec record TLS 1.3 keeps
+// for middlebox compatibility, at most once per handshake.
+//
+// RFC 8446 appendix D.4 places it "immediately before its second flight", which
+// is the second ClientHello when a HelloRetryRequest intervened and the
+// encrypted Finished otherwise — one record either way. Not sending it at all
+// is a fingerprint leak anti-bot services check for.
+func (hs *handshakeState) sendChangeCipherSpec() error {
+	if hs.ccsSent {
+		return nil
+	}
+	if err := writeRawRecord(hs.conn, recordTypeChangeCipherSpec, []byte{0x01}); err != nil {
+		return fmt.Errorf("send ccs: %w", err)
+	}
+	hs.ccsSent = true
+	return nil
+}
+
+func (hs *handshakeState) run() (*Conn, error) {
+	var chMsg []byte
+	var err error
+	switch hs.browser {
+	case BrowserChrome:
+		chMsg, err = buildChromeClientHello(hs.serverName, hs.alpn, hs.km)
+	default:
+		chMsg, err = buildSafariClientHello(hs.serverName, hs.alpn, hs.km)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("build client hello: %w", err)
+	}
+	hs.clientHelloMsg = chMsg
+
+	if err := writeInitialClientHello(hs.conn, chMsg); err != nil {
+		return nil, fmt.Errorf("send client hello: %w", err)
 	}
 
-	suite, dhe, negotiatedALPN, err := hs.parseServerHello(serverHelloMsg)
+	serverHelloMsg, err := hs.readServerHelloMessage()
+	if err != nil {
+		return nil, err
+	}
+	shell, err := parseServerHelloShell(serverHelloMsg)
+	if err != nil {
+		return nil, fmt.Errorf("parse server hello: %w", err)
+	}
+
+	if shell.isHRR {
+		// The server could not use either key share we sent. Answering the
+		// retry sets up hs.suite, hs.ks and the whole transcript — including
+		// the synthetic message_hash that stands in for ClientHello1 — and
+		// leaves the real ServerHello in hand.
+		serverHelloMsg, shell, err = hs.retryAfterHelloRetryRequest(serverHelloMsg, shell)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		hs.suite = shell.suite
+		hs.ks = newKeySchedule(shell.suite)
+
+		// Initialize transcript with SHA-256 or SHA-384
+		hs.transcript = hs.ks.h()
+		hs.transcript.Write(chMsg)
+		hs.transcript.Write(serverHelloMsg)
+	}
+
+	dhe, negotiatedALPN, err := hs.parseServerHello(shell)
 	if err != nil {
 		return nil, fmt.Errorf("parse server hello: %w", err)
 	}
 	hs.negotiatedALPN = negotiatedALPN
-
-	hs.suite = suite
-	hs.ks = newKeySchedule(suite)
-
-	// Initialize transcript with SHA-256 or SHA-384
-	hs.transcript = hs.ks.h()
-	hs.transcript.Write(chMsg)
-	hs.transcript.Write(serverHelloMsg)
 
 	// Derive handshake secrets
 	transcriptHash := hs.transcript.Sum(nil)
@@ -217,7 +260,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 	// Set up server handshake AEAD
 	serverHSAEAD, serverHSIV, err := hs.ks.makeTrafficKeys(hs.ks.serverHSTraffic)
 	if err != nil {
-		return nil, fmt.Errorf("server hs keys (suite=0x%04x): %w", suite, err)
+		return nil, fmt.Errorf("server hs keys (suite=0x%04x): %w", hs.suite, err)
 	}
 	serverHSER := newEncryptedRecord(serverHSAEAD, serverHSIV)
 
@@ -225,10 +268,12 @@ func (hs *handshakeState) run() (*Conn, error) {
 	// CertificateVerify, Finished.
 	var serverCerts []*x509.Certificate
 	var sawCertVerify bool
+	var sawCertRequest bool
+	var certReqContext []byte
 	var finished bool
 	var hr handshakeReader
 
-	idleRecords = 0
+	idleRecords := 0
 	for !finished {
 		rec, err := readRawRecord(hs.br)
 		if err != nil {
@@ -350,6 +395,24 @@ func (hs *handshakeState) run() (*Conn, error) {
 				hs.transcript.Write(msg)
 				sawCertVerify = true
 
+			case handshakeTypeCertificateRequest:
+				// The server is asking for a client certificate. We have none
+				// to give, but silence is not a legal answer: §4.4.2 requires a
+				// Certificate message either way, and a server that asked and
+				// got nothing fails the handshake. Sites with optional mTLS —
+				// which accept anonymous clients perfectly well once the empty
+				// Certificate arrives — used to break here.
+				//
+				// The context has to be echoed verbatim, so it is kept rather
+				// than assumed empty.
+				ctx, err := parseCertificateRequestContext(body)
+				if err != nil {
+					return nil, err
+				}
+				certReqContext = ctx
+				sawCertRequest = true
+				hs.transcript.Write(msg)
+
 			case handshakeTypeFinished:
 				// DO NOT update transcript yet - verify first
 				finishedKey := hs.ks.finishedKey(hs.ks.serverHSTraffic)
@@ -382,13 +445,28 @@ func (hs *handshakeState) run() (*Conn, error) {
 		}
 	}
 
-	// Derive master secrets (transcript up to server Finished)
+	// Master secrets are derived from the transcript up to and including the
+	// server Finished — the client's own Certificate does not feed into them
+	// (RFC 8446 §7.1), even though it does feed into the client Finished MAC
+	// computed below.
 	transcriptAfterSF := hs.transcript.Sum(nil)
 	hs.ks.deriveMasterSecrets(transcriptAfterSF)
 
-	// Build and send client Finished
+	// The client's second flight: an empty Certificate when one was asked for,
+	// then Finished. Both go in a single record, which is what a real client
+	// emits and keeps the flight to one write.
+	var flight []byte
+	if sawCertRequest {
+		flight = append(flight, emptyCertificateMessage(certReqContext)...)
+		hs.transcript.Write(flight)
+		// No CertificateVerify follows: §4.4.2 forbids one when the Certificate
+		// carried no certificates, since there is no key to prove possession of.
+	}
+
+	// §4.4.4 puts the client's own Certificate inside the context its Finished
+	// covers, so this hash is taken after the message above was folded in.
 	clientFinishedKey := hs.ks.finishedKey(hs.ks.clientHSTraffic)
-	clientFinishedMAC := computeFinishedMAC(hs.ks.h, clientFinishedKey, transcriptAfterSF)
+	clientFinishedMAC := computeFinishedMAC(hs.ks.h, clientFinishedKey, hs.transcript.Sum(nil))
 
 	finishedMsg := make([]byte, 4+len(clientFinishedMAC))
 	finishedMsg[0] = handshakeTypeFinished
@@ -396,12 +474,12 @@ func (hs *handshakeState) run() (*Conn, error) {
 	finishedMsg[2] = byte(len(clientFinishedMAC) >> 8)
 	finishedMsg[3] = byte(len(clientFinishedMAC))
 	copy(finishedMsg[4:], clientFinishedMAC)
+	flight = append(flight, finishedMsg...)
 
-	// Send ChangeCipherSpec for TLS 1.3 middlebox compatibility.
-	// Firefox sends CCS after ClientHello when session_id is non-empty (compat mode).
-	// Not sending CCS is a fingerprint leak detectable by anti-bot services.
-	if err := writeRawRecord(hs.conn, recordTypeChangeCipherSpec, []byte{0x01}); err != nil {
-		return nil, fmt.Errorf("send ccs: %w", err)
+	// Middlebox-compatibility ChangeCipherSpec. A retried handshake already
+	// sent it ahead of the second ClientHello, so this is a no-op there.
+	if err := hs.sendChangeCipherSpec(); err != nil {
+		return nil, err
 	}
 
 	clientHSAEAD, clientHSIV, err := hs.ks.makeTrafficKeys(hs.ks.clientHSTraffic)
@@ -410,12 +488,12 @@ func (hs *handshakeState) run() (*Conn, error) {
 	}
 	clientHSER := newEncryptedRecord(clientHSAEAD, clientHSIV)
 
-	encFinished, err := clientHSER.encrypt(finishedMsg, recordTypeHandshake)
+	encFlight, err := clientHSER.encrypt(flight, recordTypeHandshake)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt finished: %w", err)
 	}
 
-	if err := writeRawRecord(hs.conn, recordTypeApplicationData, encFinished); err != nil {
+	if err := writeRawRecord(hs.conn, recordTypeApplicationData, encFlight); err != nil {
 		return nil, fmt.Errorf("send finished: %w", err)
 	}
 
@@ -479,43 +557,45 @@ func forEachExtension(exts []byte, fn func(extType uint16, extData []byte) error
 	return nil
 }
 
-// parseServerHello parses a ServerHello message and returns the cipher suite,
-// the DHE shared secret (X25519, P-256 or X25519MLKEM768) and the negotiated
-// ALPN. data must be one complete handshake message including its header.
-func (hs *handshakeState) parseServerHello(data []byte) (suite uint16, dhe []byte, alpn string, err error) {
-	fail := func(format string, args ...any) (uint16, []byte, string, error) {
-		return 0, nil, "", fmt.Errorf(format, args...)
-	}
+// serverHelloShell is the part of a ServerHello that parses the same way
+// whether the message is a real ServerHello or a HelloRetryRequest — the two
+// share a message type and differ only by the fixed random and by what their
+// key_share carries.
+type serverHelloShell struct {
+	suite uint16
+	exts  []byte
+	isHRR bool
+}
 
+// parseServerHelloShell parses the fixed header of a ServerHello. data must be
+// one complete handshake message including its header.
+func parseServerHelloShell(data []byte) (*serverHelloShell, error) {
 	if len(data) < 4 {
-		return fail("server hello too short")
+		return nil, fmt.Errorf("server hello too short")
 	}
 
 	msgType := data[0]
 	msgLen := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
 
 	if msgType != handshakeTypeServerHello {
-		return fail("expected ServerHello (2), got %d", msgType)
+		return nil, fmt.Errorf("expected ServerHello (2), got %d", msgType)
 	}
 	if 4+msgLen > len(data) {
-		return fail("server hello claims %d bytes, %d available", msgLen, len(data)-4)
+		return nil, fmt.Errorf("server hello claims %d bytes, %d available", msgLen, len(data)-4)
 	}
 
 	body := data[4 : 4+msgLen]
 
 	if len(body) < 2+32+1 {
-		return fail("server hello body too short")
+		return nil, fmt.Errorf("server hello body too short")
 	}
 
+	sh := &serverHelloShell{}
+
 	// A HelloRetryRequest is a ServerHello carrying this fixed random. Its
-	// key_share holds a bare 2-byte group id instead of a key, so parsing it as
-	// an ordinary ServerHello reads past the end of the message. We do not
-	// retry: both profiles offer the key shares the browsers they emulate
-	// offer, so a retry request means the server wants a group we deliberately
-	// do not advertise, and answering it would change the fingerprint anyway.
-	if bytes.Equal(body[2:34], helloRetryRequestRandom) {
-		return fail("server sent HelloRetryRequest: no offered key share was acceptable")
-	}
+	// key_share holds a bare 2-byte group id instead of a key, so the caller
+	// has to know which shape to expect before reading the extensions.
+	sh.isHRR = bytes.Equal(body[2:34], helloRetryRequestRandom)
 
 	// Skip legacy version (2) + random (32)
 	offset := 2 + 32
@@ -526,35 +606,46 @@ func (hs *handshakeState) parseServerHello(data []byte) (suite uint16, dhe []byt
 
 	// Cipher suite (2) + compression method (1)
 	if offset+3 > len(body) {
-		return fail("truncated server hello")
+		return nil, fmt.Errorf("truncated server hello")
 	}
-	suite = binary.BigEndian.Uint16(body[offset:])
+	sh.suite = binary.BigEndian.Uint16(body[offset:])
 	offset += 2
 	offset++
 
-	switch suite {
+	switch sh.suite {
 	case cipherTLS_AES_128_GCM_SHA256, cipherTLS_AES_256_GCM_SHA384, cipherTLS_CHACHA20_POLY1305_SHA256:
 	default:
-		return fail("server selected unsupported cipher suite 0x%04x", suite)
+		return nil, fmt.Errorf("server selected unsupported cipher suite 0x%04x", sh.suite)
 	}
 
 	// Extensions. TLS 1.3 is signalled by supported_versions, so a ServerHello
 	// without extensions is by definition not a 1.3 handshake.
 	if offset+2 > len(body) {
-		return fail("server hello has no extensions (not TLS 1.3)")
+		return nil, fmt.Errorf("server hello has no extensions (not TLS 1.3)")
 	}
 	extsLen := int(binary.BigEndian.Uint16(body[offset:]))
 	offset += 2
 	if offset+extsLen > len(body) {
-		return fail("server hello extensions claim %d bytes, %d remain", extsLen, len(body)-offset)
+		return nil, fmt.Errorf("server hello extensions claim %d bytes, %d remain", extsLen, len(body)-offset)
 	}
-	exts := body[offset : offset+extsLen]
+	sh.exts = body[offset : offset+extsLen]
+
+	return sh, nil
+}
+
+// parseServerHello extracts the DHE shared secret (X25519, P-256, P-384, P-521
+// or X25519MLKEM768) and the negotiated ALPN from an already-shelled
+// ServerHello.
+func (hs *handshakeState) parseServerHello(sh *serverHelloShell) (dhe []byte, alpn string, err error) {
+	fail := func(format string, args ...any) ([]byte, string, error) {
+		return nil, "", fmt.Errorf(format, args...)
+	}
 
 	var (
 		isTLS13      bool
 		keyShareData []byte
 	)
-	if err := forEachExtension(exts, func(extType uint16, extData []byte) error {
+	if err := forEachExtension(sh.exts, func(extType uint16, extData []byte) error {
 		switch extType {
 		case extSupportedVersions:
 			if len(extData) == 2 && binary.BigEndian.Uint16(extData) == versionTLS13 {
@@ -588,7 +679,7 @@ func (hs *handshakeState) parseServerHello(data []byte) (suite uint16, dhe []byt
 		return fail("key share: %w", err)
 	}
 
-	return suite, dhe, alpn, nil
+	return dhe, alpn, nil
 }
 
 // processServerKeyShare computes DHE shared secret from server's key share.
@@ -605,18 +696,6 @@ func (hs *handshakeState) processServerKeyShare(data []byte) ([]byte, error) {
 	keyData := data[4 : 4+keyLen]
 
 	switch group {
-	case groupX25519:
-		// X25519 key exchange
-		serverPub, err := ecdh.X25519().NewPublicKey(keyData)
-		if err != nil {
-			return nil, fmt.Errorf("parse server x25519 key: %w", err)
-		}
-		shared, err := hs.km.x25519Priv.ECDH(serverPub)
-		if err != nil {
-			return nil, fmt.Errorf("x25519 ecdh: %w", err)
-		}
-		return shared, nil
-
 	case groupX25519MLKEM768:
 		// X25519MLKEM768: server sends ML-KEM-768 ciphertext (1088 bytes) || X25519 public key (32 bytes)
 		const mlkemCTSize = mlkem.CiphertextSize // 1088 bytes
@@ -646,20 +725,24 @@ func (hs *handshakeState) processServerKeyShare(data []byte) ([]byte, error) {
 		combined := append(mlkemShared, x25519Shared...)
 		return combined, nil
 
-	case groupP256:
-		// P-256 ECDH key exchange
-		serverPub, err := ecdh.P256().NewPublicKey(keyData)
-		if err != nil {
-			return nil, fmt.Errorf("parse server p256 key: %w", err)
+	default:
+		// Every remaining group we can negotiate is a plain ECDH curve. The
+		// private key is looked up rather than switched on so the set stays in
+		// one place: X25519 and P-256 are generated up front, and P-384/P-521
+		// only appear here after a HelloRetryRequest asked for one.
+		priv := hs.km.privateKeyFor(group)
+		if priv == nil {
+			return nil, fmt.Errorf("unsupported server key share group: 0x%04x", group)
 		}
-		shared, err := hs.km.p256Priv.ECDH(serverPub)
+		serverPub, err := priv.Curve().NewPublicKey(keyData)
 		if err != nil {
-			return nil, fmt.Errorf("p256 ecdh: %w", err)
+			return nil, fmt.Errorf("parse server key for group 0x%04x: %w", group, err)
+		}
+		shared, err := priv.ECDH(serverPub)
+		if err != nil {
+			return nil, fmt.Errorf("ecdh for group 0x%04x: %w", group, err)
 		}
 		return shared, nil
-
-	default:
-		return nil, fmt.Errorf("unsupported server key share group: 0x%04x", group)
 	}
 }
 
@@ -782,6 +865,45 @@ func hashPayload(h crypto.Hash, payload []byte) []byte {
 	hh := h.New()
 	hh.Write(payload)
 	return hh.Sum(nil)
+}
+
+// parseCertificateRequestContext pulls the certificate_request_context out of a
+// CertificateRequest body, which RFC 8446 §4.3.2 lays out as:
+//
+//	opaque certificate_request_context<0..2^8-1>;
+//	Extension extensions<2..2^16-1>;
+//
+// It is opaque and normally empty in a handshake-time request, but it must be
+// echoed byte-for-byte in the answering Certificate, so it is read rather than
+// assumed.
+func parseCertificateRequestContext(body []byte) ([]byte, error) {
+	if len(body) < 1 {
+		return nil, fmt.Errorf("certificate_request too short")
+	}
+	ctxLen := int(body[0])
+	if 1+ctxLen > len(body) {
+		return nil, fmt.Errorf("certificate_request context claims %d bytes, %d remain", ctxLen, len(body)-1)
+	}
+	return append([]byte(nil), body[1:1+ctxLen]...), nil
+}
+
+// emptyCertificateMessage builds the Certificate message a client sends when it
+// was asked for one and has none: the echoed context, then a zero-length
+// certificate_list. RFC 8446 §4.4.2 explicitly allows the empty list, and it is
+// how anonymous clients answer an optional-mTLS server.
+func emptyCertificateMessage(reqContext []byte) []byte {
+	body := make([]byte, 0, 1+len(reqContext)+3)
+	body = append(body, byte(len(reqContext)))
+	body = append(body, reqContext...)
+	body = append(body, 0x00, 0x00, 0x00) // certificate_list length: 0
+
+	msg := make([]byte, 4+len(body))
+	msg[0] = handshakeTypeCertificate
+	msg[1] = byte(len(body) >> 16)
+	msg[2] = byte(len(body) >> 8)
+	msg[3] = byte(len(body))
+	copy(msg[4:], body)
+	return msg
 }
 
 // parseCertificate parses a TLS Certificate message body (after the handshake header).

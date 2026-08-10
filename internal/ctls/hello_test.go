@@ -1,6 +1,10 @@
 package ctls
 
-import "testing"
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
 
 // TestGreaseExtensionValuesDiffer covers a bug that made roughly 6% of all
 // connections fail against strict servers.
@@ -168,11 +172,25 @@ func TestSNIOmittedForAddressLiterals(t *testing.T) {
 		{"sub.example.co.uk", true, "sub.example.co.uk"},
 		// A hostname that merely looks numeric is still a hostname.
 		{"1.2.3.4.example.com", true, "1.2.3.4.example.com"},
+		// A trailing root label is legal in a URL host and illegal in a
+		// HostName, so it is stripped rather than passed through.
+		{"example.com.", true, "example.com"},
+		{"example.com...", true, "example.com"},
+		// Browsers normalise the URL host before the TLS layer sees it.
+		{"EXAMPLE.com", true, "example.com"},
+		{"Sub.Example.COM.", true, "sub.example.com"},
+		// net/http hands the dialer an A-label, which passes through unchanged.
+		{"xn--kln-sna.example", true, "xn--kln-sna.example"},
 		{"103.214.71.121", false, ""},
 		{"::1", false, ""},
 		{"[2606:4700:4700::1111]", false, ""},
 		{"2606:4700:4700::1111", false, ""},
+		// A scope zone has to come off before the address check, or the whole
+		// thing fails to parse as an IP and goes out as a bogus HostName.
+		{"fe80::1%eth0", false, ""},
+		{"[fe80::1%eth0]", false, ""},
 		{"", false, ""},
+		{".", false, ""},
 	}
 
 	builders := map[string]func(string, []string, *keyMaterial) ([]byte, error){
@@ -210,6 +228,103 @@ func TestSNIOmittedForAddressLiterals(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestALPNEncoding pins the ProtocolNameList guards. RFC 7301 gives the list
+// and each name a minimum length of one, and the 1-byte name prefix cannot
+// describe anything longer than 255 — inputs that break either used to be
+// encoded anyway, putting an extension on the wire whose framing disagreed with
+// its contents.
+func TestALPNEncoding(t *testing.T) {
+	t.Run("well formed", func(t *testing.T) {
+		got := buildALPN([]string{"h2", "http/1.1"})
+		want := []byte{
+			0x00, 0x0C, // list length: 12
+			0x02, 'h', '2',
+			0x08, 'h', 't', 't', 'p', '/', '1', '.', '1',
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("buildALPN = %x, want %x", got, want)
+		}
+	})
+
+	t.Run("nothing encodable", func(t *testing.T) {
+		for name, in := range map[string][]string{
+			"nil":         nil,
+			"empty slice": {},
+			"empty name":  {""},
+			"all dropped": {"", strings.Repeat("x", 256)},
+		} {
+			if got := buildALPN(in); got != nil {
+				t.Fatalf("%s: buildALPN = %x, want nil so the caller omits the extension", name, got)
+			}
+		}
+	})
+
+	t.Run("drops unencodable names", func(t *testing.T) {
+		got := buildALPN([]string{"h2", strings.Repeat("x", 256), "", "http/1.1"})
+		want := []byte{
+			0x00, 0x0C,
+			0x02, 'h', '2',
+			0x08, 'h', 't', 't', 'p', '/', '1', '.', '1',
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("buildALPN = %x, want %x", got, want)
+		}
+	})
+}
+
+// TestExtensionsAreSelfConsistent walks every extension of every hello both
+// builders can produce and checks the declared lengths against the bytes that
+// follow. A length that disagrees with its payload shifts the parse of every
+// later extension, so one bad encoder turns the whole ClientHello into
+// something the server rejects rather than something it merely ignores.
+func TestExtensionsAreSelfConsistent(t *testing.T) {
+	km, err := generateKeyMaterial()
+	if err != nil {
+		t.Fatalf("generateKeyMaterial: %v", err)
+	}
+
+	names := []string{
+		"example.com", "example.com.", "EXAMPLE.com",
+		"127.0.0.1", "::1", "fe80::1%eth0", "",
+	}
+	alpnLists := [][]string{
+		{"h2", "http/1.1"},
+		{"http/1.1"},
+		{},
+		nil,
+		{""},
+	}
+	builders := map[string]func(string, []string, *keyMaterial) ([]byte, error){
+		"safari": buildSafariClientHello,
+		"chrome": buildChromeClientHello,
+	}
+
+	for bname, build := range builders {
+		for _, host := range names {
+			for _, alpn := range alpnLists {
+				raw, err := build(host, alpn, km)
+				if err != nil {
+					t.Fatalf("%s build(%q, %v): %v", bname, host, alpn, err)
+				}
+				// parseClientHello validates the handshake header, the block
+				// length and every extension length against the real bytes.
+				ch, err := parseClientHello(raw)
+				if err != nil {
+					t.Fatalf("%s build(%q, %v): %v", bname, host, alpn, err)
+				}
+				// And the retry rewriter re-derives the same boundaries, so it
+				// is a second, independent check on the framing.
+				if _, err := clientHelloExtensionsStart(raw); err != nil {
+					t.Fatalf("%s build(%q, %v): extension span: %v", bname, host, alpn, err)
+				}
+				if len(ch.extTypes) == 0 {
+					t.Fatalf("%s build(%q, %v): no extensions", bname, host, alpn)
+				}
+			}
+		}
 	}
 }
 

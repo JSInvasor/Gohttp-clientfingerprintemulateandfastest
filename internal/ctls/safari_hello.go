@@ -187,9 +187,9 @@ func buildSafariExtensions(serverName string, alpn []string, km *keyMaterial, gs
 	// 1. GREASE extension (empty)
 	out = appendExt(out, gs.extFirst, nil)
 
-	// 2. server_name (0) — omitted for an address-form target, see sendSNI.
-	if sendSNI(serverName) {
-		out = appendExt(out, extServerName, buildSNI(serverName))
+	// 2. server_name (0) — omitted for an address-form target, see sniHostName.
+	if host, ok := sniHostName(serverName); ok {
+		out = appendExt(out, extServerName, buildSNI(host))
 	}
 
 	// 3. extended_master_secret (23) - empty
@@ -204,8 +204,10 @@ func buildSafariExtensions(serverName string, alpn []string, km *keyMaterial, gs
 	// 6. ec_point_formats (11) - uncompressed
 	out = appendExt(out, extECPointFormats, []byte{1, 0x00})
 
-	// 7. ALPN (16)
-	out = appendExt(out, extALPN, buildALPN(alpn))
+	// 7. ALPN (16) — omitted rather than sent empty, see buildALPN.
+	if alpnData := buildALPN(alpn); alpnData != nil {
+		out = appendExt(out, extALPN, alpnData)
+	}
 
 	// 8. status_request (5) - OCSP stapling
 	out = appendExt(out, extStatusRequest, buildStatusRequest())

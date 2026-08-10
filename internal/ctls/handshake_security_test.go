@@ -12,10 +12,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
-	"strings"
 	"testing"
 	"time"
 )
@@ -246,34 +246,56 @@ func TestServerHelloParserRejectsHostileInput(t *testing.T) {
 					t.Fatalf("parseServerHello panicked: %v", r)
 				}
 			}()
-			if _, _, _, err := hs.parseServerHello(data); err == nil {
+			if err := parseServerHelloForTest(hs, data); err == nil {
 				t.Fatal("malformed ServerHello accepted")
 			}
 		})
 	}
 }
 
-// TestHelloRetryRequestDetected ensures an HRR is reported as such rather than
-// parsed as an ordinary ServerHello, whose key_share layout it does not share.
-func TestHelloRetryRequestDetected(t *testing.T) {
-	km, err := generateKeyMaterial()
+// parseServerHelloForTest runs the two-stage parse the handshake performs: the
+// shell that ServerHello and HelloRetryRequest share, then the extraction that
+// only applies to a real ServerHello.
+func parseServerHelloForTest(hs *handshakeState, data []byte) error {
+	sh, err := parseServerHelloShell(data)
 	if err != nil {
-		t.Fatalf("generateKeyMaterial: %v", err)
+		return err
 	}
-	hs := &handshakeState{km: km, serverName: "example.com"}
+	if sh.isHRR {
+		return fmt.Errorf("HelloRetryRequest")
+	}
+	_, _, err = hs.parseServerHello(sh)
+	return err
+}
 
+// TestHelloRetryRequestDetected ensures an HRR is recognised by its fixed
+// random rather than run through the ordinary ServerHello path, whose key_share
+// layout it does not share: an HRR carries a bare group id where a ServerHello
+// carries a KeyShareEntry.
+func TestHelloRetryRequestDetected(t *testing.T) {
 	tls13 := tlsExt(extSupportedVersions, binary.BigEndian.AppendUint16(nil, versionTLS13))
 	// An HRR key_share carries a bare group id, not a key.
 	hrrKeyShare := tlsExt(extKeyShare, []byte{0x00, 0x17})
 	msg := serverHelloBytes(helloRetryRequestRandom, nil, cipherTLS_AES_128_GCM_SHA256,
 		append(append([]byte{}, tls13...), hrrKeyShare...))
 
-	_, _, _, err = hs.parseServerHello(msg)
-	if err == nil {
-		t.Fatal("HelloRetryRequest parsed as a ServerHello")
+	sh, err := parseServerHelloShell(msg)
+	if err != nil {
+		t.Fatalf("parseServerHelloShell: %v", err)
 	}
-	if !strings.Contains(err.Error(), "HelloRetryRequest") {
-		t.Fatalf("want a HelloRetryRequest diagnosis, got %v", err)
+	if !sh.isHRR {
+		t.Fatal("HelloRetryRequest not recognised")
+	}
+
+	hrr, err := parseHelloRetryRequest(sh)
+	if err != nil {
+		t.Fatalf("parseHelloRetryRequest: %v", err)
+	}
+	if !hrr.hasGroup || hrr.selectedGroup != groupP256 {
+		t.Fatalf("selected group = 0x%04x (present %v), want P-256", hrr.selectedGroup, hrr.hasGroup)
+	}
+	if hrr.suite != cipherTLS_AES_128_GCM_SHA256 {
+		t.Fatalf("suite = 0x%04x, want 0x1301", hrr.suite)
 	}
 }
 
