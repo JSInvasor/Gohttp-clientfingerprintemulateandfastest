@@ -3,6 +3,11 @@
 // Usage:
 //   node solver/index.js <url> [timeout_sec=75]
 //
+// Environment:
+//   SOLVER_PROXY   scheme://[user:pass@]host:port — solve through this proxy.
+//                  cf_clearance is bound to the issuing IP, so a cookie earned
+//                  here and replayed from a different exit is dead on arrival.
+//
 // Output (stdout, single JSON line):
 //   { "status": "ok"|"no_clearance"|"error",
 //     "url": "<final url>",
@@ -13,6 +18,7 @@
 //     "attempts": <int>,                      // attempts actually made
 //     "chromium_version": "<browser.version()>",
 //     "chromium_major": <int>,
+//     "proxy": "<host:port>",                 // "" when solved direct
 //     "error": "<message>" }                  // only on error
 //
 // Design (one-shot, no server):
@@ -36,8 +42,9 @@
 
 import { connect } from "puppeteer-real-browser";
 import {
-  CONNECT_OPTIONS,
   TARGET_UA,
+  connectOptions,
+  parseProxyURL,
   userAgentMetadata,
   chromiumMajor as parseChromiumMajor,
 } from "./profile.js";
@@ -91,6 +98,19 @@ try {
   die(errorMessage(err));
 }
 
+// SOLVER_PROXY routes the solve through the same exit the replay will use.
+// Parsed up front for the same reason as the hints: a malformed proxy URL
+// should not cost a browser launch to discover.
+let CONNECT_OPTS;
+let PROXY_LABEL = "";
+try {
+  CONNECT_OPTS = connectOptions({ proxy: process.env.SOLVER_PROXY });
+  const parsed = parseProxyURL(process.env.SOLVER_PROXY);
+  if (parsed) PROXY_LABEL = `${parsed.host}:${parsed.port}`; // credentials stay out of the output
+} catch (err) {
+  die(errorMessage(err));
+}
+
 // Kill the Chromium tree on every exit path — signals, exceptions, normal
 // return. See cleanup.js for why this is not done with an env-var pkill sweep.
 installExitHandlers({
@@ -125,7 +145,7 @@ async function launch() {
   // browser configuration this solves with. A launch flag can move the TLS
   // layer, and measuring a differently-flagged browser answers the wrong
   // question.
-  const result = await connect(CONNECT_OPTIONS);
+  const result = await connect(CONNECT_OPTS);
 
   const { browser, page } = result;
 
@@ -397,6 +417,7 @@ async function solve() {
         attempts: i,
         chromium_version: r.chromiumVersion || "",
         chromium_major: r.chromiumMajor || 0,
+        proxy: PROXY_LABEL,
       };
       console.log(JSON.stringify(out));
       return;
@@ -422,6 +443,7 @@ async function solve() {
       attempts: attemptsMade,
       chromium_version: lastResult.chromiumVersion || "",
       chromium_major: lastResult.chromiumMajor || 0,
+      proxy: PROXY_LABEL,
     };
     console.log(JSON.stringify(out));
     return;
@@ -435,6 +457,7 @@ async function solve() {
       attempts: attemptsMade,
       chromium_version: (lastResult && lastResult.chromiumVersion) || "",
       chromium_major: (lastResult && lastResult.chromiumMajor) || 0,
+      proxy: PROXY_LABEL,
     })
   );
 }

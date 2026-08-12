@@ -79,6 +79,43 @@ export const CONNECT_OPTIONS = {
   ignoreAllFlags: false,
 };
 
+// parseProxyURL turns a proxy URL into the {host, port, username, password}
+// shape puppeteer-real-browser wants.
+//
+// It builds --proxy-server=${host}:${port}, and Chrome only assumes HTTP when
+// the value carries no scheme — so anything that is not a plain HTTP proxy has
+// to keep its scheme inside the host field or a SOCKS proxy is silently dialled
+// as HTTP. Credentials are handled separately, by page.authenticate.
+export function parseProxyURL(raw) {
+  if (!raw) return null;
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error(`invalid proxy URL ${JSON.stringify(raw)}: want scheme://[user:pass@]host:port`);
+  }
+  const scheme = u.protocol.replace(/:$/, "").toLowerCase();
+  if (!u.hostname) throw new Error(`proxy URL ${JSON.stringify(raw)} has no host`);
+  if (!u.port) throw new Error(`proxy URL ${JSON.stringify(raw)} has no port`);
+  return {
+    host: scheme === "http" ? u.hostname : `${scheme}://${u.hostname}`,
+    port: u.port,
+    username: decodeURIComponent(u.username || ""),
+    password: decodeURIComponent(u.password || ""),
+  };
+}
+
+// connectOptions is CONNECT_OPTIONS plus an optional proxy.
+//
+// Routing the solve through the same proxy the replay will use is not a
+// convenience: Cloudflare binds cf_clearance to (UA, JA3/JA4, IP). A cookie
+// earned from this box and replayed from an exit node is presented by an
+// address it was never issued to, which fails the same way a UA mismatch does.
+export function connectOptions({ proxy } = {}) {
+  const parsed = parseProxyURL(proxy);
+  return parsed ? { ...CONNECT_OPTIONS, proxy: parsed } : { ...CONNECT_OPTIONS };
+}
+
 // chromiumMajor extracts the major version from a browser.version() string
 // such as "HeadlessChrome/151.0.7204.50". Returns 0 when it cannot be parsed.
 export function chromiumMajor(version) {

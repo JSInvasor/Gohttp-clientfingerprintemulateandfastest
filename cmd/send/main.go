@@ -22,6 +22,12 @@
 //	send -n 50000 -c 300 -mode pipeline https://site.com
 //	send -t 1m -c 200 -s 50 -proxy-file proxies.txt https://site.com
 //	send -X POST -H 'Content-Type: application/json' -d '{"a":1}' https://site.com/api
+//
+// A target behind a Cloudflare challenge needs the cookie before the run: -solve
+// earns one with the real browser in solver/ and seeds it into every session.
+//
+//	send -solve https://site.com
+//	send -solve -t 30s -c 100 -proxy socks5://host:1080 https://site.com
 package main
 
 import (
@@ -98,11 +104,17 @@ type options struct {
 	warmup      int
 
 	// Identity
-	profile   string
-	userAgent string
-	lang      string
-	accept    string
-	referer   string
+	profile    string
+	profileSet bool // -p was given explicitly, so -solve must not override it
+	userAgent  string
+	lang       string
+	accept     string
+	referer    string
+
+	// Challenge solving
+	solve        bool
+	solverDir    string
+	solveTimeout time.Duration
 
 	// Proxy
 	proxy         string
@@ -176,16 +188,30 @@ func run() error {
 		return err
 	}
 
+	// Ctrl-C stops the run and still prints what was collected, which is the
+	// point of interrupting a long one. Installed before the solve so a slow
+	// challenge can be interrupted too.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Solve before the sessions are built: the cookies and the UA it returns go
+	// in through the same options -cookie and -ua use, so every session is
+	// seeded at construction rather than patched afterwards.
+	if o.solve {
+		if profile != gofire.Chrome151 {
+			return fmt.Errorf("-solve needs -p chrome: the solver earns the cookie with a real "+
+				"Chromium, and %s replays it with a TLS fingerprint the cookie was never issued to", profile)
+		}
+		if err := solveAndSeed(ctx, o, profile, target); err != nil {
+			return err
+		}
+	}
+
 	pool, err := newSessionPool(o, profile, target)
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
-
-	// Ctrl-C stops the run and still prints what was collected, which is the
-	// point of interrupting a long one.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	if o.warmup > 0 {
 		pool.warm(ctx, target, o.warmup)
@@ -231,6 +257,11 @@ func parseFlags(args []string) (*options, string, error) {
 	fs.StringVar(&o.accept, "accept", "", "")
 	fs.StringVar(&o.referer, "referer", "", "")
 
+	// Challenge solving
+	fs.BoolVar(&o.solve, "solve", false, "")
+	fs.StringVar(&o.solverDir, "solver-dir", "solver", "")
+	fs.DurationVar(&o.solveTimeout, "solve-timeout", 75*time.Second, "")
+
 	// Proxy
 	fs.StringVar(&o.proxy, "proxy", "", "")
 	fs.StringVar(&o.proxyFile, "proxy-file", "", "")
@@ -272,6 +303,15 @@ func parseFlags(args []string) (*options, string, error) {
 	if err := fs.Parse(flagArgs); err != nil {
 		return nil, "", err
 	}
+
+	// Whether -p was actually typed decides what -solve is allowed to do with
+	// it: defaulting a profile the user never chose is helpful, overriding one
+	// they did choose would hide the mismatch that breaks the cookie.
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "p" || f.Name == "profile" {
+			o.profileSet = true
+		}
+	})
 
 	target := ""
 	if len(posArgs) >= 1 {
@@ -348,6 +388,34 @@ func (o *options) normalize() error {
 		return fmt.Errorf("-rate cannot be negative, got %d", o.rate)
 	}
 
+	if o.solve {
+		// Launching Chromium under Xvfb costs several seconds before the first
+		// byte of the challenge is fetched, and the solver's own watchdog only
+		// fires at timeout+30s — so a budget too small to launch in does not
+		// fail fast, it fails slowly and blames the watchdog. The floor is well
+		// under any workable value and only rejects the nonsensical ones.
+		if o.solveTimeout < minSolveTimeout {
+			return fmt.Errorf("-solve-timeout %s is below the %s a browser launch needs",
+				o.solveTimeout, minSolveTimeout)
+		}
+		// One solve produces one cookie bound to one IP. A rotator hands each
+		// session a different exit, so all but the one that happened to match
+		// would replay a cookie issued to an address they are not using —
+		// which looks like the target blocking the client, not like a config
+		// error. Solving per session is a different design, not a flag.
+		if o.proxyFile != "" {
+			return errors.New("-solve cannot be combined with -proxy-file: cf_clearance is bound " +
+				"to the IP that earned it, and a rotator gives each session a different one. " +
+				"Use -proxy to solve and replay through a single exit")
+		}
+		// The solver drives a real Chromium, so the cookie is issued to a Chrome
+		// TLS fingerprint. Replaying it from the Safari profile presents a JA4
+		// the cookie was never issued to.
+		if !o.profileSet {
+			o.profile = "chrome"
+		}
+	}
+
 	// A duration run has no count to bound it, so -n is ignored rather than
 	// silently cutting the run short at its default of 1.
 	if o.duration > 0 {
@@ -406,6 +474,19 @@ identity
   -referer string Referer header to send
   -cookie k=v     seed a cookie into every session (repeatable)
   -fingerprint    print the profile's reference fingerprint and continue
+
+cloudflare
+  -solve                earn a cf_clearance with the real browser in solver/ and
+                        seed it into every session before the run. Implies
+                        -p chrome unless -p was given: the cookie is bound to the
+                        UA and TLS fingerprint that earned it, and the solver
+                        drives a real Chromium. Needs npm install in solver/
+  -solver-dir path      where index.js and node_modules live (default solver)
+  -solve-timeout dur    how long the solve may take (default 75s)
+
+                        -solve routes through -proxy when one is set, because
+                        the cookie is bound to the issuing IP too. It cannot be
+                        combined with -proxy-file: one solve covers one exit
 
 request
   -X string       HTTP method (default GET)
@@ -514,17 +595,23 @@ func parseProfile(name string) (gofire.BrowserProfile, error) {
 // splitArgs separates positional arguments from flag options so that positional
 // parameters like URL, duration, concurrency, and rate can be given first before flags.
 func splitArgs(args []string) (posArgs []string, flagArgs []string) {
+	// Every boolean flag has to be listed here. A bool takes no value, so one
+	// that is missing swallows whatever follows it — `send -solve https://site`
+	// would consume the URL as -solve's argument and then report that no URL was
+	// given. There is no way to derive this from the FlagSet at this point,
+	// because the split has to happen before Parse.
 	boolFlags := map[string]bool{
-		"-proxy-stats": true,
-		"-http1":       true,
-		"-insecure":    true,
-		"-no-redirect": true,
-		"-no-keepalive":true,
-		"-tfo":         true,
-		"-i":           true,
-		"-silent":      true,
-		"-json":        true,
-		"-fingerprint": true,
+		"-proxy-stats":  true,
+		"-http1":        true,
+		"-insecure":     true,
+		"-no-redirect":  true,
+		"-no-keepalive": true,
+		"-tfo":          true,
+		"-i":            true,
+		"-silent":       true,
+		"-json":         true,
+		"-fingerprint":  true,
+		"-solve":        true,
 	}
 
 	for i := 0; i < len(args); i++ {

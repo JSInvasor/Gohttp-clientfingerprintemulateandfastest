@@ -33,10 +33,10 @@
 
 import { connect } from "puppeteer-real-browser";
 import {
-  CONNECT_OPTIONS,
   TARGET_SEC_CH_UA,
   TARGET_UA,
   chromiumMajor,
+  connectOptions,
 } from "./profile.js";
 import {
   cleanup,
@@ -95,7 +95,10 @@ hardStop.unref();
 async function main() {
   let browser;
   try {
-    const result = await connect(CONNECT_OPTIONS);
+    // SOLVER_PROXY is honoured here too, so the browser being measured is the
+    // one the solve actually runs — a proxy can change the egress path and the
+    // TLS the far end sees.
+    const result = await connect(connectOptions({ proxy: process.env.SOLVER_PROXY }));
     browser = result.browser;
     trackBrowser(browser);
     const page = result.page;

@@ -459,6 +459,48 @@ latency  min 80µs   p50 2.3ms   p90 4ms   p99 5.9ms   max 35.2ms
 the summary — per-second series included — as JSON, and `send -h` lists the
 transport knobs (`-max-streams`, `-idle-conns`, `-sockbuf`, `-tfo`, …).
 
+### Getting past a Cloudflare challenge
+
+`-solve` runs the browser in `solver/` first, then seeds what it earned into
+every session before the run starts:
+
+```bash
+cd solver && npm install && cd ..
+
+go run ./cmd/send -solve https://site.com                       # solve, then one request
+go run ./cmd/send -solve -t 30s -c 100 https://site.com         # solve, then a load run
+go run ./cmd/send -solve -proxy socks5://host:1080 https://site.com
+```
+
+```
+solving https://site.com with the browser in solver/ (direct, up to 1m15s)
+solved in 9.4s, 1 attempt(s), 4 cookie(s), chromium Chrome/151.0.7204.50
+cf_clearance issued for .site.com
+```
+
+Cloudflare binds `cf_clearance` to three things, and all three have to survive
+the handover from the browser that earned it to the client that replays it:
+
+| bound to | how it survives | what happens otherwise |
+|---|---|---|
+| User-Agent | the solver returns the UA it used, and the run is pinned to it | 403 on the first request |
+| JA3/JA4 | `-solve` implies `-p chrome`, since a real Chromium earned the cookie | works once, dies under load |
+| source IP | `-proxy` is handed to the solver, so it solves through the same exit | 403 from the first replay |
+
+None of those fail loudly. A mismatch produces a cookie that works for one
+request and then stops, which looks exactly like the target simply blocking the
+client — so `send` refuses the combinations it cannot make consistent (`-p
+safari`, `-proxy-file`) rather than letting them fail that way at runtime.
+
+`-proxy-file` is refused because one solve earns one cookie bound to one IP,
+while a rotator hands each session a different exit. Solving per session is a
+different design, not a flag.
+
+`-solver-dir` points at a solver checkout somewhere else, and `-solve-timeout`
+bounds the solve (default 75s). A run continues even when no `cf_clearance`
+appears — a target behind Bot Fight Mode alone never issues one, and the
+`__cf_bm` the solve did earn is what carries the session — but it says so.
+
 ## What happens when a handshake fails
 
 How a client *fails* is part of its fingerprint, so the failure paths are
