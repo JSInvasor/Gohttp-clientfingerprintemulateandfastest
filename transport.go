@@ -57,6 +57,14 @@ type Transport struct {
 	connCount   atomic.Int64
 	dialer      *net.Dialer
 
+	// handshakeTimeout bounds one TLS handshake. It is held here because
+	// net/http will not apply it for us: http.Transport.TLSHandshakeTimeout is
+	// only consulted by its own addTLS path, which a custom DialTLSContext
+	// replaces outright. Setting it on h1Transport therefore did nothing, and
+	// with no deadline on the request context a handshake against a black-holing
+	// edge had no bound at all. dialTLS applies it per attempt.
+	handshakeTimeout time.Duration
+
 	// hostProto records the ALPN protocol negotiated per host so subsequent
 	// requests skip the h2 attempt for hosts that only speak http/1.1. Without
 	// this cache every request to an h1-only host would dial twice (once for
@@ -154,6 +162,8 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		skipVerify: cfg.InsecureSkipVerify,
 		dnscache:   newDNSCache(cfg.DNSCacheTTL),
 		browser:    browser,
+
+		handshakeTimeout: cfg.TLSHandshakeTimeout,
 	}
 
 	// Per-browser fingerprint tables.
@@ -199,13 +209,15 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 
 	// HTTP/1.1 transport (for plain HTTP or ForceHTTP1 mode)
 	t.h1Transport = &http.Transport{
-		DialContext:           t.dialWithDNSCache(),
-		DialTLSContext:        t.dialTLSForH1(),
-		MaxIdleConns:          cfg.MaxIdleConns,
-		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
-		MaxConnsPerHost:       cfg.MaxConnsPerHost,
-		IdleConnTimeout:       cfg.IdleConnTimeout,
-		TLSHandshakeTimeout:   cfg.TLSHandshakeTimeout,
+		DialContext:         t.dialWithDNSCache(),
+		DialTLSContext:      t.dialTLSForH1(),
+		MaxIdleConns:        cfg.MaxIdleConns,
+		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
+		MaxConnsPerHost:     cfg.MaxConnsPerHost,
+		IdleConnTimeout:     cfg.IdleConnTimeout,
+		// Not TLSHandshakeTimeout: net/http only applies that in addTLS, which
+		// DialTLSContext bypasses entirely. wrapTLS enforces it instead, for
+		// both this transport and the h2 one.
 		DisableKeepAlives:     cfg.DisableKeepAlives,
 		DisableCompression:    cfg.DisableCompression,
 		ForceAttemptHTTP2:     false, // We handle HTTP/2 ourselves
@@ -469,7 +481,7 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 			continue
 		}
 
-		tlsConn, err := ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, t.ctlsBrowser)
+		tlsConn, err := t.wrapTLS(ctx, rawConn, host, alpn)
 		if err != nil {
 			// WrapConn closes rawConn on every failure path, so there is
 			// nothing to close here.
@@ -487,6 +499,28 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 		return tlsConn, nil
 	}
 	return nil, lastErr
+}
+
+// wrapTLS runs the handshake with the configured TLSHandshakeTimeout applied.
+//
+// The timeout has to be imposed here because nothing above does it: net/http
+// only honours Transport.TLSHandshakeTimeout on the path a custom
+// DialTLSContext replaces, and the http2 transport has no equivalent knob at
+// all. Until this existed, WithTLSHandshakeTimeout set a field nothing read, and
+// a request whose context carried no deadline — the common case for
+// http.NewRequest without a client timeout — could sit in the handshake
+// indefinitely against a peer that accepts the TCP connection and then goes
+// quiet.
+//
+// A deadline already on ctx still wins when it is the earlier of the two, so a
+// per-request timeout is never extended by this.
+func (t *Transport) wrapTLS(ctx context.Context, rawConn net.Conn, host string, alpn []string) (net.Conn, error) {
+	if t.handshakeTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t.handshakeTimeout)
+		defer cancel()
+	}
+	return ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, t.ctlsBrowser)
 }
 
 // isTransientDialErr classifies errors that are worth retrying. We only

@@ -124,6 +124,10 @@ func WithIdleConnTimeout(d time.Duration) Option {
 }
 
 // WithTLSHandshakeTimeout sets the TLS handshake timeout. Default: 10s.
+//
+// It bounds one handshake attempt, and the dial retries up to three times, so
+// the worst case for an unreachable-but-accepting host is roughly three times
+// this. A deadline on the request context still wins whenever it is sooner.
 func WithTLSHandshakeTimeout(d time.Duration) Option {
 	return func(c *clientConfig) {
 		c.transport.TLSHandshakeTimeout = d

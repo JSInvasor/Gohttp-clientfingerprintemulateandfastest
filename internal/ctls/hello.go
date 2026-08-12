@@ -174,7 +174,7 @@ func newGreaseSet() greaseSet {
 	// for a group the hello never advertised. Most servers ignore it, which is
 	// why this only ever showed up on "some sites" — but the ones that do
 	// enforce §4.2.8 answer with a fatal illegal_parameter, surfacing as
-	// "tls handshake: server alert: 47" with no way to retry.
+	// "tls handshake: server alert: illegal_parameter (47)" with no way to retry.
 	//
 	// Matching them is also what the emulated browsers do. BoringSSL fills both
 	// slots from a single ssl_grease_group index (there is no separate key_share

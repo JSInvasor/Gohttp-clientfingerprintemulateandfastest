@@ -63,7 +63,7 @@ func TestNoDuplicateExtensionTypes(t *testing.T) {
 }
 
 // TestGreaseKeyShareMatchesGreaseGroup covers the cause of
-// "tls handshake: server alert: 47" (illegal_parameter) against strict servers.
+// "tls handshake: server alert: illegal_parameter (47)" against strict servers.
 //
 // RFC 8446 §4.2.8: "Clients MUST NOT offer any KeyShareEntry values for groups
 // not listed in the client's 'supported_groups' extension. [...] Servers MAY

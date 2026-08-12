@@ -51,21 +51,32 @@ func parseHelloRetryRequest(sh *serverHelloShell) (*helloRetryRequest, error) {
 			}
 		case extKeyShare:
 			if len(extData) != 2 {
-				return fmt.Errorf("hello retry request key_share is %d bytes, want 2", len(extData))
+				return alertErrf(alertDecodeError,
+					"hello retry request key_share is %d bytes, want 2", len(extData))
 			}
 			hrr.selectedGroup = binary.BigEndian.Uint16(extData)
 			hrr.hasGroup = true
 		case extCookie:
 			// Opaque to us; §4.2.2 only requires echoing it back verbatim.
 			if len(extData) < 2 {
-				return fmt.Errorf("malformed cookie extension")
+				return alertErrf(alertDecodeError, "malformed cookie extension")
 			}
 			cookieLen := int(binary.BigEndian.Uint16(extData))
-			if 2+cookieLen > len(extData) {
-				return fmt.Errorf("cookie claims %d bytes, %d remain", cookieLen, len(extData)-2)
+			if 2+cookieLen != len(extData) {
+				return alertErrf(alertDecodeError,
+					"cookie claims %d bytes, %d remain", cookieLen, len(extData)-2)
 			}
 			// Stored with its length prefix so it can be re-emitted as-is.
 			hrr.cookie = append([]byte(nil), extData[:2+cookieLen]...)
+		default:
+			// §4.1.4 gives a HelloRetryRequest the ServerHello extension rules,
+			// and those three are the only ones defined for it. Anything else we
+			// recognise is forbidden here; unknown types stay ignored so GREASE
+			// keeps working.
+			if containsUint16(serverHelloForbiddenExtensions, extType) || extType == extPreSharedKey {
+				return alertErrf(alertUnsupportedExtension,
+					"extension 0x%04x is not allowed in a hello retry request", extType)
+			}
 		}
 		return nil
 	}); err != nil {
@@ -73,12 +84,12 @@ func parseHelloRetryRequest(sh *serverHelloShell) (*helloRetryRequest, error) {
 	}
 
 	if !hrr.isTLS13 {
-		return nil, fmt.Errorf("hello retry request did not select TLS 1.3")
+		return nil, alertErrf(alertProtocolVersion, "hello retry request did not select TLS 1.3")
 	}
 	if !hrr.hasGroup && len(hrr.cookie) == 0 {
 		// Neither a new group nor a cookie means resending the same hello,
 		// which §4.1.4 forbids as it cannot make progress.
-		return nil, fmt.Errorf("hello retry request asks for no change")
+		return nil, alertErrf(alertIllegalParameter, "hello retry request asks for no change")
 	}
 	return hrr, nil
 }
@@ -140,16 +151,22 @@ func (hs *handshakeState) retryAfterHelloRetryRequest(hrrMsg []byte, shell *serv
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse second server hello: %w", err)
 	}
+	// The second ServerHello gets the same header checks as the first — session
+	// id echo and downgrade sentinel. Skipping them here would have left the
+	// retry path as the way around both.
+	if err := hs.checkServerHelloShell(sh2); err != nil {
+		return nil, nil, err
+	}
 	if sh2.isHRR {
 		// §4.1.4: "If a client receives a second HelloRetryRequest in the same
 		// connection [...] it MUST abort the handshake."
-		return nil, nil, fmt.Errorf("server sent a second hello retry request")
+		return nil, nil, alertErrf(alertUnexpectedMessage, "server sent a second hello retry request")
 	}
 	if sh2.suite != hrr.suite {
 		// §4.1.4: the ServerHello must keep the suite the retry chose,
 		// otherwise the transcript hash the two sides computed disagree.
-		return nil, nil, fmt.Errorf("server changed cipher suite from 0x%04x to 0x%04x after retry",
-			hrr.suite, sh2.suite)
+		return nil, nil, alertErrf(alertIllegalParameter,
+			"server changed cipher suite from 0x%04x to 0x%04x after retry", hrr.suite, sh2.suite)
 	}
 
 	hs.transcript.Write(sh2Msg)
@@ -165,13 +182,16 @@ func (hs *handshakeState) checkRetryGroup(group uint16) error {
 		return fmt.Errorf("re-read own client hello: %w", err)
 	}
 	if !containsUint16(supported, group) {
-		return fmt.Errorf("hello retry request selected group 0x%04x, which was not offered in supported_groups", group)
+		return alertErrf(alertIllegalParameter,
+			"hello retry request selected group 0x%04x, which was not offered in supported_groups", group)
 	}
 	if containsUint16(offered, group) {
-		return fmt.Errorf("hello retry request selected group 0x%04x, for which a key share was already sent", group)
+		return alertErrf(alertIllegalParameter,
+			"hello retry request selected group 0x%04x, for which a key share was already sent", group)
 	}
 	if ecdhCurveForGroup(group) == nil {
-		return fmt.Errorf("hello retry request selected group 0x%04x, which has no key exchange", group)
+		return alertErrf(alertIllegalParameter,
+			"hello retry request selected group 0x%04x, which has no key exchange", group)
 	}
 	return nil
 }
@@ -360,6 +380,29 @@ func assembleClientHello(prefix, exts []byte) ([]byte, error) {
 	msg[2] = byte(bodyLen >> 8)
 	msg[3] = byte(bodyLen)
 	return msg, nil
+}
+
+// clientHelloSessionID returns the legacy_session_id a ClientHello carries.
+//
+// It is read back out of the sent message rather than stashed when the hello was
+// built, for the same reason clientHelloGroups is: what matters is what actually
+// went on the wire, and a value re-derived from the message can never drift from
+// the builders. The retry path leaves the field untouched, so this answers for
+// ClientHello1 and ClientHello2 alike.
+func clientHelloSessionID(msg []byte) ([]byte, error) {
+	if len(msg) < 4 || msg[0] != handshakeTypeClientHello {
+		return nil, fmt.Errorf("not a client hello")
+	}
+	b := msg[4:]
+	const p = 2 + 32 // legacy_version + random
+	if p >= len(b) {
+		return nil, fmt.Errorf("truncated client hello")
+	}
+	idLen := int(b[p])
+	if p+1+idLen > len(b) {
+		return nil, fmt.Errorf("client hello session id claims %d bytes, %d remain", idLen, len(b)-p-1)
+	}
+	return b[p+1 : p+1+idLen], nil
 }
 
 // clientHelloGroups returns the groups a ClientHello advertises in

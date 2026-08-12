@@ -189,14 +189,5 @@ var greaseValues = []uint16{
 	0x8A8A, 0x9A9A, 0xAAAA, 0xBABA, 0xCACA, 0xDADA, 0xEAEA, 0xFAFA,
 }
 
-// Alert levels and descriptions
-const (
-	alertLevelWarning = 1
-	alertLevelFatal   = 2
-
-	alertCloseNotify      = 0
-	alertUnexpectedMsg    = 10
-	alertHandshakeFailure = 40
-	alertIllegalParameter = 47
-	alertDecryptError     = 51
-)
+// Alert levels and descriptions live in alert.go, next to the code that reads
+// and writes them.

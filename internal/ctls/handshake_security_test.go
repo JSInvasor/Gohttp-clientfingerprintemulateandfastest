@@ -264,7 +264,7 @@ func parseServerHelloForTest(hs *handshakeState, data []byte) error {
 	if sh.isHRR {
 		return fmt.Errorf("HelloRetryRequest")
 	}
-	_, _, err = hs.parseServerHello(sh)
+	_, err = hs.parseServerHello(sh)
 	return err
 }
 

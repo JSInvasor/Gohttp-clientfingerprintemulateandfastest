@@ -37,6 +37,7 @@ type Conn struct {
 	readBuf      []byte           // decrypted application data buffer
 	readErr      error            // stored read error
 	postHS       []byte           // partial post-handshake message reassembly
+	keyUpdates   int              // KeyUpdates honoured, bounded by maxKeyUpdates
 
 	// writeMu serialises everything that touches clientWriter. The AEAD
 	// sequence number it holds must advance exactly once per record, and
@@ -143,20 +144,24 @@ func (c *Conn) Read(b []byte) (int, error) {
 			return n, nil
 
 		case recordTypeAlert:
-			if len(plaintext) >= 2 {
-				// close_notify is a clean shutdown and must surface as io.EOF.
-				// net/http ends a Content-Length-less HTTP/1.1 body on EOF and
-				// treats anything else as a truncated response, so reporting an
-				// error here corrupts every connection-close-delimited body.
-				// It is sent at warning level, so check it before the level.
-				if plaintext[1] == alertCloseNotify {
-					c.readErr = io.EOF
-					return 0, io.EOF
-				}
-				if plaintext[0] == alertLevelFatal {
-					c.readErr = fmt.Errorf("tls alert: %d", plaintext[1])
-					return 0, c.readErr
-				}
+			// close_notify is a clean shutdown and must surface as io.EOF.
+			// net/http ends a Content-Length-less HTTP/1.1 body on EOF and
+			// treats anything else as a truncated response, so reporting an
+			// error here corrupts every connection-close-delimited body.
+			//
+			// Everything else except user_canceled is fatal regardless of the
+			// level byte — see receivedAlert. Reading the level instead meant a
+			// server tearing the connection down at warning level was ignored
+			// here, and the caller saw the read spin to its deadline rather than
+			// the reason the peer gave.
+			desc, alertErr := receivedAlert(plaintext)
+			if alertErr != nil {
+				c.readErr = alertErr
+				return 0, c.readErr
+			}
+			if desc == alertCloseNotify {
+				c.readErr = io.EOF
+				return 0, io.EOF
 			}
 			if err := noProgress(); err != nil {
 				c.readErr = err
@@ -212,6 +217,15 @@ func (c *Conn) handlePostHandshake(data []byte) error {
 			if len(body) != 1 {
 				return fmt.Errorf("malformed key_update")
 			}
+			// Every KeyUpdate costs two HKDF expansions and an AEAD setup, and
+			// an update_requested one also costs a record write — all driven by
+			// the peer. The per-Read no-progress ceiling does not bound it,
+			// because it resets on each byte of application data, so a peer
+			// could alternate one byte with a burst of updates indefinitely.
+			// Real servers rekey a handful of times over a connection's life.
+			if c.keyUpdates++; c.keyUpdates > maxKeyUpdates {
+				return fmt.Errorf("peer sent %d key_updates on one connection", c.keyUpdates)
+			}
 			if err := c.rekeyServer(); err != nil {
 				return err
 			}
@@ -229,8 +243,19 @@ func (c *Conn) handlePostHandshake(data []byte) error {
 			// for post-handshake auth we never opted into) is ignored.
 		}
 	}
+	// Fully drained: release the buffer. Re-slicing alone leaves the read
+	// offset marching forward through the backing array, so every later append
+	// starts further in and the array is regrown for bytes already consumed.
+	if len(c.postHS) == 0 {
+		c.postHS = nil
+	}
 	return nil
 }
+
+// maxKeyUpdates bounds how many times one connection will follow the peer's
+// rekeying. RFC 8446 sets no limit; servers that rekey at all do so on a byte or
+// time budget, which is single digits over any realistic connection lifetime.
+const maxKeyUpdates = 32
 
 // rekeyServer advances the server's application traffic secret one generation
 // (RFC 8446 §4.6.3) and installs the resulting record keys.
@@ -338,15 +363,29 @@ func DialWithConfig(ctx context.Context, network, addr, serverName string, alpn 
 	return WrapConn(ctx, rawConn, serverName, alpn, skipVerify, rootCAs, browser)
 }
 
+// DefaultHandshakeTimeout bounds a handshake whose context carries no deadline
+// of its own.
+//
+// Without it there was no bound at all on that path: a peer that completes the
+// TCP handshake and then sends nothing — a black-holing edge, a stalled proxy, a
+// tarpit — held the dialing goroutine and its connection forever, because every
+// other ceiling in this package bounds work rather than wall clock. The value is
+// deliberately generous; it is a backstop, not a policy. Callers that care set a
+// deadline on the context, which always wins when it is the earlier of the two.
+const DefaultHandshakeTimeout = 30 * time.Second
+
 // WrapConn performs the TLS 1.3 handshake over an existing net.Conn.
 // This is the main entry point for use with pre-dialed connections (proxies, etc.).
 func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType) (*Conn, error) {
-	// Set deadline from context
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := rawConn.SetDeadline(deadline); err != nil {
-			rawConn.Close()
-			return nil, fmt.Errorf("set deadline: %w", err)
-		}
+	// Set deadline from the context, falling back to the package default so
+	// this can never run unbounded.
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(DefaultHandshakeTimeout)
+	}
+	if err := rawConn.SetDeadline(deadline); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 
 	tlsConn, err := handshake(rawConn, serverName, alpn, skipVerify, rootCAs, browser)

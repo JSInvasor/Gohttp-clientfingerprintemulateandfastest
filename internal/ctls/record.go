@@ -68,6 +68,16 @@ func writeInitialClientHello(conn net.Conn, data []byte) error {
 }
 
 func writeRecordVersion(conn net.Conn, typ uint8, version uint16, data []byte) error {
+	// The length field is 16 bits and RFC 8446 §5.2 caps a record body at
+	// 2^14+256 anyway, so an oversized body cannot be framed. Without the check
+	// the uint16 conversion below wraps silently, producing a record whose
+	// header disagrees with its contents — which desynchronises the peer's
+	// record layer for the rest of the connection rather than failing here.
+	// Nothing this package builds comes close, so this is a guard against a
+	// future caller, not a live bug.
+	if len(data) > maxCiphertextRecord {
+		return fmt.Errorf("record body is %d bytes, over the %d limit", len(data), maxCiphertextRecord)
+	}
 	buf := make([]byte, recordHeaderLen+len(data))
 	buf[0] = typ
 	binary.BigEndian.PutUint16(buf[1:], version)

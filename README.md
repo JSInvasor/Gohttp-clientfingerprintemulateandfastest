@@ -405,6 +405,39 @@ and is stable.
 - ECH GREASE payload length 208 bytes (`0x00d0`), measured against an
   11-character hostname; see Known gaps
 
+## What happens when a handshake fails
+
+How a client *fails* is part of its fingerprint, so the failure paths are
+browser-shaped rather than "close the socket and return an error":
+
+- **A fatal alert goes out before the connection is dropped**, with a
+  description matched to the cause — `bad_certificate` / `unknown_ca` /
+  `certificate_expired` for a chain that does not verify, `illegal_parameter`
+  for a ServerHello field that is out of contract, `decrypt_error` for a bad
+  signature or Finished MAC, `protocol_version` for a server that will not
+  speak TLS 1.3. Once handshake keys exist the alert is encrypted, which is
+  what a server holding those keys expects. A client that instead vanishes
+  mid-handshake is doing something no shipping browser does, and the peer sees
+  it. Failures that are the *connection* dying send nothing.
+- **Alerts received are read per RFC 8446 §6.2**, where the level byte carries
+  no meaning: everything except `close_notify` and `user_canceled` is fatal
+  whatever level it arrives at. `close_notify` surfaces as `io.EOF` so
+  connection-close-delimited bodies are not reported as truncated.
+- **Errors name the alert.** `server alert: illegal_parameter (47)` rather than
+  `server alert: 47` — for a fingerprint regression that name is usually the
+  whole diagnosis.
+- **The ServerHello is checked against the ClientHello that was sent**: the
+  `legacy_session_id_echo` must match, `legacy_compression_method` must be null,
+  the TLS 1.2/1.1 downgrade sentinels in `ServerHello.random` are rejected, no
+  extension may appear twice, and extensions TLS 1.3 moved to
+  EncryptedExtensions (or a `pre_shared_key` that was never offered) are
+  refused. A negotiated ALPN that was not in the offer is rejected with
+  `no_application_protocol`.
+- **Every handshake is bounded in time.** `WithTLSHandshakeTimeout` is applied
+  by this transport directly, because `net/http` only honours its own
+  `TLSHandshakeTimeout` on the code path a custom TLS dialer replaces. A
+  deadline on the request context still wins when it is sooner.
+
 ## Known gaps
 
 The TLS, HTTP/2 and header layers match the reference devices. These do not, and
