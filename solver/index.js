@@ -10,16 +10,21 @@
 //     "cookies": "name=val; name=val; ...",   // header-ready
 //     "cookie_list": [{name, value, domain, expires}, ...],
 //     "duration_ms": <int>,
-//     "attempts": <int>,
+//     "attempts": <int>,                      // attempts actually made
+//     "chromium_version": "<browser.version()>",
+//     "chromium_major": <int>,
 //     "error": "<message>" }                  // only on error
 //
 // Design (one-shot, no server):
 //   - puppeteer-real-browser launches a real Chromium with stealth patches.
-//   - We pin the UA (profile.js TARGET_UA) to match what the gofire client
-//     emulates. UAM binds cf_clearance to (UA, JA3/JA4, IP); UA drift = instant
-//     403. `fpcheck -via-chromium` verifies the pin against the Go profile and
-//     against this box's actual Chromium, so the drift is caught before a run
-//     rather than diagnosed from a wall of 403s.
+//   - We pin the UA and its Client Hints (profile.js) to match what the gofire
+//     client emulates. UAM binds cf_clearance to (UA, JA3/JA4, IP); UA drift =
+//     instant 403. `fpcheck -via-chromium` verifies the pin against the Go
+//     profile and against this box's actual Chromium, so the drift is caught
+//     before a run rather than diagnosed from a wall of 403s.
+//   - Cookies are read scoped to the target origin. A challenge run navigates
+//     cross-origin and back, so the whole-profile jar ends up holding another
+//     host's cf_clearance too — which is not proof the target was solved.
 //   - After cf_clearance appears we perform human-like behavior (mouse moves,
 //     smoothed scroll, dwell time) BEFORE reading the cookie. CF assigns a
 //     "human signal" score during the first few seconds after issuance; a
@@ -30,127 +35,69 @@
 //     soft-fail, so a fresh tab/session can succeed.
 
 import { connect } from "puppeteer-real-browser";
-import { execSync } from "node:child_process";
 import {
   CONNECT_OPTIONS,
   TARGET_UA,
+  userAgentMetadata,
   chromiumMajor as parseChromiumMajor,
 } from "./profile.js";
+import {
+  cleanup,
+  errorMessage,
+  installExitHandlers,
+  trackBrowser,
+  untrackBrowser,
+} from "./cleanup.js";
+import { cookiesForUrl } from "./cookies.js";
+
+const MAX_ATTEMPTS = 2;
+const DEFAULT_TIMEOUT_SEC = 75;
+
+// Everything below is written to the single-JSON-line contract in the header
+// comment, so usage errors go to stdout in the same shape a caller parses.
+function die(message, code = 1) {
+  console.log(JSON.stringify({ status: "error", error: message }));
+  process.exit(code);
+}
 
 const url = process.argv[2];
-const timeoutSec = parseInt(process.argv[3] || "75", 10);
-const TIMEOUT_MS = timeoutSec * 1000;
-const MAX_ATTEMPTS = 2;
-
 if (!url) {
-  console.error(
-    JSON.stringify({
-      status: "error",
-      error: "usage: node solver/index.js <url> [timeout_sec]",
-    })
-  );
-  process.exit(1);
+  die("usage: node solver/index.js <url> [timeout_sec]");
 }
 
-// ---- Process tracking + hard cleanup ----------------------------------------
-//
-// puppeteer-real-browser launches Chromium plus an Xvfb wrapper plus
-// renderer/GPU child processes. browser.close() is best-effort: if the node
-// process is killed (blaze timeout, SIGKILL) the chromium tree is orphaned
-// and keeps eating CPU/RAM. We track every PID we know about and kill the
-// whole tree on every exit path - signals, exceptions, normal exit.
-//
-// Additionally, on Linux we run a `pkill` sweep using a unique env-var marker
-// the chromium processes inherit, so any straggler that escaped our PID
-// tracking still gets cleaned up.
-
-const SESSION_MARK = `BLAZE_SOLVER_SESSION=${process.pid}-${Date.now()}`;
-process.env.BLAZE_SOLVER_SESSION = SESSION_MARK.split("=")[1];
-
-const trackedPids = new Set();
-let cleanedUp = false;
-
-function trackPid(pid) {
-  if (pid && Number.isInteger(pid)) trackedPids.add(pid);
-}
-
-function killProcessTree(pid, signal) {
-  try {
-    // Negative pid = kill the entire process group. Requires the child to
-    // have been started in its own group (puppeteer does this by default
-    // for the Chromium it spawns).
-    process.kill(-pid, signal);
-  } catch {}
-  try {
-    process.kill(pid, signal);
-  } catch {}
-}
-
-function cleanup() {
-  if (cleanedUp) return;
-  cleanedUp = true;
-
-  // 1) Try graceful close on the live browser handle.
-  if (currentBrowser) {
-    try {
-      currentBrowser.close();
-    } catch {}
-    currentBrowser = null;
+// A non-numeric timeout used to survive all the way to setTimeout, where Node
+// coerces NaN to 1ms: the watchdog fired a millisecond into the run and the
+// solver reported "watchdog timeout" without ever opening a browser. NaN also
+// poisoned the goto budget (Math.max(1000, NaN) is NaN) and the deadline
+// comparison (Date.now() >= NaN is false).
+function parseTimeoutSec(raw) {
+  if (raw === undefined) return DEFAULT_TIMEOUT_SEC;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    die(`invalid timeout_sec ${JSON.stringify(raw)}: want a positive number of seconds`);
   }
-
-  // 2) SIGTERM every PID we tracked, then SIGKILL after a short grace window.
-  for (const pid of trackedPids) killProcessTree(pid, "SIGTERM");
-  setTimeout(() => {
-    for (const pid of trackedPids) killProcessTree(pid, "SIGKILL");
-  }, 500).unref();
-
-  // 3) Linux belt-and-braces sweep: kill any chromium descendant that
-  //    inherited our session marker. Catches stragglers that puppeteer-
-  //    real-browser detached from us (Xvfb wrapper etc.).
-  if (process.platform === "linux") {
-    try {
-      execSync(
-        `pgrep -af "BLAZE_SOLVER_SESSION=${process.env.BLAZE_SOLVER_SESSION}" | awk '{print $1}' | xargs -r kill -9`,
-        { stdio: "ignore", timeout: 2000 }
-      );
-    } catch {}
-  }
+  return n;
 }
 
-process.on("SIGINT", () => {
-  cleanup();
-  process.exit(130);
+const TIMEOUT_MS = Math.round(parseTimeoutSec(process.argv[3]) * 1000);
+
+// Client Hints are built once, up front: userAgentMetadata() throws when the
+// pinned UA and sec-ch-ua disagree, and finding that out after a 75-second
+// solve would be an expensive way to learn it.
+let UA_METADATA;
+try {
+  UA_METADATA = userAgentMetadata();
+} catch (err) {
+  die(errorMessage(err));
+}
+
+// Kill the Chromium tree on every exit path — signals, exceptions, normal
+// return. See cleanup.js for why this is not done with an env-var pkill sweep.
+installExitHandlers({
+  onFatal: (err) => {
+    if (err) console.log(JSON.stringify({ status: "error", error: errorMessage(err) }));
+  },
 });
-process.on("SIGTERM", () => {
-  cleanup();
-  process.exit(143);
-});
-process.on("SIGHUP", () => {
-  cleanup();
-  process.exit(129);
-});
-process.on("uncaughtException", (e) => {
-  try {
-    console.log(
-      JSON.stringify({ status: "error", error: e?.message || String(e) })
-    );
-  } catch {}
-  cleanup();
-  process.exit(1);
-});
-process.on("unhandledRejection", (e) => {
-  try {
-    console.log(
-      JSON.stringify({
-        status: "error",
-        error: (e && e.message) || String(e),
-      })
-    );
-  } catch {}
-  cleanup();
-  process.exit(1);
-});
-process.on("exit", cleanup);
 
 // Hard backstop: even if the run hangs forever, we self-terminate at
 // (timeout + 30s) so we never become the zombie ourselves.
@@ -163,8 +110,6 @@ setTimeout(() => {
   cleanup();
   process.exit(2);
 }, TIMEOUT_MS + 30_000).unref();
-
-let currentBrowser = null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -183,14 +128,10 @@ async function launch() {
   const result = await connect(CONNECT_OPTIONS);
 
   const { browser, page } = result;
-  currentBrowser = browser;
 
-  // Track the chromium PID so cleanup() can kill the whole tree even if
-  // browser.close() never runs (timeout, kill -9 from blaze, etc.).
-  try {
-    const proc = browser.process && browser.process();
-    if (proc && proc.pid) trackPid(proc.pid);
-  } catch {}
+  // Track the handle and the chromium PID so cleanup() can kill the whole tree
+  // even if browser.close() never runs (timeout, kill -9 from blaze, etc.).
+  trackBrowser(browser);
 
   // Read the actual Chromium build so the caller can compare it to the emulated
   // Chrome major. cf_clearance is bound to the JA4 of the session that issued
@@ -203,10 +144,14 @@ async function launch() {
     chromiumMajorVersion = parseChromiumMajor(chromiumVersion);
   } catch {}
 
-  // Force the gofire-matching UA before any navigation.
-  try {
-    await page.setUserAgent(TARGET_UA);
-  } catch {}
+  // Force the gofire-matching identity before any navigation.
+  //
+  // The metadata argument is not optional in practice: setUserAgent(ua) alone
+  // clears the Client Hints rather than leaving them alone, so the session ends
+  // up claiming Chrome 151 in User-Agent while sending no sec-ch-ua at all —
+  // a combination no real Chrome emits, on the very request that earns
+  // cf_clearance. See profile.js for the measurement.
+  await page.setUserAgent(TARGET_UA, UA_METADATA);
 
   // Stealth shims - applied to every new document so they survive navigations.
   await page.evaluateOnNewDocument(() => {
@@ -247,14 +192,21 @@ async function launch() {
   return { browser, page, chromiumVersion, chromiumMajor: chromiumMajorVersion };
 }
 
-// Wait until cf_clearance appears in the cookie jar OR the page leaves the
-// challenge state (title flips back to a normal one). Returns the cookie
-// object on success, null if no challenge was present, throws on timeout.
+// Wait until cf_clearance appears for the target origin, or until the page
+// leaves the challenge state. Returns:
+//
+//   {cleared: true,  cookie}                 clearance issued
+//   {cleared: false, challenged: false}      no challenge was ever presented
+//   {cleared: false, challenged: true}       still challenged at the deadline
+//
+// The challenged flag is what tells the caller whether a retry has anything to
+// retry: a site with no challenge at all has already given us everything it is
+// going to, and relaunching the browser for it only costs another cold start.
 async function waitForClearance(browser, page, deadline) {
   while (Date.now() < deadline) {
-    const cookies = await browser.cookies(url).catch(() => []);
+    const cookies = await cookiesForUrl(browser, page, url);
     const cf = cookies.find((c) => c.name === "cf_clearance");
-    if (cf) return cf;
+    if (cf) return { cleared: true, cookie: cf };
 
     const title = await page.title().catch(() => "");
     if (
@@ -265,11 +217,11 @@ async function waitForClearance(browser, page, deadline) {
     ) {
       // Page is past the challenge gate even without an explicit clearance
       // cookie (some sites use Bot Fight Mode without UAM).
-      return null;
+      return { cleared: false, challenged: false };
     }
     await sleep(500);
   }
-  throw new Error("cf_clearance did not appear before timeout");
+  return { cleared: false, challenged: true };
 }
 
 // Real-user behavior between challenge solve and cookie capture. CF samples
@@ -323,12 +275,33 @@ async function simulateHumanBehavior(page) {
 // One full attempt: launch, navigate, wait for clearance, simulate behavior,
 // capture cookies. Caller decides whether to retry on failure.
 //
-// attemptDeadline is a wall-clock timestamp (ms) shared across attempts so a
-// long first attempt cannot blow past the overall solver budget. page.goto
-// + waitForClearance both honor it.
+// attemptDeadline is a wall-clock timestamp (ms); page.goto and waitForClearance
+// both honor it, and solve() sizes it so an attempt cannot consume the budget
+// its own retry needs.
+//
+// Two structural notes, both of which were bugs:
+//
+//   - launch() is inside the try. A failed connect() (no Xvfb, missing Chromium,
+//     a port race) used to escape attempt() entirely and abort the run from
+//     solve()'s outermost catch, so the retry documented at the top of this file
+//     never covered the one failure a retry helps most with.
+//   - the browser is closed in finally rather than handed back for the caller to
+//     close. The caller then had to clear the module-level handle too, and the
+//     check that did so compared against a field it had already set to undefined
+//     — so it never fired, and cleanup's "graceful close" always ran against a
+//     dead handle.
 async function attempt(attemptNum, attemptDeadline) {
-  const { browser, page, chromiumVersion, chromiumMajor } = await launch();
+  let browser = null;
+  let chromiumVersion = "";
+  let chromiumMajor = 0;
+
   try {
+    const launched = await launch();
+    browser = launched.browser;
+    chromiumVersion = launched.chromiumVersion;
+    chromiumMajor = launched.chromiumMajor;
+    const page = launched.page;
+
     const budgetMs = Math.max(1000, attemptDeadline - Date.now());
 
     await page.goto(url, {
@@ -336,10 +309,12 @@ async function attempt(attemptNum, attemptDeadline) {
       timeout: budgetMs,
     });
 
-    const cf = await waitForClearance(browser, page, attemptDeadline);
-    if (!cf && attemptNum < MAX_ATTEMPTS) {
-      // No clearance and we still have a retry left - signal caller.
-      return { status: "no_clearance", browser, chromiumVersion, chromiumMajor };
+    const outcome = await waitForClearance(browser, page, attemptDeadline);
+    if (!outcome.cleared && outcome.challenged && attemptNum < MAX_ATTEMPTS) {
+      // Still sitting on a challenge with a retry left. A fresh tab often gets
+      // a different challenge variant, so signal the caller rather than
+      // harvesting a jar we know has no clearance in it.
+      return { status: "no_clearance", chromiumVersion, chromiumMajor };
     }
 
     // Whether clearance was present or not, harvest behavior data so even
@@ -347,7 +322,7 @@ async function attempt(attemptNum, attemptDeadline) {
     await simulateHumanBehavior(page);
 
     // Re-read cookies post-behavior (interaction can elevate __cf_bm).
-    const cookies = await browser.cookies(url);
+    const cookies = await cookiesForUrl(browser, page, url);
     const cfFinal = cookies.find((c) => c.name === "cf_clearance");
     const userAgent = await page.evaluate(() => navigator.userAgent);
     const finalUrl = page.url();
@@ -363,44 +338,53 @@ async function attempt(attemptNum, attemptDeadline) {
         domain: c.domain,
         expires: c.expires,
       })),
-      browser,
       chromiumVersion,
       chromiumMajor,
     };
   } catch (err) {
     return {
       status: "error",
-      error: err.message || String(err),
-      browser,
+      error: errorMessage(err),
       chromiumVersion,
       chromiumMajor,
     };
+  } finally {
+    // Always tear the session down before the caller decides whether to retry:
+    // a reused session carries stale fingerprint state into the next attempt.
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {}
+      untrackBrowser(browser);
+    }
   }
 }
 
 async function solve() {
   const startTs = Date.now();
-  // Single overall deadline shared by every attempt — prevents a slow first
-  // attempt from leaving the second with no time, or the whole solver from
-  // overshooting the parent's (blaze's) outer timeout.
+  // Single overall deadline shared by every attempt, so the solver cannot
+  // overshoot the parent's (blaze's) outer timeout. The per-attempt split below
+  // is what keeps a slow first attempt from leaving the second with no time.
   const overallDeadline = startTs + TIMEOUT_MS;
   let lastResult = null;
+  let attemptsMade = 0;
 
   for (let i = 1; i <= MAX_ATTEMPTS; i++) {
     // Stop early if we've already overshot the global deadline.
     if (Date.now() >= overallDeadline) break;
 
-    const r = await attempt(i, overallDeadline);
-    lastResult = r;
+    // Give a non-final attempt only part of what is left, so a first attempt
+    // that sits on a challenge until the deadline cannot leave the retry with
+    // no time to run in. The last attempt gets everything that remains.
+    const remaining = overallDeadline - Date.now();
+    const attemptDeadline =
+      i < MAX_ATTEMPTS
+        ? Date.now() + Math.round(remaining * 0.6)
+        : overallDeadline;
 
-    // Always close the browser before deciding whether to retry. Keeping
-    // the old session around can carry stale fingerprint state into the
-    // next attempt.
-    if (r.browser) {
-      await r.browser.close().catch(() => {});
-      r.browser = undefined;
-    }
-    if (currentBrowser === r.browser) currentBrowser = null;
+    const r = await attempt(i, attemptDeadline);
+    lastResult = r;
+    attemptsMade = i;
 
     if (r.status === "ok") {
       const out = {
@@ -435,7 +419,7 @@ async function solve() {
       cookies: lastResult.cookies || "",
       cookie_list: lastResult.cookie_list || [],
       duration_ms: Date.now() - startTs,
-      attempts: MAX_ATTEMPTS,
+      attempts: attemptsMade,
       chromium_version: lastResult.chromiumVersion || "",
       chromium_major: lastResult.chromiumMajor || 0,
     };
@@ -448,7 +432,7 @@ async function solve() {
       status: "error",
       error: (lastResult && lastResult.error) || "solve failed",
       duration_ms: Date.now() - startTs,
-      attempts: MAX_ATTEMPTS,
+      attempts: attemptsMade,
       chromium_version: (lastResult && lastResult.chromiumVersion) || "",
       chromium_major: (lastResult && lastResult.chromiumMajor) || 0,
     })
@@ -457,10 +441,7 @@ async function solve() {
 
 solve().catch((err) => {
   console.log(
-    JSON.stringify({
-      status: "error",
-      error: err.message || String(err),
-    })
+    JSON.stringify({ status: "error", error: errorMessage(err) })
   );
   process.exit(1);
 });

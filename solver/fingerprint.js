@@ -9,6 +9,7 @@
 //     "chromium_major": 151,
 //     "native_user_agent": "<what this Chromium reports for itself>",
 //     "solver_user_agent": "<the UA index.js pins, from profile.js>",
+//     "solver_sec_ch_ua": "<the Client Hints index.js pins alongside it>",
 //     "capture": { ... the fingerprint endpoint's JSON ... } }
 //   { "status": "error", "error": "<message>" }
 //
@@ -23,30 +24,60 @@
 // Deliberately does NOT call page.setUserAgent. index.js overrides the UA so
 // the solved session matches gofire; here we want the browser's own identity,
 // because the question being answered is "what browser is actually installed
-// on this box". The pinned UA is reported alongside as solver_user_agent so the
-// caller can check both.
+// on this box". The pinned UA and its Client Hints are reported alongside as
+// solver_user_agent and solver_sec_ch_ua so the caller can check both.
 //
 // The TLS and HTTP/2 layers are unaffected by any of that either way: they come
 // from BoringSSL and Chromium's own HTTP/2 stack, which no page-level override
 // can reach. That is precisely what makes them worth measuring.
 
 import { connect } from "puppeteer-real-browser";
-import { CONNECT_OPTIONS, TARGET_UA, chromiumMajor } from "./profile.js";
-
-const url = process.argv[2];
-const timeoutSec = parseInt(process.argv[3] || "60", 10);
-
-if (!url) {
-  fail("usage: node solver/fingerprint.js <url> [timeout_sec]");
-}
+import {
+  CONNECT_OPTIONS,
+  TARGET_SEC_CH_UA,
+  TARGET_UA,
+  chromiumMajor,
+} from "./profile.js";
+import {
+  cleanup,
+  errorMessage,
+  installExitHandlers,
+  trackBrowser,
+  untrackBrowser,
+} from "./cleanup.js";
 
 function fail(message) {
   console.log(JSON.stringify({ status: "error", error: message }));
   process.exit(1);
 }
 
-// Hard stop. puppeteer-real-browser leaves a Chromium tree behind if the node
-// process is killed, so an unbounded hang here would leak a browser per run.
+const url = process.argv[2];
+if (!url) {
+  fail("usage: node solver/fingerprint.js <url> [timeout_sec]");
+}
+
+// A NaN here would reach setTimeout, which coerces it to 1ms and fires the hard
+// stop immediately; a zero would reach page.goto, where it means "no timeout at
+// all". fpcheck passes int(timeout.Seconds()), so a sub-second -timeout arrives
+// as 0 — clamped rather than rejected, since that is a legitimate way to ask
+// for "as little as possible".
+const DEFAULT_TIMEOUT_SEC = 60;
+const rawTimeout = process.argv[3];
+let timeoutSec = DEFAULT_TIMEOUT_SEC;
+if (rawTimeout !== undefined) {
+  const n = Number(rawTimeout);
+  if (!Number.isFinite(n) || n < 0) {
+    fail(`invalid timeout_sec ${JSON.stringify(rawTimeout)}: want a non-negative number of seconds`);
+  }
+  timeoutSec = Math.max(1, n);
+}
+
+// Kill the Chromium tree on every exit path. The previous hard stop called
+// process.exit() directly, which skips the finally that closes the browser — so
+// the timeout path leaked exactly the tree this comment promised to prevent,
+// and there were no signal handlers at all.
+installExitHandlers();
+
 const hardStop = setTimeout(() => {
   try {
     console.log(
@@ -56,6 +87,7 @@ const hardStop = setTimeout(() => {
       })
     );
   } catch {}
+  cleanup();
   process.exit(2);
 }, timeoutSec * 1000 + 15_000);
 hardStop.unref();
@@ -65,6 +97,7 @@ async function main() {
   try {
     const result = await connect(CONNECT_OPTIONS);
     browser = result.browser;
+    trackBrowser(browser);
     const page = result.page;
 
     let version = "";
@@ -112,16 +145,20 @@ async function main() {
         chromium_major: chromiumMajor(version),
         native_user_agent: nativeUA,
         solver_user_agent: TARGET_UA,
+        solver_sec_ch_ua: TARGET_SEC_CH_UA,
         capture,
       })
     );
   } finally {
     if (browser) {
-      await browser.close().catch(() => {});
+      try {
+        await browser.close();
+      } catch {}
+      untrackBrowser(browser);
     }
   }
 }
 
 main().catch((err) => {
-  fail(err && err.message ? err.message : String(err));
+  fail(errorMessage(err));
 });
