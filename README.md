@@ -405,6 +405,43 @@ and is stable.
 - ECH GREASE payload length 208 bytes (`0x00d0`), measured against an
   11-character hostname; see Known gaps
 
+## Sending requests from the CLI
+
+`cmd/send` drives this client against a real target. It goes through `Emulate`
+and the ordinary `Client` methods, so what it reports is what a program using
+the library gets, not what a bespoke harness arranged to happen.
+
+```bash
+go run ./cmd/send https://site.com                    # one request, prints the response
+go run ./cmd/send -p chrome -i https://site.com       # Chrome profile, with headers
+go run ./cmd/send -t 30s -c 100 https://site.com      # run for 30s, 100 in flight
+go run ./cmd/send -n 50000 -c 300 -mode pipeline https://site.com
+go run ./cmd/send -t 1m -c 200 -s 50 -proxy-file proxies.txt https://site.com
+go run ./cmd/send -fingerprint -p chrome              # the profile's reference values
+```
+
+A load run has three dials: `-t` (or `-n`) for how long, `-c` for how wide, and
+`-s` for how many identities. A **session** is a separate `Client` — its own
+cookie jar, its own connection pool, and its own pinned proxy when
+`-proxy-file` is set. One session with 200 workers is one browser making 200
+parallel requests; 200 sessions with 200 workers is 200 browsers making one
+each, and a target that scores per-identity behaviour tells those apart.
+
+`-mode` picks the entry point, and the guarantees drop as throughput rises:
+
+| mode | path | gives up |
+|---|---|---|
+| `client` (default) | `Client.Do` | nothing |
+| `fast` | `FastDo` on a prepared template | cookie jar, redirects, retries |
+| `pipeline` | the `Pipeline` worker pool | as `fast`, plus per-request submission control |
+
+Response bodies are always drained rather than abandoned. Closing an unfinished
+body makes HTTP/2 emit RST_STREAM, which is the abusive-client signal this
+package exists to avoid — measuring throughput must not be the thing that
+produces it. `-rate` caps the whole run, `-json` prints the summary as JSON, and
+`send -h` lists the transport knobs (`-max-streams`, `-idle-conns`, `-sockbuf`,
+`-tfo`, …).
+
 ## What happens when a handshake fails
 
 How a client *fails* is part of its fingerprint, so the failure paths are
