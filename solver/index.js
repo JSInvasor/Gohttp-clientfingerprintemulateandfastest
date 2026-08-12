@@ -173,38 +173,37 @@ async function launch() {
   // cf_clearance. See profile.js for the measurement.
   await page.setUserAgent(TARGET_UA, UA_METADATA);
 
-  // Stealth shims - applied to every new document so they survive navigations.
+  // Stealth shim, singular.
+  //
+  // This used to also overwrite navigator.webdriver and navigator.plugins.
+  // Measured against this browser with the shims on and off, both were making
+  // the fingerprint worse than leaving it alone:
+  //
+  //                              shimmed              untouched
+  //   navigator.webdriver        undefined            false
+  //   own property on navigator  true                 false
+  //   plugins.length             3                    5
+  //   toString(plugins)          [object Array]       [object PluginArray]
+  //   typeof plugins.item        undefined            function
+  //   toString(plugins[0])       [object Object]      [object Plugin]
+  //
+  // puppeteer-real-browser's rebrowser patches already report webdriver as
+  // false, which is what a real Chrome reports — undefined is not a stealthier
+  // false, it is a value no browser produces, and defining it on the instance
+  // leaves an own property that Navigator.prototype never has. The plugins
+  // override replaced a genuine PluginArray of five Plugin objects with a plain
+  // Array of three plain objects: three separate tells in one property, plus a
+  // plugins/mimeTypes pair (3 and 2) that no Chrome ever emits.
+  //
+  // languages is the one that earns its place. Chrome sends
+  // Accept-Language: en-US,en;q=0.9 while navigator.languages reports only
+  // ["en-US"] here, and a header advertising a language the page object does
+  // not list is the kind of contradiction the rest of this repo exists to
+  // avoid. Restoring the second entry makes the two agree.
   await page.evaluateOnNewDocument(() => {
-    // navigator.webdriver -> undefined (CF Bot Score signal)
-    try {
-      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-    } catch {}
-    // languages: realistic en-US fallback
     try {
       Object.defineProperty(navigator, "languages", {
         get: () => ["en-US", "en"],
-      });
-    } catch {}
-    // plugins: real Chrome reports several PDF-related entries
-    try {
-      Object.defineProperty(navigator, "plugins", {
-        get: () => [
-          {
-            name: "PDF Viewer",
-            filename: "internal-pdf-viewer",
-            description: "Portable Document Format",
-          },
-          {
-            name: "Chrome PDF Viewer",
-            filename: "internal-pdf-viewer",
-            description: "",
-          },
-          {
-            name: "Chromium PDF Viewer",
-            filename: "internal-pdf-viewer",
-            description: "",
-          },
-        ],
       });
     } catch {}
   });

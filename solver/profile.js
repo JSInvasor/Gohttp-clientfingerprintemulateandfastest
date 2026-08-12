@@ -13,15 +13,28 @@
 // apart, and `fpcheck -via-chromium` measures the browser the solver actually
 // launches rather than a differently-configured one.
 
-// TARGET_UA must match gofire's Chrome151UserAgent in headers.go.
+// TARGET_UA must match the UA gofire replays with — Chrome151LinuxUserAgent in
+// headers.go, which is the same Chrome 151 identity with the OS token this box
+// actually runs.
 //
-// `fpcheck -via-chromium` checks this for you and fails when it drifts; that
-// check is the reason this constant is worth pinning rather than leaving to
-// whatever Chromium happens to report. Override with SOLVER_UA when your box
-// runs a different Chrome major and you have re-pinned the Go profile to match.
+// Claiming Windows was measurably wrong here. The headers said Windows while
+// the JS environment said otherwise, and a challenge reads both:
+//
+//   navigator.platform          Linux x86_64   (real Chrome on Windows: Win32)
+//   fonts                       Calibri and Segoe UI absent, DejaVu Sans present
+//
+// No page-level override fixes that honestly — patching navigator.platform
+// leaves its own tells, exactly as the plugins shim in index.js did. The TLS
+// and HTTP/2 layers are untouched by the choice: BoringSSL sends the same
+// ClientHello on every platform, so the pinned JA4 and Akamai fingerprint stay
+// valid either way. Only the OS token and the platform hint move.
+//
+// Set SOLVER_UA (and SOLVER_SEC_CH_UA, SOLVER_PLATFORM) when solving from a
+// machine whose OS or Chrome major differs; `fpcheck -via-chromium` checks the
+// pin for you and fails when it drifts.
 export const TARGET_UA =
   process.env.SOLVER_UA ||
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 
 // The Client Hint half of the same identity. These must match gofire's
 // Chrome151SecChUa and the Sec-Ch-Ua-Mobile / Sec-Ch-Ua-Platform defaults in
@@ -46,12 +59,13 @@ export const TARGET_SEC_CH_UA =
   process.env.SOLVER_SEC_CH_UA ||
   `"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"`;
 
-// Sec-Ch-Ua-Platform, without the quotes the header carries. Windows 10 and 11
-// both report "Windows"; the platformVersion is what separates them (1-14 is
-// Windows 10, 15+ is Windows 11), and the pinned UA says Windows NT 10.0.
-export const TARGET_PLATFORM = process.env.SOLVER_PLATFORM || "Windows";
+// Sec-Ch-Ua-Platform, without the quotes the header carries, and the
+// platformVersion that accompanies it. On Linux Chrome reports the kernel
+// release; the value below is an ordinary current one. These must agree with
+// the OS token in TARGET_UA — that pairing is checked in userAgentMetadata().
+export const TARGET_PLATFORM = process.env.SOLVER_PLATFORM || "Linux";
 export const TARGET_PLATFORM_VERSION =
-  process.env.SOLVER_PLATFORM_VERSION || "10.0.0";
+  process.env.SOLVER_PLATFORM_VERSION || "6.8.0";
 
 // LAUNCH_ARGS and CONNECT_OPTIONS are shared so the fingerprint probe measures
 // the same browser configuration the solver runs. Launch flags can move the
@@ -62,12 +76,26 @@ export const LAUNCH_ARGS = [
   "--no-sandbox",
   "--disable-setuid-sandbox",
   "--disable-dev-shm-usage",
-  "--disable-gpu",
   "--disable-blink-features=AutomationControlled",
   "--no-first-run",
   "--no-default-browser-check",
   "--disable-features=IsolateOrigins,site-per-process",
   "--window-size=1920,1080",
+  // Software WebGL. A headless box has no GPU, and without these the canvas
+  // hands back no WebGL context at all — measured here, with and without
+  // --disable-gpu, which turned out not to be the cause:
+  //
+  //   as shipped (--disable-gpu)   -> NO WEBGL
+  //   --use-gl=angle --use-angle=swiftshader
+  //                                -> ANGLE (Google, Vulkan 1.3.0 (SwiftShader
+  //                                   Device (Subzero)), SwiftShader driver)
+  //
+  // Every real Chrome has a WebGL context. A browser that has none is a far
+  // stronger signal than one rendering in software, which is what any VM or
+  // RDP session looks like. --disable-gpu is gone because it is redundant next
+  // to an explicit software renderer and only invites the two to disagree.
+  "--use-gl=angle",
+  "--use-angle=swiftshader",
 ];
 
 export const CONNECT_OPTIONS = {
@@ -187,6 +215,17 @@ export function userAgentMetadata(
     }
   }
 
+  // The OS token and the platform hint have to name the same system. Getting
+  // this pair wrong is what made the old Windows pin detectable: the headers
+  // said one OS while navigator.platform and the installed fonts said another.
+  const uaPlatform = platformFromUA(ua);
+  if (uaPlatform && uaPlatform !== platform) {
+    throw new Error(
+      `platform drift: the UA's OS token says ${uaPlatform} but the platform hint says ${platform}. ` +
+        `Re-pin SOLVER_UA and SOLVER_PLATFORM together.`
+    );
+  }
+
   // fullVersionList carries the four-part version; brands carries the major
   // only, which is what sec-ch-ua puts on the wire.
   const fullVersionList = brands.map(({ brand, version }) => ({
@@ -194,7 +233,6 @@ export function userAgentMetadata(
     version: isGreasedBrand(brand) ? `${version}.0.0.0` : fullVersion,
   }));
 
-  const windows = /Windows/i.test(ua) || platform === "Windows";
   return {
     brands,
     fullVersionList,
@@ -202,9 +240,23 @@ export function userAgentMetadata(
     platform,
     platformVersion,
     architecture: "x86",
-    bitness: /Win64|x64|x86_64/.test(ua) || windows ? "64" : "",
+    bitness: /Win64|x64|x86_64|amd64/i.test(ua) ? "64" : "",
     model: "",
     mobile: false,
     wow64: false,
   };
+}
+
+// platformFromUA reads the OS token out of a User-Agent and returns it in the
+// spelling Sec-Ch-Ua-Platform uses. Returns "" when the UA names no OS it
+// recognises, which leaves the caller's platform unchallenged rather than
+// guessed at.
+export function platformFromUA(ua) {
+  const s = String(ua || "");
+  if (/Windows NT/i.test(s)) return "Windows";
+  if (/Android/i.test(s)) return "Android"; // before Linux: Android UAs say both
+  if (/iPhone|iPad|iPod/i.test(s)) return "iOS";
+  if (/Macintosh|Mac OS X/i.test(s)) return "macOS";
+  if (/X11|Linux/i.test(s)) return "Linux";
+  return "";
 }

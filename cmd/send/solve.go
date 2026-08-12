@@ -208,12 +208,23 @@ func solveAndSeed(ctx context.Context, o *options, profile gofire.BrowserProfile
 			"  issued to %s\n  replaying %s\n", res.UserAgent, o.userAgent)
 	}
 
-	// Report drift against the profile rather than silently living with it: the
-	// solver pins its UA to headers.go, so a difference here means solver/ and
-	// the Go profile have moved apart.
-	if ref := gofire.ReferenceFor(profile); res.UserAgent != "" && ref.UserAgent != res.UserAgent {
-		fmt.Fprintf(os.Stderr, "warning: solver UA and %s profile UA differ — "+
-			"run `go run ./cmd/fpcheck -via-chromium -profile chrome` to see what else drifted\n", profile)
+	// Report drift rather than silently living with it. The comparison is
+	// against the pinned UA for the platform the solver runs on, not the
+	// profile's default: the solver claims the OS it actually has — a Linux VPS
+	// stays Linux — and Sec-Ch-Ua-Platform follows the UA, so that difference is
+	// expected and already handled. A difference in the browser identity is not.
+	if res.UserAgent != "" {
+		platform := gofire.PlatformFromUserAgent(res.UserAgent)
+		switch want, ok := gofire.ChromeUserAgentFor(platform); {
+		case !ok:
+			fmt.Fprintf(os.Stderr, "warning: the solver runs on %q, which this client has no "+
+				"pinned Chrome UA for — replaying its UA verbatim\n", platform)
+		case want != res.UserAgent:
+			fmt.Fprintf(os.Stderr, "warning: solver UA and the pinned Chrome UA for %s differ —\n"+
+				"  solver %s\n  pinned %s\n"+
+				"  run `go run ./cmd/fpcheck -via-chromium -profile chrome` to see what else drifted\n",
+				platform, res.UserAgent, want)
+		}
 	}
 
 	for _, c := range res.CookieList {

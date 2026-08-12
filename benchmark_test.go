@@ -80,7 +80,7 @@ func TestNewClient(t *testing.T) {
 
 func TestSafariHeaders(t *testing.T) {
 	req, _ := http.NewRequest("GET", "https://example.com", nil)
-	applySafariHeaders(req, "text/html", "en-US,en;q=0.9", modeNavigate)
+	applySafariHeaders(req, "text/html", "en-US,en;q=0.9", "", modeNavigate)
 
 	tests := []struct {
 		header string
@@ -124,7 +124,7 @@ func TestSafariHeadersNoOverride(t *testing.T) {
 	req, _ := http.NewRequest("GET", "https://example.com", nil)
 	req.Header.Set("User-Agent", "custom-agent")
 	req.Header.Set("Accept", "application/json")
-	applySafariHeaders(req, "text/html", "en-US", modeNavigate)
+	applySafariHeaders(req, "text/html", "en-US", "", modeNavigate)
 
 	if got := req.Header.Get("User-Agent"); got != "custom-agent" {
 		t.Errorf("User-Agent was overridden: got %q", got)
@@ -684,7 +684,7 @@ func BenchmarkSafariHeaders(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		req, _ := http.NewRequest("GET", "https://example.com", nil)
-		applySafariHeaders(req, "text/html", "en-US,en;q=0.9", modeNavigate)
+		applySafariHeaders(req, "text/html", "en-US,en;q=0.9", "", modeNavigate)
 	}
 }
 

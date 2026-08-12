@@ -501,6 +501,16 @@ the handover from the browser that earned it to the client that replays it:
 | JA3/JA4 | `-solve` implies `-p chrome`, since a real Chromium earned the cookie | works once, dies under load |
 | source IP | `-proxy` is handed to the solver, so it solves through the same exit | 403 from the first replay |
 
+The solver claims the OS it is actually running, which for most deployments is
+Linux — `Chrome151LinuxUserAgent`, the same Chrome 151 identity with the Linux
+OS token. Claiming Windows from a Linux box is a contradiction a JS challenge
+reads directly out of `navigator.platform` and the installed font set, and no
+page-level override fixes it honestly. The TLS layer does not move with the
+platform: BoringSSL sends the same ClientHello everywhere, so the pinned JA4 and
+Akamai fingerprint hold either way. `Sec-Ch-Ua-Platform` is derived from
+whatever User-Agent the request ends up with, so `-ua` and `-solve` stay
+self-consistent without a second knob.
+
 None of those fail loudly. A mismatch produces a cookie that works for one
 request and then stops, which looks exactly like the target simply blocking the
 client — so `send` refuses the combinations it cannot make consistent (`-p

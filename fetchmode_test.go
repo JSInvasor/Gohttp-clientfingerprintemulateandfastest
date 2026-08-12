@@ -16,7 +16,7 @@ func requestFor(t *testing.T, browser BrowserProfile, method, rawURL string, hea
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	applyBrowserHeaders(req, browser, defaultNavigateAccept, "en-US,en;q=0.9")
+	applyBrowserHeaders(req, browser, defaultNavigateAccept, "en-US,en;q=0.9", "")
 	return req
 }
 
@@ -201,7 +201,7 @@ func TestProfileDefaultAcceptBecomesWildcardOnFetch(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewRequest: %v", err)
 			}
-			applyBrowserHeaders(nav, cfg.browser, cfg.accept, cfg.acceptLanguage)
+			applyBrowserHeaders(nav, cfg.browser, cfg.accept, cfg.acceptLanguage, "")
 			if got := nav.Header.Get("Accept"); got != cfg.accept {
 				t.Errorf("navigation Accept = %q, want the profile default %q", got, cfg.accept)
 			}
@@ -211,7 +211,7 @@ func TestProfileDefaultAcceptBecomesWildcardOnFetch(t *testing.T) {
 				t.Fatalf("NewRequest: %v", err)
 			}
 			api.Header.Set("Content-Type", "application/json")
-			applyBrowserHeaders(api, cfg.browser, cfg.accept, cfg.acceptLanguage)
+			applyBrowserHeaders(api, cfg.browser, cfg.accept, cfg.acceptLanguage, "")
 			if got := api.Header.Get("Accept"); got != "*/*" {
 				t.Errorf("fetch Accept = %q, want */* (a document Accept beside Sec-Fetch-Dest: empty is a bot signal)", got)
 			}
@@ -231,7 +231,7 @@ func TestConfiguredAcceptSurvivesFetchMode(t *testing.T) {
 		t.Fatalf("NewRequest: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	applyBrowserHeaders(req, Chrome150, "application/vnd.api+json", "en-US")
+	applyBrowserHeaders(req, Chrome150, "application/vnd.api+json", "en-US", "")
 
 	if got := req.Header.Get("Accept"); got != "application/vnd.api+json" {
 		t.Errorf("Accept = %q, want the configured value", got)

@@ -70,7 +70,7 @@ func NewClient(opts ...Option) (*Client, error) {
 		// otherwise the stale value from the previous hop leaks through and
 		// no longer matches the actual origin transition.
 		req.Header.Del("Sec-Fetch-Site")
-		applyBrowserHeaders(req, cfg.browser, cfg.accept, cfg.acceptLanguage)
+		applyBrowserHeaders(req, cfg.browser, cfg.accept, cfg.acceptLanguage, cfg.userAgent)
 		return nil
 	}
 
@@ -198,17 +198,14 @@ func (c *Client) DoWithContext(ctx context.Context, method, rawURL string, body 
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		callerSetUA := req.Header.Get("User-Agent") != ""
 		if req.Header.Get("Referer") == "" && c.config.referer != "" {
 			req.Header.Set("Referer", c.config.referer)
 		}
 
-		applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage)
-
-		// Precedence: caller header > configured User-Agent > browser default.
-		if c.config.userAgent != "" && !callerSetUA {
-			req.Header.Set("User-Agent", c.config.userAgent)
-		}
+		// Precedence — caller header > configured User-Agent > browser default
+		// — is applied inside, because Sec-Ch-Ua-Platform is derived from the
+		// winner and cannot be settled before it is known.
+		applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage, c.config.userAgent)
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
@@ -316,11 +313,7 @@ func (c *Client) DoHTTPRequest(req *http.Request) (*Response, error) {
 	if c.config.referer != "" {
 		setIfEmpty(req.Header, "Referer", c.config.referer)
 	}
-	applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage)
-
-	if c.config.userAgent != "" {
-		req.Header.Set("User-Agent", c.config.userAgent)
-	}
+	applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage, c.config.userAgent)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -342,10 +335,7 @@ func (c *Client) PrepareRequest(method, rawURL string) (*http.Request, error) {
 	if c.config.referer != "" {
 		setIfEmpty(req.Header, "Referer", c.config.referer)
 	}
-	applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage)
-	if c.config.userAgent != "" {
-		req.Header.Set("User-Agent", c.config.userAgent)
-	}
+	applyBrowserHeaders(req, c.config.browser, c.config.accept, c.config.acceptLanguage, c.config.userAgent)
 	return req, nil
 }
 

@@ -132,10 +132,32 @@ func checkChromiumProbe(ref gofire.Reference, probe *chromiumProbe) []check {
 	// The UA the solver pins for the solved session must be the one gofire
 	// replays with, or the cookie is issued to one identity and presented by
 	// another.
-	if probe.SolverUserAgent == "" {
+	//
+	// The comparison is against the pinned UA for the solver's own platform,
+	// not against the profile's default one. The solver runs wherever it runs —
+	// a Linux VPS, most often — and claiming an OS it is not running is a
+	// mismatch a challenge can see from JS, so it pins the OS token it actually
+	// has. What has to match is the browser identity, which is what this checks
+	// once both sides are talking about the same platform.
+	switch {
+	case probe.SolverUserAgent == "":
 		skip("solver.user_agent", "probe reported no solver_user_agent")
-	} else {
-		add("solver.user_agent", ref.UserAgent, probe.SolverUserAgent)
+	default:
+		platform := gofire.PlatformFromUserAgent(probe.SolverUserAgent)
+		want, ok := gofire.ChromeUserAgentFor(platform)
+		if !ok {
+			skip("solver.user_agent", fmt.Sprintf(
+				"the solver runs on %q, which this client has no pinned Chrome UA for",
+				platform))
+			break
+		}
+		add("solver.user_agent", want, probe.SolverUserAgent)
+		if refPlatform := gofire.PlatformFromUserAgent(ref.UserAgent); refPlatform != platform {
+			skip("solver.platform", fmt.Sprintf(
+				"the solver runs on %s while the %s profile defaults to %s — replay with "+
+					"WithUserAgent(%q) so both name the same OS, which `send -solve` does for you",
+				platform, ref.Profile, refPlatform, want))
+		}
 	}
 
 	// The installed Chromium's own major version against the one the Go profile

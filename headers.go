@@ -196,7 +196,7 @@ var (
 // directly with already-canonical keys. http.Header.Set canonicalizes its key
 // on every call (allocates a temp byte slice), and for a fixed set of
 // well-known headers that's ~150-200ns per request of pure waste.
-func applySafariHeaders(req *http.Request, accept, lang string, mode fetchMode) {
+func applySafariHeaders(req *http.Request, accept, lang, userAgent string, mode fetchMode) {
 	h := req.Header
 	if h == nil {
 		h = make(http.Header, 10)
@@ -211,7 +211,11 @@ func applySafariHeaders(req *http.Request, accept, lang string, mode fetchMode) 
 		}
 	}
 	if _, ok := h["User-Agent"]; !ok {
-		h["User-Agent"] = safariUserAgent
+		if userAgent != "" {
+			h["User-Agent"] = []string{userAgent}
+		} else {
+			h["User-Agent"] = safariUserAgent
+		}
 	}
 	if _, ok := h["Accept"]; !ok {
 		h["Accept"] = []string{acceptFor(accept, mode)}
@@ -261,6 +265,20 @@ func applySafariHeaders(req *http.Request, accept, lang string, mode fetchMode) 
 // Chrome151UserAgent is the User-Agent string sent by Chrome 151 on Windows 10
 // x64. Verified against a real Chrome 151 capture from tls.peet.ws.
 const Chrome151UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+
+// Chrome151LinuxUserAgent is the same Chrome 151 identity with the Linux OS
+// token. The TLS and HTTP/2 layers do not move with the platform — BoringSSL
+// sends the same ClientHello everywhere, so the pinned JA4 and Akamai
+// fingerprint hold — but the OS token does, and so does Sec-Ch-Ua-Platform.
+//
+// It exists because the solver in solver/ drives a real Chromium, and a Linux
+// box running a browser that claims Windows contradicts itself the moment a
+// challenge reads navigator.platform or the installed fonts. Replaying a
+// cf_clearance earned there means sending the OS the browser actually ran.
+//
+// Pass it with WithUserAgent; Sec-Ch-Ua-Platform follows automatically, which
+// is the whole point of deriving that header from the UA rather than pinning it.
+const Chrome151LinuxUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 
 // Chrome150UserAgent, Chrome147UserAgent and Chrome146UserAgent are
 // backward-compatible aliases. They resolve to the Chrome 151 User-Agent so a
@@ -339,24 +357,32 @@ var chromeHeaderOrder = []string{
 
 // applyChromeHeaders sets exact Chrome 151 default headers on the request.
 // Only sets headers that are not already present, preserving user overrides.
-func applyChromeHeaders(req *http.Request, accept, lang string, mode fetchMode) {
+func applyChromeHeaders(req *http.Request, accept, lang, userAgent string, mode fetchMode) {
 	h := req.Header
 	if h == nil {
 		h = make(http.Header, 16)
 		req.Header = h
 	}
 
+	// The User-Agent is settled first because Sec-Ch-Ua-Platform is derived
+	// from it. That header used to be a hardcoded "Windows", so any caller
+	// overriding the UA — a Linux or macOS one, or the UA the solver reports
+	// back after earning a cf_clearance — kept advertising Windows and
+	// contradicted itself in the same request. A UA that disagrees with its
+	// Client Hints is the signal this file exists to avoid.
+	ua := resolveUserAgent(h, userAgent, Chrome151UserAgent)
+
 	// Chrome-specific Client Hints (Safari doesn't support them at all)
 	setIfEmpty(h, "Sec-Ch-Ua", Chrome151SecChUa)
 	setIfEmpty(h, "Sec-Ch-Ua-Mobile", "?0")
-	setIfEmpty(h, "Sec-Ch-Ua-Platform", `"Windows"`)
+	setIfEmpty(h, "Sec-Ch-Ua-Platform", secChUaPlatform(ua))
 	if mode == modeNavigate {
 		// Both are navigation-only. Upgrade-Insecure-Requests advertises what
 		// the document load will accept, and Sec-Fetch-User marks a
 		// user-activated navigation; neither appears on a fetch or XHR.
 		setIfEmpty(h, "Upgrade-Insecure-Requests", "1")
 	}
-	setIfEmpty(h, "User-Agent", Chrome151UserAgent)
+	h.Set("User-Agent", ua)
 	setIfEmpty(h, "Accept", acceptFor(accept, mode))
 	if origin := originFor(req, mode); origin != "" {
 		setIfEmpty(h, "Origin", origin)
@@ -381,13 +407,13 @@ func applyChromeHeaders(req *http.Request, accept, lang string, mode fetchMode) 
 
 // applyBrowserHeaders applies headers for the configured browser profile,
 // annotated for how a browser would have issued this request.
-func applyBrowserHeaders(req *http.Request, browser BrowserProfile, accept, lang string) {
+func applyBrowserHeaders(req *http.Request, browser BrowserProfile, accept, lang, userAgent string) {
 	mode := fetchModeFor(req)
 	switch browser {
 	case Chrome151:
-		applyChromeHeaders(req, accept, lang, mode)
+		applyChromeHeaders(req, accept, lang, userAgent, mode)
 	default:
-		applySafariHeaders(req, accept, lang, mode)
+		applySafariHeaders(req, accept, lang, userAgent, mode)
 	}
 }
 
@@ -395,6 +421,76 @@ func setIfEmpty(h http.Header, key, value string) {
 	if h.Get(key) == "" {
 		h.Set(key, value)
 	}
+}
+
+// resolveUserAgent applies the documented precedence — a header the caller put
+// on the request, then the client's configured User-Agent, then the profile
+// default — and returns the winner.
+//
+// It lives here rather than at the call sites because Sec-Ch-Ua-Platform is
+// derived from the result: settling the UA after the headers were built meant
+// the hint was computed from a User-Agent that had not been chosen yet.
+func resolveUserAgent(h http.Header, configured, fallback string) string {
+	if ua := h.Get("User-Agent"); ua != "" {
+		return ua
+	}
+	if configured != "" {
+		return configured
+	}
+	return fallback
+}
+
+// PlatformFromUserAgent reads the OS token out of a User-Agent and returns it
+// in the spelling Sec-Ch-Ua-Platform uses, unquoted. Returns "" when the UA
+// names no platform it recognises.
+func PlatformFromUserAgent(ua string) string {
+	switch {
+	case strings.Contains(ua, "Windows NT"):
+		return "Windows"
+	case strings.Contains(ua, "Android"):
+		// Checked before Linux: an Android UA names both.
+		return "Android"
+	case strings.Contains(ua, "iPhone"), strings.Contains(ua, "iPad"):
+		return "iOS"
+	case strings.Contains(ua, "Macintosh"), strings.Contains(ua, "Mac OS X"):
+		return "macOS"
+	case strings.Contains(ua, "CrOS"):
+		return "Chrome OS"
+	case strings.Contains(ua, "X11"), strings.Contains(ua, "Linux"):
+		return "Linux"
+	}
+	return ""
+}
+
+// ChromeUserAgentFor returns the pinned Chrome User-Agent for a platform token,
+// and whether one exists for it. The platform spelling is the one
+// PlatformFromUserAgent returns.
+//
+// It exists so a caller replaying a cookie earned by a browser on some other OS
+// — the solver in solver/, most of all — can ask for the matching identity
+// rather than assembling a UA string by hand.
+func ChromeUserAgentFor(platform string) (string, bool) {
+	switch platform {
+	case "Windows":
+		return Chrome151UserAgent, true
+	case "Linux":
+		return Chrome151LinuxUserAgent, true
+	}
+	return "", false
+}
+
+// secChUaPlatform returns the Sec-Ch-Ua-Platform value for a User-Agent, quoted
+// as the header carries it.
+//
+// Chrome reports one of a small closed set here, and it has to name the same
+// system as the UA's OS token. A UA naming none of them falls back to the
+// platform the pinned profile describes rather than inventing a value no Chrome
+// sends.
+func secChUaPlatform(ua string) string {
+	if p := PlatformFromUserAgent(ua); p != "" {
+		return `"` + p + `"`
+	}
+	return `"Windows"`
 }
 
 // secFetchSiteCache memoizes secFetchSiteFor results keyed by the
