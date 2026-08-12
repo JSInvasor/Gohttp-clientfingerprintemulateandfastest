@@ -414,18 +414,32 @@ the library gets, not what a bespoke harness arranged to happen.
 ```bash
 go run ./cmd/send https://site.com                    # one request, prints the response
 go run ./cmd/send -p chrome -i https://site.com       # Chrome profile, with headers
-go run ./cmd/send -t 30s -c 100 https://site.com      # run for 30s, 100 in flight
+go run ./cmd/send https://site.com 30s 100            # 30s, 100 threads
+go run ./cmd/send https://site.com 30s 100 8 500      # ...8 clients, held at 500 rps
+go run ./cmd/send https://site.com 1m 200 50 -proxy-file proxies.txt
 go run ./cmd/send -n 50000 -c 300 -mode pipeline https://site.com
-go run ./cmd/send -t 1m -c 200 -s 50 -proxy-file proxies.txt https://site.com
 go run ./cmd/send -fingerprint -p chrome              # the profile's reference values
 ```
 
-A load run has three dials: `-t` (or `-n`) for how long, `-c` for how wide, and
-`-s` for how many identities. A **session** is a separate `Client` — its own
-cookie jar, its own connection pool, and its own pinned proxy when
-`-proxy-file` is set. One session with 200 workers is one browser making 200
-parallel requests; 200 sessions with 200 workers is 200 browsers making one
-each, and a target that scores per-identity behaviour tells those apart.
+Running `send` with no arguments prints the usage, examples included.
+
+A load run has four dials, and each has a positional form taken in this order
+after the URL:
+
+```
+send URL [duration] [threads] [clients] [rate]
+          -t         -c        -s        -rps
+```
+
+Giving the flag skips that slot, so `send URL 100 -t 30s` means 100 threads.
+Anything the dials cannot place is reported rather than dropped — a dial that
+shifts by one runs the wrong shape and still prints a confident summary.
+
+A **client** is a separate `Client` — its own cookie jar, its own connection
+pool, and its own pinned proxy when `-proxy-file` is set. One client with 200
+threads is one browser making 200 parallel requests; 200 clients with 200
+threads is 200 browsers making one each, and a target that scores per-identity
+behaviour tells those apart.
 
 `-mode` picks the entry point, and the guarantees drop as throughput rises:
 
@@ -468,7 +482,7 @@ every session before the run starts:
 cd solver && npm install && cd ..
 
 go run ./cmd/send -solve https://site.com                       # solve, then one request
-go run ./cmd/send -solve -t 30s -c 100 https://site.com         # solve, then a load run
+go run ./cmd/send -solve https://site.com 30s 100                # solve, then a load run
 go run ./cmd/send -solve -proxy socks5://host:1080 https://site.com
 ```
 

@@ -4,30 +4,39 @@
 // It goes through Emulate and the ordinary Client methods rather than a bespoke
 // harness, so what it reports is what a program using this library gets.
 //
-// A run has three dials — how long, how wide, and how many identities:
+// A run has four dials, each with a positional form taken in this order after
+// the URL:
 //
-//	-t   how long to keep going (or -n for a fixed count)
-//	-c   how many requests are in flight at once
-//	-s   how many independent sessions those workers are spread across
+//	send URL [duration] [threads] [clients] [rate]
 //
-// A session is a separate Client: its own cookie jar, its own connection pool,
-// and — when a proxy list is loaded — its own pinned proxy. One session with
-// 200 workers is one browser making 200 parallel requests; 200 sessions with
-// 200 workers is 200 browsers making one each, and a target that scores
+//	-t    duration  how long to keep going (or -n for a fixed count)
+//	-c    threads   how many requests are in flight at once
+//	-s    clients   how many independent sessions those threads spread across
+//	-rps  rate      hold the whole run at this many requests per second
+//
+// Giving the flag skips that slot, so `send URL 100 -t 30s` means 100 threads.
+// Anything the dials cannot place is reported rather than dropped, because a
+// dial that shifts by one runs the wrong shape and still prints a summary.
+//
+// A client is a separate Client: its own cookie jar, its own connection pool,
+// and — when a proxy list is loaded — its own pinned proxy. One client with
+// 200 threads is one browser making 200 parallel requests; 200 clients with
+// 200 threads is 200 browsers making one each, and a target that scores
 // per-identity behaviour can tell those apart.
 //
 //	send https://site.com
 //	send -p chrome -i https://site.com
-//	send -t 30s -c 100 https://site.com
+//	send https://site.com 30s 100
+//	send https://site.com 30s 100 8 500
+//	send https://site.com 1m 200 50 -proxy-file proxies.txt
 //	send -n 50000 -c 300 -mode pipeline https://site.com
-//	send -t 1m -c 200 -s 50 -proxy-file proxies.txt https://site.com
 //	send -X POST -H 'Content-Type: application/json' -d '{"a":1}' https://site.com/api
 //
 // A target behind a Cloudflare challenge needs the cookie before the run: -solve
 // earns one with the real browser in solver/ and seeds it into every session.
 //
 //	send -solve https://site.com
-//	send -solve -t 30s -c 100 -proxy socks5://host:1080 https://site.com
+//	send -solve https://site.com 30s 100 -proxy socks5://host:1080
 package main
 
 import (
@@ -38,6 +47,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -304,14 +314,17 @@ func parseFlags(args []string) (*options, string, error) {
 		return nil, "", err
 	}
 
-	// Whether -p was actually typed decides what -solve is allowed to do with
-	// it: defaulting a profile the user never chose is helpful, overriding one
-	// they did choose would hide the mismatch that breaks the cookie.
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "p" || f.Name == "profile" {
-			o.profileSet = true
-		}
-	})
+	// Which flags were actually typed, rather than left at their default. A
+	// positional must not overwrite a flag the user gave, and "was it given"
+	// cannot be inferred from the value: -s defaults to 1, so a zero check
+	// cannot tell `-s 1` from an -s that was never mentioned.
+	given := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
+
+	// -solve leaves an unset profile alone to default to chrome, but must not
+	// override one the user chose: that would hide the mismatch that breaks the
+	// cookie rather than surface it.
+	o.profileSet = given["p"] || given["profile"]
 
 	target := ""
 	if len(posArgs) >= 1 {
@@ -320,36 +333,16 @@ func parseFlags(args []string) (*options, string, error) {
 			target = "https://" + target
 		}
 
-		argIdx := 1
-
-		// Positional Arg 1: Duration (e.g. 60 or 60s)
-		if argIdx < len(posArgs) && o.duration == 0 {
-			val := posArgs[argIdx]
-			if d, err := time.ParseDuration(val); err == nil && d > 0 {
-				o.duration = d
-				argIdx++
-			} else if sec, err := strconv.Atoi(val); err == nil && sec > 0 {
-				o.duration = time.Duration(sec) * time.Second
-				argIdx++
-			}
+		rest, err := applyPositionalDials(o, posArgs[1:], given)
+		if err != nil {
+			return nil, "", err
 		}
-
-		// Positional Arg 2: Concurrency / Threads (-c)
-		if argIdx < len(posArgs) && o.concurrency == 0 {
-			val := posArgs[argIdx]
-			if c, err := strconv.Atoi(val); err == nil && c > 0 {
-				o.concurrency = c
-				argIdx++
-			}
-		}
-
-		// Positional Arg 3: Rate / RPS (-rate / -rps)
-		if argIdx < len(posArgs) && o.rate == 0 {
-			val := posArgs[argIdx]
-			if r, err := strconv.Atoi(val); err == nil && r > 0 {
-				o.rate = r
-				argIdx++
-			}
+		if len(rest) > 0 {
+			// Silently dropping these is how `URL 30s 100 8 500` used to run
+			// with the wrong shape: the extra value landed nowhere and the run
+			// started anyway, reporting numbers for settings nobody asked for.
+			return nil, "", fmt.Errorf("unexpected argument %q — the positional dials are "+
+				"URL [duration] [threads] [clients] [rate]", rest[0])
 		}
 	}
 
@@ -445,19 +438,43 @@ func (o *options) normalize() error {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, `usage: send [flags] URL
+	fmt.Fprint(w, `usage: send URL [duration] [threads] [clients] [rate] [flags]
 
-A single request prints the response. Adding -n or -t turns it into a load run
-and prints a summary instead.
+A single request prints the response. Adding a duration — or -n — turns it into
+a load run and prints a summary instead.
+
+examples
+  send https://site.com                     one request, prints the response
+  send https://site.com -i                  the same, with response headers
+  send https://site.com 30s                 run for 30 seconds
+  send https://site.com 30s 100             ...with 100 threads
+  send https://site.com 30s 100 8           ...spread across 8 clients
+  send https://site.com 30s 100 8 500       ...held at 500 requests/sec
+  send https://site.com 60 200              a bare number is seconds
+
+  send -p chrome https://site.com           Chrome profile instead of Safari
+  send -solve https://site.com              solve a Cloudflare challenge first
+  send -solve https://site.com 30s 100      ...then load-test past it
+  send https://site.com 1m 200 50 -proxy-file proxies.txt
+  send -n 50000 -c 300 -mode pipeline https://site.com
+  send -X POST -H 'Content-Type: application/json' -d '{"a":1}' https://site.com/api
+  send -fingerprint -p chrome               the profile's reference values
+
+The four numbers after the URL are the load-shape dials, in that order. Each one
+is the positional form of a flag, and giving the flag skips that slot — so
+'send URL 100 -t 30s' means 100 threads. Anything that is not a positive number
+stops the walk and is reported rather than shifting the dials silently.
 
 load shape
   -n int          number of requests (default 1)
-  -t duration     run for this long instead of a fixed count, e.g. 30s, 5m
-  -c int          concurrent requests in flight (default 50 for a load run)
-  -s int          independent sessions to spread the workers across (default 1).
-                  Each is its own Client: own cookie jar, own connection pool,
-                  and own pinned proxy when -proxy-file is set
-  -rps int        hold the whole run at this many requests per second
+  -t duration     [1st] run for this long instead of a fixed count, e.g. 30s, 5m
+  -c int          [2nd] threads: concurrent requests in flight (default 50 for
+                  a load run)
+  -s int          [3rd] clients: independent sessions to spread the threads
+                  across (default 1). Each is its own Client: own cookie jar,
+                  own connection pool, and own pinned proxy when -proxy-file is
+                  set
+  -rps int        [4th] hold the whole run at this many requests per second
                   (0 = as fast as it will go). -rate is the same flag
 
   -mode string    client | fast | pipeline (default client)
@@ -592,8 +609,62 @@ func parseProfile(name string) (gofire.BrowserProfile, error) {
 	}
 }
 
+// applyPositionalDials fills the load-shape dials from the arguments following
+// the URL, in the order the usage text advertises:
+//
+//	URL [duration] [threads] [clients] [rate]
+//
+// It returns whatever it could not place, which the caller rejects. Each dial is
+// skipped when the matching flag was given, so `-t 30s URL 100` means 100
+// threads rather than a duration fighting with -t.
+//
+// A dial only consumes its argument when the value actually fits: anything that
+// is not a positive number stops the walk and comes back as leftover, so a typo
+// is reported rather than silently shifting every dial after it by one.
+func applyPositionalDials(o *options, args []string, given map[string]bool) ([]string, error) {
+	i := 0
+
+	// Duration accepts both 30s and a bare count of seconds.
+	if i < len(args) && !given["t"] {
+		if d, err := time.ParseDuration(args[i]); err == nil && d > 0 {
+			o.duration = d
+			i++
+		} else if sec, err := strconv.Atoi(args[i]); err == nil && sec > 0 {
+			o.duration = time.Duration(sec) * time.Second
+			i++
+		}
+	}
+
+	// The remaining three are plain positive counts.
+	dials := []struct {
+		flags []string
+		set   func(int)
+	}{
+		{[]string{"c"}, func(v int) { o.concurrency = v }},    // threads
+		{[]string{"s"}, func(v int) { o.sessions = v }},       // clients
+		{[]string{"rate", "rps"}, func(v int) { o.rate = v }}, // rate
+	}
+	for _, d := range dials {
+		if i >= len(args) {
+			break
+		}
+		if slices.ContainsFunc(d.flags, func(name string) bool { return given[name] }) {
+			continue
+		}
+		v, err := strconv.Atoi(args[i])
+		if err != nil || v <= 0 {
+			break
+		}
+		d.set(v)
+		i++
+	}
+
+	return args[i:], nil
+}
+
 // splitArgs separates positional arguments from flag options so that positional
-// parameters like URL, duration, concurrency, and rate can be given first before flags.
+// parameters like URL, duration, threads, clients and rate can be given before
+// the flags.
 func splitArgs(args []string) (posArgs []string, flagArgs []string) {
 	// Every boolean flag has to be listed here. A bool takes no value, so one
 	// that is missing swallows whatever follows it — `send -solve https://site`

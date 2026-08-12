@@ -255,18 +255,22 @@ func TestSolveDoesNotSwallowTheURL(t *testing.T) {
 	}
 }
 
-// The positional form still has to reach the load-shape dials with -solve in
-// front of it, since that is the combination the README shows.
+// The positional dials still have to arrive intact with -solve in front of
+// them, since that is the combination the usage text shows.
 func TestSolveWithPositionalLoadShape(t *testing.T) {
-	o, target, err := parseFlags([]string{"-solve", "site.test", "30s", "100", "500"})
+	o, target, err := parseFlags([]string{"-solve", "site.test", "30s", "100", "8", "500"})
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
 	}
 	if target != "https://site.test" {
 		t.Errorf("target = %q", target)
 	}
-	if o.duration != 30*time.Second || o.concurrency != 100 || o.rate != 500 {
-		t.Errorf("duration=%s concurrency=%d rate=%d", o.duration, o.concurrency, o.rate)
+	if o.duration != 30*time.Second || o.concurrency != 100 || o.sessions != 8 || o.rate != 500 {
+		t.Errorf("duration=%s threads=%d clients=%d rate=%d",
+			o.duration, o.concurrency, o.sessions, o.rate)
+	}
+	if !o.solve {
+		t.Error("-solve was not set")
 	}
 }
 
