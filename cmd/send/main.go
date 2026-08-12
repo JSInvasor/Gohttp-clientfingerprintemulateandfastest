@@ -32,6 +32,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -265,21 +266,53 @@ func parseFlags(args []string) (*options, string, error) {
 	fs.BoolVar(&o.asJSON, "json", false, "")
 	fs.BoolVar(&o.fingerprint, "fingerprint", false, "")
 
+	posArgs, flagArgs := splitArgs(args)
+
 	fs.Usage = func() { printUsage(fs.Output()) }
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagArgs); err != nil {
 		return nil, "", err
 	}
 
-	if fs.NArg() > 1 {
-		return nil, "", fmt.Errorf("expected one URL, got %d arguments", fs.NArg())
-	}
 	target := ""
-	if fs.NArg() == 1 {
-		target = fs.Arg(0)
+	if len(posArgs) >= 1 {
+		target = posArgs[0]
 		if !strings.Contains(target, "://") {
 			target = "https://" + target
 		}
+
+		argIdx := 1
+
+		// Positional Arg 1: Duration (e.g. 60 or 60s)
+		if argIdx < len(posArgs) && o.duration == 0 {
+			val := posArgs[argIdx]
+			if d, err := time.ParseDuration(val); err == nil && d > 0 {
+				o.duration = d
+				argIdx++
+			} else if sec, err := strconv.Atoi(val); err == nil && sec > 0 {
+				o.duration = time.Duration(sec) * time.Second
+				argIdx++
+			}
+		}
+
+		// Positional Arg 2: Concurrency / Threads (-c)
+		if argIdx < len(posArgs) && o.concurrency == 0 {
+			val := posArgs[argIdx]
+			if c, err := strconv.Atoi(val); err == nil && c > 0 {
+				o.concurrency = c
+				argIdx++
+			}
+		}
+
+		// Positional Arg 3: Rate / RPS (-rate / -rps)
+		if argIdx < len(posArgs) && o.rate == 0 {
+			val := posArgs[argIdx]
+			if r, err := strconv.Atoi(val); err == nil && r > 0 {
+				o.rate = r
+				argIdx++
+			}
+		}
 	}
+
 	if target == "" && !o.fingerprint {
 		printUsage(os.Stderr)
 		return nil, "", errors.New("exactly one URL is required")
@@ -476,4 +509,39 @@ func parseProfile(name string) (gofire.BrowserProfile, error) {
 	default:
 		return 0, fmt.Errorf("unknown browser profile %q (want safari or chrome)", name)
 	}
+}
+
+// splitArgs separates positional arguments from flag options so that positional
+// parameters like URL, duration, concurrency, and rate can be given first before flags.
+func splitArgs(args []string) (posArgs []string, flagArgs []string) {
+	boolFlags := map[string]bool{
+		"-proxy-stats": true,
+		"-http1":       true,
+		"-insecure":    true,
+		"-no-redirect": true,
+		"-no-keepalive":true,
+		"-tfo":         true,
+		"-i":           true,
+		"-silent":      true,
+		"-json":        true,
+		"-fingerprint": true,
+	}
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if strings.HasPrefix(arg, "-") {
+			flagArgs = append(flagArgs, arg)
+			if strings.Contains(arg, "=") {
+				continue
+			}
+			flagName := strings.TrimLeft(arg, "-")
+			if !boolFlags["-"+flagName] && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				flagArgs = append(flagArgs, args[i])
+			}
+		} else {
+			posArgs = append(posArgs, arg)
+		}
+	}
+	return posArgs, flagArgs
 }
