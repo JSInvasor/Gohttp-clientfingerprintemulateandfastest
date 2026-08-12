@@ -438,9 +438,26 @@ each, and a target that scores per-identity behaviour tells those apart.
 Response bodies are always drained rather than abandoned. Closing an unfinished
 body makes HTTP/2 emit RST_STREAM, which is the abusive-client signal this
 package exists to avoid — measuring throughput must not be the thing that
-produces it. `-rate` caps the whole run, `-json` prints the summary as JSON, and
-`send -h` lists the transport knobs (`-max-streams`, `-idle-conns`, `-sockbuf`,
-`-tfo`, …).
+produces it.
+
+A run reports itself once a second, live, and the rate it prints is the one over
+the second just ended rather than the running average — that is what shows a
+target starting to throttle or a proxy pool going bad, neither of which is
+visible in a number that keeps averaging in the healthy start:
+
+```
+$ go run ./cmd/send -t 60s -c 100 https://site.com
+0:01  sent 22564  now 22.6k/s  avg 22.6k/s  ok 22564  failed 0  59s left
+0:02  sent 47525  now 25.0k/s  avg 23.8k/s  ok 47526  failed 0  58s left
+...
+rps      avg 24.2k   peak 26.0k   low 22.6k   over 60 seconds
+         ▇▇▇▇▇▇▇█▇▇▇▆▅▃▂▂▂▂▂▂
+latency  min 80µs   p50 2.3ms   p90 4ms   p99 5.9ms   max 35.2ms
+```
+
+`-rps N` holds the run at a fixed rate instead of going flat out, `-json` prints
+the summary — per-second series included — as JSON, and `send -h` lists the
+transport knobs (`-max-streams`, `-idle-conns`, `-sockbuf`, `-tfo`, …).
 
 ## What happens when a handshake fails
 

@@ -31,6 +31,12 @@ type stats struct {
 	// start of the run the way a "keep the first N" cap would be.
 	latencies []time.Duration
 	stride    int64
+
+	// perSecond is the completed-request rate over each whole second of the
+	// run. The average alone hides the shape: a run that opens at 30k and is
+	// throttled to 2k after ten seconds averages out to something that never
+	// happened, and on a minute-long run that shape is the result.
+	perSecond []float64
 }
 
 const maxLatencySamples = 1 << 21 // ~2M samples, 16 MiB
@@ -92,6 +98,36 @@ func (s *stats) record(index int64, d time.Duration, code int, err error) {
 	s.mu.Unlock()
 }
 
+// addPerSecond records the rate observed over one tick of the progress loop.
+func (s *stats) addPerSecond(rate float64) {
+	s.mu.Lock()
+	s.perSecond = append(s.perSecond, rate)
+	s.mu.Unlock()
+}
+
+// rpsSummary reduces the per-second series to the three numbers worth printing.
+// ok reports whether the run lasted long enough to have any.
+type rpsSummary struct {
+	peak, low float64
+	ok        bool
+}
+
+func summarizeRPS(series []float64) rpsSummary {
+	if len(series) == 0 {
+		return rpsSummary{}
+	}
+	out := rpsSummary{peak: series[0], low: series[0], ok: true}
+	for _, v := range series[1:] {
+		if v > out.peak {
+			out.peak = v
+		}
+		if v < out.low {
+			out.low = v
+		}
+	}
+	return out
+}
+
 // classify trims the per-request noise out of an error so the summary groups by
 // cause instead of listing one line per ephemeral port.
 func classify(err error) string {
@@ -112,18 +148,28 @@ func classify(err error) string {
 	return msg
 }
 
-// progress redraws a live line while the run is in flight, so a long or stalled
-// run is visible rather than silent. It returns when the run finishes.
+// progress samples the run once a second and reports it live. It returns when
+// the run finishes.
 //
-// The line is redrawn in place, which only works on a terminal — piped into a
-// file the carriage returns and the erase sequence are literal bytes in the
-// output — so anywhere else it is simply not drawn.
+// Each tick measures the rate over the interval just ended rather than the
+// running average, because those answer different questions: the average tells
+// you what the run achieved, the instantaneous rate tells you what it is doing
+// now — which is what shows a target starting to throttle, a proxy pool going
+// bad, or a warm-up finishing. Both are printed; the per-second series is kept
+// for the summary.
+//
+// On a terminal the line is redrawn in place. Anywhere else the carriage
+// returns would be literal bytes in the output, so each tick is printed as its
+// own line instead — a piped run still gets its timeline.
 func progress(ctx context.Context, done <-chan struct{}, st *stats, o *options, start time.Time) {
-	enabled := !o.asJSON && isTerminal(os.Stderr)
+	tty := isTerminal(os.Stderr)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
+	lastSent := int64(0)
+	lastTick := start
 	drew := false
+
 	for {
 		select {
 		case <-done:
@@ -131,30 +177,129 @@ func progress(ctx context.Context, done <-chan struct{}, st *stats, o *options, 
 				fmt.Fprint(os.Stderr, "\r\033[K")
 			}
 			return
-		case <-ticker.C:
-			if !enabled {
+
+		case now := <-ticker.C:
+			sent := st.sent.Load()
+			interval := now.Sub(lastTick).Seconds()
+			instant := 0.0
+			if interval > 0 {
+				instant = float64(sent-lastSent) / interval
+			}
+			lastSent, lastTick = sent, now
+
+			// Recorded even under -json, which prints no live output but still
+			// reports the series in its summary.
+			st.addPerSecond(instant)
+			if o.asJSON {
 				continue
 			}
-			sent := st.sent.Load()
-			elapsed := time.Since(start)
-			scope := fmt.Sprintf("%d/%d", sent, o.count)
-			if o.duration > 0 {
+
+			elapsed := now.Sub(start)
+			line := fmt.Sprintf("%s  sent %d  now %s/s  avg %s/s  ok %d  failed %d",
+				clock(elapsed), sent, formatRate(instant),
+				formatRate(float64(sent)/elapsed.Seconds()), st.ok.Load(), st.failed.Load())
+			switch {
+			case o.duration > 0:
 				remaining := o.duration - elapsed
 				if remaining < 0 {
 					remaining = 0
 				}
-				scope = fmt.Sprintf("%d sent, %s left", sent, remaining.Round(time.Second))
+				line += fmt.Sprintf("  %s left", remaining.Round(time.Second))
+			case o.count > 0:
+				line += fmt.Sprintf("  %d left", max(int64(o.count)-sent, 0))
 			}
-			fmt.Fprintf(os.Stderr, "\r%s  %.0f req/s  %d failed   ",
-				scope, float64(sent)/elapsed.Seconds(), st.failed.Load())
-			drew = true
+
+			if tty {
+				fmt.Fprintf(os.Stderr, "\r\033[K%s", line)
+				drew = true
+			} else {
+				fmt.Fprintln(os.Stderr, line)
+			}
 		}
 	}
+}
+
+// clock renders an elapsed duration as m:ss, which is easier to read at a
+// glance during a minute-long run than Go's default formatting.
+func clock(d time.Duration) string {
+	total := int(d.Round(time.Second).Seconds())
+	return fmt.Sprintf("%d:%02d", total/60, total%60)
+}
+
+// formatRate keeps the live line from jittering in width as the rate crosses
+// powers of ten.
+func formatRate(v float64) string {
+	switch {
+	case v >= 100000:
+		return fmt.Sprintf("%.0fk", v/1000)
+	case v >= 10000:
+		return fmt.Sprintf("%.1fk", v/1000)
+	default:
+		return fmt.Sprintf("%.0f", v)
+	}
+}
+
+// sparkline draws the per-second series as one line of block characters,
+// downsampled so a long run still fits on a terminal.
+//
+// The shape is the point: a flat bar means a steady run, a cliff means the
+// target started refusing, a ramp means the connection pool was still warming.
+// None of that survives being averaged into a single number.
+func sparkline(series []float64, width int) string {
+	if len(series) < 2 {
+		return ""
+	}
+	const blocks = "▁▂▃▄▅▆▇█"
+	levels := []rune(blocks)
+
+	// Downsample by averaging into buckets rather than dropping samples, so a
+	// brief stall in a long run still moves its column instead of vanishing
+	// between two kept points.
+	buckets := series
+	if len(series) > width {
+		buckets = make([]float64, width)
+		for i := range buckets {
+			lo := i * len(series) / width
+			hi := (i + 1) * len(series) / width
+			if hi <= lo {
+				hi = lo + 1
+			}
+			sum := 0.0
+			for _, v := range series[lo:hi] {
+				sum += v
+			}
+			buckets[i] = sum / float64(hi-lo)
+		}
+	}
+
+	peak := 0.0
+	for _, v := range buckets {
+		if v > peak {
+			peak = v
+		}
+	}
+	if peak <= 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	for _, v := range buckets {
+		idx := int(v / peak * float64(len(levels)-1))
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(levels) {
+			idx = len(levels) - 1
+		}
+		b.WriteRune(levels[idx])
+	}
+	return b.String()
 }
 
 func report(st *stats, elapsed time.Duration, pool *sessionPool, o *options) error {
 	st.mu.Lock()
 	lat := append([]time.Duration(nil), st.latencies...)
+	series := append([]float64(nil), st.perSecond...)
 	statuses := make(map[int]int, len(st.statuses))
 	for k, v := range st.statuses {
 		statuses[k] = v
@@ -173,6 +318,7 @@ func report(st *stats, elapsed time.Duration, pool *sessionPool, o *options) err
 		rps = float64(sent) / elapsed.Seconds()
 	}
 	conns := pool.connections()
+	shape := summarizeRPS(series)
 
 	if o.asJSON {
 		out := map[string]any{
@@ -197,14 +343,32 @@ func report(st *stats, elapsed time.Duration, pool *sessionPool, o *options) err
 				"max": ms(percentile(lat, 100)),
 			},
 		}
+		if shape.ok {
+			out["rps_peak"] = shape.peak
+			out["rps_low"] = shape.low
+			out["rps_per_second"] = series
+		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(out)
 	}
 
-	fmt.Fprintf(os.Stderr, "\n%d requests in %s — %.0f req/s\n", sent, round(elapsed), rps)
+	fmt.Fprintf(os.Stderr, "\n%d requests in %s\n", sent, round(elapsed))
 	fmt.Fprintf(os.Stderr, "ok %d   failed %d   tls connections %d   body %s\n",
 		st.ok.Load(), st.failed.Load(), conns, humanBytes(st.bodyBytes.Load()))
+
+	// The average is what the run achieved; peak and low are what it did along
+	// the way, and on anything longer than a few seconds those are the numbers
+	// that say whether the target held up.
+	if shape.ok {
+		fmt.Fprintf(os.Stderr, "rps      avg %s   peak %s   low %s   over %d seconds\n",
+			formatRate(rps), formatRate(shape.peak), formatRate(shape.low), len(series))
+		if line := sparkline(series, 60); line != "" {
+			fmt.Fprintf(os.Stderr, "         %s\n", line)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "rps      avg %s\n", formatRate(rps))
+	}
 
 	if len(lat) > 0 {
 		fmt.Fprintf(os.Stderr, "latency  min %s   p50 %s   p90 %s   p99 %s   max %s\n",

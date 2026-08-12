@@ -218,6 +218,7 @@ func parseFlags(args []string) (*options, string, error) {
 	fs.IntVar(&o.concurrency, "c", 0, "")
 	fs.IntVar(&o.sessions, "s", 1, "")
 	fs.IntVar(&o.rate, "rate", 0, "")
+	fs.IntVar(&o.rate, "rps", 0, "")
 	fs.StringVar(&o.mode, "mode", modeClient, "")
 	fs.IntVar(&o.warmup, "warmup", 0, "")
 
@@ -355,7 +356,9 @@ load shape
   -s int          independent sessions to spread the workers across (default 1).
                   Each is its own Client: own cookie jar, own connection pool,
                   and own pinned proxy when -proxy-file is set
-  -rate int       cap the whole run at this many requests per second (0 = full speed)
+  -rps int        hold the whole run at this many requests per second
+                  (0 = as fast as it will go). -rate is the same flag
+
   -mode string    client | fast | pipeline (default client)
                     client   Client.Do — cookie jar, redirects, retries
                     fast     FastDo on a prepared template — none of the above
