@@ -125,6 +125,9 @@ type options struct {
 	solve        bool
 	solverDir    string
 	solveTimeout time.Duration
+	solveCache   string
+	solveRefresh bool
+	solveMaxAge  time.Duration
 
 	// Proxy
 	proxy         string
@@ -271,6 +274,9 @@ func parseFlags(args []string) (*options, string, error) {
 	fs.BoolVar(&o.solve, "solve", false, "")
 	fs.StringVar(&o.solverDir, "solver-dir", "solver", "")
 	fs.DurationVar(&o.solveTimeout, "solve-timeout", defaultSolveTimeout, "")
+	fs.StringVar(&o.solveCache, "solve-cache", defaultSolveCachePath(), "")
+	fs.BoolVar(&o.solveRefresh, "solve-refresh", false, "")
+	fs.DurationVar(&o.solveMaxAge, "solve-max-age", 30*time.Minute, "")
 
 	// Proxy
 	fs.StringVar(&o.proxy, "proxy", "", "")
@@ -499,6 +505,11 @@ cloudflare
                         UA and TLS fingerprint that earned it, and the solver
                         drives a real Chromium. Needs npm install in solver/
   -solver-dir path      where index.js and node_modules live (default solver)
+  -solve-cache path     reuse a still-valid solve instead of earning a new one.
+                        Most of a solve is Cloudflare's own challenge, so this is
+                        what makes the second run instant. Empty disables it
+  -solve-refresh        ignore the cache and solve fresh
+  -solve-max-age dur    how old a cached solve may be (default 30m)
   -solve-timeout dur    how long the solve may take (default 150s). Browser
                         startup comes out of this, so a small VPS needs more
 
@@ -673,17 +684,18 @@ func splitArgs(args []string) (posArgs []string, flagArgs []string) {
 	// given. There is no way to derive this from the FlagSet at this point,
 	// because the split has to happen before Parse.
 	boolFlags := map[string]bool{
-		"-proxy-stats":  true,
-		"-http1":        true,
-		"-insecure":     true,
-		"-no-redirect":  true,
-		"-no-keepalive": true,
-		"-tfo":          true,
-		"-i":            true,
-		"-silent":       true,
-		"-json":         true,
-		"-fingerprint":  true,
-		"-solve":        true,
+		"-proxy-stats":   true,
+		"-http1":         true,
+		"-insecure":      true,
+		"-no-redirect":   true,
+		"-no-keepalive":  true,
+		"-tfo":           true,
+		"-i":             true,
+		"-silent":        true,
+		"-json":          true,
+		"-fingerprint":   true,
+		"-solve":         true,
+		"-solve-refresh": true,
 	}
 
 	for i := 0; i < len(args); i++ {

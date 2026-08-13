@@ -520,6 +520,27 @@ safari`, `-proxy-file`) rather than letting them fail that way at runtime.
 while a rotator hands each session a different exit. Solving per session is a
 different design, not a flag.
 
+A solve is slow because most of it is Cloudflare's own challenge — its
+JavaScript runs, the Turnstile widget executes, the edge decides. A real browser
+pays that too, so there is nothing to optimise away; what there is, is not
+paying it twice. The clearance is cached and reused while it is still valid:
+
+```
+$ send -solve https://site.com          # first run
+solving https://site.com with the browser in solver/ (direct, up to 2m30s)
+solved in 1m11s, 1 attempt(s), 1 cookie(s), chromium Chrome/151.0.7922.108
+
+$ send -solve https://site.com          # every run after
+reusing the solve from 2m14s ago (1 cookie(s), expires in 27m45s)
+```
+
+The entry is keyed by host **and** proxy, because `cf_clearance` is bound to the
+IP that earned it — a run through a different exit gets a miss rather than a
+dead cookie. `-solve-refresh` forces a new solve, `-solve-max-age` caps how old
+an entry may be (default 30m, since Cloudflare can invalidate server-side well
+before the stated expiry), and `-solve-cache ""` turns it off. The file is
+written 0600: it holds a bearer token for the origin.
+
 `-solver-dir` points at a solver checkout somewhere else, and `-solve-timeout`
 bounds the solve (default 150s). Browser startup comes out of that budget and
 costs ~20s on a small VPS, twice if the first attempt is retried, so a small

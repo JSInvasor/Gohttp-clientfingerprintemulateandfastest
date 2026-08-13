@@ -63,9 +63,10 @@ type solveResult struct {
 }
 
 type solvedCookie struct {
-	Name   string `json:"name"`
-	Value  string `json:"value"`
-	Domain string `json:"domain"`
+	Name    string  `json:"name"`
+	Value   string  `json:"value"`
+	Domain  string  `json:"domain"`
+	Expires float64 `json:"expires"`
 }
 
 // clearance returns the cf_clearance cookie, if the solve produced one.
@@ -177,6 +178,16 @@ func decodeSolve(b []byte) (*solveResult, error) {
 // session pool is about to be built from, so the solved cookies and UA arrive
 // through the same paths -cookie and -ua already use.
 func solveAndSeed(ctx context.Context, o *options, profile gofire.BrowserProfile, target string) error {
+	// A cookie that is still valid is worth more than a fresh one: it costs
+	// nothing and it is the same cookie. Most of a solve is the edge's own
+	// challenge, so this is the only real answer to "the solve takes too long".
+	if !o.solveRefresh {
+		if e := loadSolveCache(o.solveCache, target, o.proxy, o.solveMaxAge); e != nil {
+			seedFromCache(o, e)
+			return nil
+		}
+	}
+
 	where := "direct"
 	if o.proxy != "" {
 		where = "via " + o.proxy
@@ -248,6 +259,9 @@ func solveAndSeed(ctx context.Context, o *options, profile gofire.BrowserProfile
 
 	for _, c := range res.CookieList {
 		o.cookies = append(o.cookies, c.Name+"="+c.Value)
+	}
+	if gotClearance {
+		storeSolveCache(o.solveCache, target, o.proxy, res)
 	}
 	return nil
 }
