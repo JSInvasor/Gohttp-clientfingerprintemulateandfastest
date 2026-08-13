@@ -160,6 +160,7 @@ type options struct {
 	connsPerHost  int
 	sockBuf       int
 	fastOpen      bool
+	tlsResume     bool
 	maxBody       int64
 
 	// Output
@@ -313,6 +314,7 @@ func parseFlags(args []string) (*options, string, error) {
 	fs.IntVar(&o.connsPerHost, "conns-per-host", 0, "")
 	fs.IntVar(&o.sockBuf, "sockbuf", 0, "")
 	fs.BoolVar(&o.fastOpen, "tfo", false, "")
+	fs.BoolVar(&o.tlsResume, "tls-resume", false, "")
 	fs.Int64Var(&o.maxBody, "max-body", -1, "")
 
 	// Output
@@ -563,6 +565,10 @@ network
   -conns-per-host int   hard cap on connections per host
   -sockbuf bytes        SO_RCVBUF / SO_SNDBUF size (Linux)
   -tfo                  enable TCP Fast Open (Linux; no browser does this)
+  -tls-resume           offer a cached TLS 1.3 ticket on repeat connections, as a
+                        browser does. Off by default: the PSK adds an extension and
+                        moves JA4 to t13d1517h2, so connections after the first carry
+                        a different fingerprint. Measure it on your target first
   -max-body bytes       response body ceiling, 0 for unlimited
 
 output
@@ -705,6 +711,7 @@ func splitArgs(args []string) (posArgs []string, flagArgs []string) {
 		"-no-redirect":   true,
 		"-no-keepalive":  true,
 		"-tfo":           true,
+		"-tls-resume":    true,
 		"-i":             true,
 		"-silent":        true,
 		"-json":          true,

@@ -140,6 +140,7 @@ func clientOptions(o *options) []gofire.Option {
 	add(o.connsPerHost > 0, gofire.WithMaxConnsPerHost(o.connsPerHost))
 	add(o.sockBuf > 0, gofire.WithSocketBuffers(o.sockBuf, o.sockBuf))
 	add(o.fastOpen, gofire.WithTCPFastOpen())
+	add(o.tlsResume, gofire.WithTLSSessionResumption())
 	add(o.lang != "", gofire.WithAcceptLanguage(o.lang))
 	add(o.accept != "", gofire.WithAccept(o.accept))
 	add(o.userAgent != "", gofire.WithUserAgent(o.userAgent))
