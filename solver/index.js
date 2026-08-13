@@ -1,7 +1,7 @@
 // Single-shot Cloudflare UAM solver.
 //
 // Usage:
-//   node solver/index.js <url> [timeout_sec=75]
+//   node solver/index.js <url> [timeout_sec=150]
 //
 // Environment:
 //   SOLVER_PROXY   scheme://[user:pass@]host:port — solve through this proxy.
@@ -19,6 +19,7 @@
 //     "chromium_version": "<browser.version()>",
 //     "chromium_major": <int>,
 //     "proxy": "<host:port>",                 // "" when solved direct
+//     "launch_ms": <int>,                     // browser startup, out of the budget
 //     "error": "<message>" }                  // only on error
 //
 // Design (one-shot, no server):
@@ -58,7 +59,14 @@ import {
 import { cookiesForUrl } from "./cookies.js";
 
 const MAX_ATTEMPTS = 2;
-const DEFAULT_TIMEOUT_SEC = 75;
+// 75 was too small on a real box. Chromium under Xvfb takes ~20s to come up,
+// the budget is split across two attempts, and the launch is charged against
+// each — so a 75s budget left one attempt 25s of solving and the other 9s, and
+// a managed challenge with a Turnstile widget needs 15-30s. Measured against a
+// live UAM: 75s failed with no cookie at all, 180s solved on the first attempt
+// in 71s. The default is the value that works unattended; a fast machine simply
+// finishes early, since the budget is a ceiling and not a wait.
+const DEFAULT_TIMEOUT_SEC = 150;
 
 // Exactly one result line is ever printed. Every exit path goes through
 // finish(), and this guard is what keeps a late watchdog or a stray rejection
@@ -399,6 +407,7 @@ async function attempt(attemptNum, attemptDeadline) {
   let page = null;
   let chromiumVersion = "";
   let chromiumMajor = 0;
+  let launchMs = 0;
 
   try {
     // connect() is unbounded on its own, and on a slow box it is the longest
@@ -406,11 +415,13 @@ async function attempt(attemptNum, attemptDeadline) {
     // two launches happened outside it. Racing it against the deadline keeps
     // the budget meaning what it says, and a launch that loses the race is a
     // real failure — the alternative is a browser nobody is waiting for.
+    const launchStart = Date.now();
     const launched = await withDeadline(
       launch(),
       attemptDeadline,
       "browser launch did not finish before the attempt deadline"
     );
+    launchMs = Date.now() - launchStart;
     browser = launched.browser;
     chromiumVersion = launched.chromiumVersion;
     chromiumMajor = launched.chromiumMajor;
@@ -431,7 +442,7 @@ async function attempt(attemptNum, attemptDeadline) {
       // challenge page itself, and abandoning the attempt used to throw it away,
       // so a run whose retry also failed reported nothing at all when it had in
       // fact collected something usable.
-      return { ...(await harvest(browser, page)), chromiumVersion, chromiumMajor };
+      return { ...(await harvest(browser, page)), chromiumVersion, chromiumMajor, launchMs };
     }
 
     // Whether clearance was present or not, harvest behavior data so even
@@ -439,7 +450,7 @@ async function attempt(attemptNum, attemptDeadline) {
     await simulateHumanBehavior(page);
 
     // Re-read cookies post-behavior (interaction can elevate __cf_bm).
-    return { ...(await harvest(browser, page)), chromiumVersion, chromiumMajor };
+    return { ...(await harvest(browser, page)), chromiumVersion, chromiumMajor, launchMs };
   } catch (err) {
     // Harvest before giving up. A navigation timeout or a deadline hit is not a
     // reason to throw away cookies the challenge page already set — a run whose
@@ -455,6 +466,7 @@ async function attempt(attemptNum, attemptDeadline) {
       error: errorMessage(err),
       chromiumVersion,
       chromiumMajor,
+      launchMs,
     };
   } finally {
     // Always tear the session down before the caller decides whether to retry:
@@ -522,6 +534,7 @@ async function solve() {
         chromium_version: r.chromiumVersion || "",
         chromium_major: r.chromiumMajor || 0,
         proxy: PROXY_LABEL,
+        launch_ms: r.launchMs || 0,
       };
       return finish(out);
     }
@@ -547,6 +560,7 @@ async function solve() {
       chromium_version: lastResult.chromiumVersion || "",
       chromium_major: lastResult.chromiumMajor || 0,
       proxy: PROXY_LABEL,
+      launch_ms: lastResult.launchMs || 0,
     };
     return finish(out);
   }
@@ -559,6 +573,7 @@ async function solve() {
     chromium_version: (lastResult && lastResult.chromiumVersion) || "",
     chromium_major: (lastResult && lastResult.chromiumMajor) || 0,
     proxy: PROXY_LABEL,
+    launch_ms: (lastResult && lastResult.launchMs) || 0,
   }, 1);
 }
 

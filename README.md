@@ -521,7 +521,13 @@ while a rotator hands each session a different exit. Solving per session is a
 different design, not a flag.
 
 `-solver-dir` points at a solver checkout somewhere else, and `-solve-timeout`
-bounds the solve (default 75s). A run continues even when no `cf_clearance`
+bounds the solve (default 150s). Browser startup comes out of that budget and
+costs ~20s on a small VPS, twice if the first attempt is retried, so a small
+timeout can leave a managed challenge no time to solve in — against a live UAM,
+75s failed with no cookie at all while 150s cleared it on the first attempt in
+71s. The solver reports `launch_ms` so the arithmetic is visible, and `send`
+says so when startup ate most of the budget. A run continues even when no
+`cf_clearance`
 appears — a target behind Bot Fight Mode alone never issues one, and the
 `__cf_bm` the solve did earn is what carries the session — but it says so.
 

@@ -40,6 +40,13 @@ import (
 // requested.
 const minSolveTimeout = 10 * time.Second
 
+// defaultSolveTimeout is generous on purpose. Chromium under Xvfb takes ~20s to
+// come up and that comes out of every attempt, so the old 75s left a managed
+// challenge almost no time to actually solve in. Measured against a live UAM:
+// 75s failed with no cookie, 150s+ solved on the first attempt in 71s. It is a
+// ceiling, not a wait — a fast box finishes early.
+const defaultSolveTimeout = 150 * time.Second
+
 // solveResult is what solver/index.js prints.
 type solveResult struct {
 	Status     string         `json:"status"`
@@ -52,6 +59,7 @@ type solveResult struct {
 	Attempts   int            `json:"attempts"`
 	Chromium   string         `json:"chromium_version"`
 	Proxy      string         `json:"proxy"`
+	LaunchMS   int64          `json:"launch_ms"`
 }
 
 type solvedCookie struct {
@@ -185,6 +193,17 @@ func solveAndSeed(ctx context.Context, o *options, profile gofire.BrowserProfile
 	fmt.Fprintf(os.Stderr, "solved in %s, %d attempt(s), %d cookie(s), chromium %s\n",
 		round(time.Duration(res.DurationMS)*time.Millisecond), res.Attempts,
 		len(res.CookieList), res.Chromium)
+
+	// The budget is what the browser startup does not eat. A challenge with a
+	// Turnstile widget needs 15-30s of it, and a launch on a small VPS takes
+	// 20s of every attempt — which is how a run fails with no cookie at all
+	// while looking like the target simply refused.
+	if launch := time.Duration(res.LaunchMS) * time.Millisecond; launch > 0 {
+		if solving := o.solveTimeout - launch*time.Duration(max(res.Attempts, 1)); solving < 20*time.Second {
+			fmt.Fprintf(os.Stderr, "note: browser startup took %s of the %s budget — "+
+				"raise -solve-timeout if the challenge does not clear\n", round(launch), o.solveTimeout)
+		}
+	}
 
 	switch {
 	case gotClearance:

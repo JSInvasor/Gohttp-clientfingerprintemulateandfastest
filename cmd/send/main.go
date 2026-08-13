@@ -270,7 +270,7 @@ func parseFlags(args []string) (*options, string, error) {
 	// Challenge solving
 	fs.BoolVar(&o.solve, "solve", false, "")
 	fs.StringVar(&o.solverDir, "solver-dir", "solver", "")
-	fs.DurationVar(&o.solveTimeout, "solve-timeout", 75*time.Second, "")
+	fs.DurationVar(&o.solveTimeout, "solve-timeout", defaultSolveTimeout, "")
 
 	// Proxy
 	fs.StringVar(&o.proxy, "proxy", "", "")
@@ -499,7 +499,8 @@ cloudflare
                         UA and TLS fingerprint that earned it, and the solver
                         drives a real Chromium. Needs npm install in solver/
   -solver-dir path      where index.js and node_modules live (default solver)
-  -solve-timeout dur    how long the solve may take (default 75s)
+  -solve-timeout dur    how long the solve may take (default 150s). Browser
+                        startup comes out of this, so a small VPS needs more
 
                         -solve routes through -proxy when one is set, because
                         the cookie is bound to the issuing IP too. It cannot be
