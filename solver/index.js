@@ -1,7 +1,14 @@
-// Single-shot Cloudflare UAM solver.
+// Cloudflare UAM solver: one exit, or a list of them through one browser.
 //
 // Usage:
 //   node solver/index.js <url> [timeout_sec=150]
+//   node solver/index.js <url> [timeout_sec=150] --batch   < jobs.json
+//
+// --batch reads the exits from stdin (see jobs.js) and works them through a
+// single Chromium, one BrowserContext each, printing one result line per exit as
+// it finishes. The launch is what makes this worth doing: it costs ~20s on a
+// small VPS and a browser per exit spent that on every one of them — half an
+// hour of pure startup for a hundred exits, against once for the batch.
 //
 // Environment:
 //   SOLVER_PROXY   scheme://[user:pass@]host:port — solve through this proxy.
@@ -16,7 +23,8 @@
 //                  re-pin the identity when solving from a box whose OS or
 //                  Chrome major differs; see profile.js.
 //
-// Output (stdout, single JSON line):
+// Output (stdout, one JSON line; in --batch one line per exit, each carrying an
+// extra "exit" field echoing the id it was given):
 //   { "status": "ok"|"no_clearance"|"error",
 //     "url": "<final url>",
 //     "user_agent": "<navigator.userAgent>",
@@ -69,6 +77,7 @@ import {
 import { cookiesForUrl } from "./cookies.js";
 import { detectChallengeInPage, isChallengeTitle } from "./challenge.js";
 import { withDeadline } from "./deadline.js";
+import { parseJobs, readAll } from "./jobs.js";
 
 const MAX_ATTEMPTS = 2;
 // 75 was too small on a real box. Chromium under Xvfb takes ~20s to come up,
@@ -91,9 +100,14 @@ function die(message, code = 1) {
   finish({ status: "error", error: message }, code);
 }
 
-const url = process.argv[2];
+// Flags are pulled out before the positionals are read, or --batch would land
+// in the timeout slot and be rejected as a non-number.
+const ARGV = process.argv.slice(2).filter((a) => !a.startsWith("--"));
+const BATCH = process.argv.slice(2).includes("--batch");
+
+const url = ARGV[0];
 if (!url) {
-  die("usage: node solver/index.js <url> [timeout_sec]");
+  die("usage: node solver/index.js <url> [timeout_sec] [--batch]");
 }
 
 // A non-numeric timeout used to survive all the way to setTimeout, where Node
@@ -110,7 +124,7 @@ function parseTimeoutSec(raw) {
   return n;
 }
 
-const TIMEOUT_MS = Math.round(parseTimeoutSec(process.argv[3]) * 1000);
+const TIMEOUT_MS = Math.round(parseTimeoutSec(ARGV[1]) * 1000);
 
 // Client Hints are built once, up front: userAgentMetadata() throws when the
 // pinned UA and sec-ch-ua disagree, and finding that out after a 75-second
@@ -147,11 +161,38 @@ installExitHandlers({
   },
 });
 
-// Hard backstop: even if the run hangs forever, we self-terminate at
-// (timeout + 30s) so we never become the zombie ourselves.
-setTimeout(() => {
-  finish({ status: "error", error: "watchdog timeout" }, 2);
-}, TIMEOUT_MS + 30_000).unref();
+// Hard backstop: even if the run hangs forever, we self-terminate so we never
+// become the zombie ourselves.
+//
+// A batch is sized in rounds rather than in exits: exits run parallel at a time,
+// so the wall clock is ceil(exits/parallel) budgets, not one. Arming it for a
+// single budget would have killed every batch of more than `parallel` exits at
+// the first round boundary — and it would have looked like the target timing
+// out. The batch arms this itself once the job list has been read, because
+// until then the number of rounds is not known.
+let watchdog = null;
+function armWatchdog(budgetMs) {
+  if (watchdog) clearTimeout(watchdog);
+  watchdog = setTimeout(() => {
+    finish({ status: "error", error: "watchdog timeout" }, 2);
+  }, budgetMs + 30_000);
+  watchdog.unref();
+}
+armWatchdog(TIMEOUT_MS);
+
+// emit writes one NDJSON result line, for a batch where there are many.
+//
+// Separate from finish() because the invariants are opposite: finish() prints
+// the last line and ends the process, and is guarded so a late watchdog cannot
+// append a second. A batch prints one line per exit as it completes and keeps
+// going. The guard is still honoured — once something has ended the run, no
+// further results are claimed.
+function emit(result) {
+  if (finished) return;
+  try {
+    process.stdout.write(JSON.stringify(result) + "\n");
+  } catch {}
+}
 
 // finish prints the one result line and ends the process.
 //
@@ -217,6 +258,19 @@ async function launch() {
     chromiumMajorVersion = parseChromiumMajor(chromiumVersion);
   } catch {}
 
+  await preparePage(page, chromiumVersion);
+
+  return { browser, page, chromiumVersion, chromiumMajor: chromiumMajorVersion };
+}
+
+// preparePage puts the gofire-matching identity on a page before it navigates.
+//
+// Every page a solve drives goes through this, whether it is the one connect()
+// handed back or one opened in a context of its own. A page that missed it
+// would carry the browser's own identity into the request that earns the
+// cookie, which is the mismatch this whole file exists to prevent — and in
+// batch mode there are as many pages as there are exits.
+async function preparePage(page, chromiumVersion) {
   // Force the gofire-matching identity before any navigation.
   //
   // The metadata argument is not optional in practice: setUserAgent(ua) alone
@@ -274,8 +328,6 @@ async function launch() {
       });
     } catch {}
   }, languageList(TARGET_LANG));
-
-  return { browser, page, chromiumVersion, chromiumMajor: chromiumMajorVersion };
 }
 
 // Wait until cf_clearance appears for the target origin, or until the page
@@ -288,9 +340,9 @@ async function launch() {
 // The challenged flag is what tells the caller whether a retry has anything to
 // retry: a site with no challenge at all has already given us everything it is
 // going to, and relaunching the browser for it only costs another cold start.
-async function waitForClearance(browser, page, deadline) {
+async function waitForClearance(jar, page, deadline) {
   while (Date.now() < deadline) {
-    const cookies = await cookiesForUrl(browser, page, url);
+    const cookies = await cookiesForUrl(jar, page, url);
     const cf = cookies.find((c) => c.name === "cf_clearance");
     if (cf) return { cleared: true, cookie: cf };
 
@@ -364,8 +416,8 @@ async function simulateHumanBehavior(page) {
 // harvest reads the session's cookies for the target and shapes the result the
 // caller prints. Status is decided by the cookie that matters: everything else
 // in the jar is context.
-async function harvest(browser, page) {
-  const cookies = await cookiesForUrl(browser, page, url);
+async function harvest(jar, page) {
+  const cookies = await cookiesForUrl(jar, page, url);
   const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => TARGET_UA);
   const finalUrl = (() => {
     try {
@@ -389,32 +441,33 @@ async function harvest(browser, page) {
   };
 }
 
-// One full attempt: launch, navigate, wait for clearance, simulate behavior,
-// capture cookies. Caller decides whether to retry on failure.
+// A session is one isolated place to solve in: a page to drive, the jar its
+// cookies come from, and the teardown that ends it.
 //
-// attemptDeadline is a wall-clock timestamp (ms); page.goto and waitForClearance
-// both honor it, and solve() sizes it so an attempt cannot consume the budget
-// its own retry needs.
+// There are two ways to get one, and the difference between them is the whole
+// point of batch mode:
 //
-// Two structural notes, both of which were bugs:
+//   ownBrowserSession    a fresh Chromium per attempt. On a small VPS that is
+//                        ~20s of every attempt — the honest price of a clean
+//                        profile when there is one exit, and 33 minutes of pure
+//                        startup when there are a hundred.
+//   sharedContextSession a fresh BrowserContext in a browser that is already
+//                        up. Own cookie jar, own storage, and its own proxy:
+//                        Chrome takes one per context through
+//                        Target.createBrowserContext, not only on the command
+//                        line. It costs milliseconds.
 //
-//   - launch() is inside the try. A failed connect() (no Xvfb, missing Chromium,
-//     a port race) used to escape attempt() entirely and abort the run from
-//     solve()'s outermost catch, so the retry documented at the top of this file
-//     never covered the one failure a retry helps most with.
-//   - the browser is closed in finally rather than handed back for the caller to
-//     close. The caller then had to clear the module-level handle too, and the
-//     check that did so compared against a field it had already set to undefined
-//     — so it never fired, and cleanup's "graceful close" always ran against a
-//     dead handle.
-async function attempt(attemptNum, attemptDeadline) {
-  let browser = null;
-  let page = null;
-  let chromiumVersion = "";
-  let chromiumMajor = 0;
-  let launchMs = 0;
-
-  try {
+// Both hand back the same shape and everything below is written against it, so
+// the solving logic cannot drift between the one-exit path and the list.
+//
+// What a context is not is a whole new profile. It is Chrome's incognito
+// primitive: same process, same BoringSSL, so the JA3/JA4 the cookie is bound
+// to is identical either way — which is the property that matters here. What it
+// does share is the browser's own state (its build, its command-line flags), and
+// that is shared deliberately. -solve-isolate goes back to a browser per exit
+// for anyone who measures a reason to.
+function ownBrowserSession() {
+  return async (deadline) => {
     // connect() is unbounded on its own, and on a slow box it is the longest
     // step in the attempt: a 90-second budget produced a 111-second run because
     // two launches happened outside it. Racing it against the deadline keeps
@@ -423,7 +476,7 @@ async function attempt(attemptNum, attemptDeadline) {
     const launchStart = Date.now();
     const launched = await withDeadline(
       launch(),
-      attemptDeadline,
+      deadline,
       "browser launch did not finish before the attempt deadline",
       // A launch that lost the race still comes up. Closing it here is what
       // keeps the retry from running beside a full Chromium nobody owns —
@@ -435,12 +488,102 @@ async function attempt(attemptNum, attemptDeadline) {
         return late.browser.close();
       }
     );
-    launchMs = Date.now() - launchStart;
-    browser = launched.browser;
-    chromiumVersion = launched.chromiumVersion;
-    chromiumMajor = launched.chromiumMajor;
-    page = launched.page;
+    return {
+      page: launched.page,
+      jar: launched.browser,
+      chromiumVersion: launched.chromiumVersion,
+      chromiumMajor: launched.chromiumMajor,
+      launchMs: Date.now() - launchStart,
+      close: async () => {
+        try {
+          await launched.browser.close();
+        } catch {}
+        untrackBrowser(launched.browser);
+      },
+    };
+  };
+}
 
+function sharedContextSession(shared, proxy) {
+  const parsed = parseProxyURL(proxy);
+  return async (deadline) => {
+    const start = Date.now();
+    const open = (async () => {
+      const context = await shared.browser.createBrowserContext(
+        parsed ? { proxyServer: `${parsed.host}:${parsed.port}` } : {}
+      );
+      try {
+        const page = await context.newPage();
+
+        // Credentials are applied here rather than left to
+        // puppeteer-real-browser. Its pageController authenticates every new
+        // page with the single proxy connect() was given — which in a batch is
+        // no proxy at all, and would be the wrong one even if it were set, since
+        // each exit brings its own.
+        if (parsed && (parsed.username || parsed.password)) {
+          await page.authenticate({ username: parsed.username, password: parsed.password });
+        }
+        await preparePage(page, shared.chromiumVersion);
+        return { context, page };
+      } catch (err) {
+        await context.close().catch(() => {});
+        throw err;
+      }
+    })();
+
+    const { context, page } = await withDeadline(
+      open,
+      deadline,
+      "opening a context did not finish before the attempt deadline",
+      (late) => late && late.context && late.context.close()
+    );
+
+    return {
+      page,
+      // The jar is the context, never the browser. A shared browser's jar holds
+      // every exit's cookies at once, so reading it would hand one exit the
+      // cf_clearance another one earned — the exact mispairing the Go side
+      // spends its effort preventing.
+      jar: context,
+      chromiumVersion: shared.chromiumVersion,
+      chromiumMajor: shared.chromiumMajor,
+      launchMs: Date.now() - start,
+      close: () => context.close().catch(() => {}),
+    };
+  };
+}
+
+// One full attempt: open a session, navigate, wait for clearance, simulate
+// behavior, capture cookies. Caller decides whether to retry on failure.
+//
+// attemptDeadline is a wall-clock timestamp (ms); page.goto and waitForClearance
+// both honor it, and solveExit() sizes it so an attempt cannot consume the
+// budget its own retry needs.
+//
+// Two structural notes, both of which were bugs:
+//
+//   - opening the session is inside the try. A failed connect() (no Xvfb,
+//     missing Chromium, a port race) used to escape attempt() entirely and abort
+//     the run from the outermost catch, so the retry documented at the top of
+//     this file never covered the one failure a retry helps most with.
+//   - the session is closed in finally rather than handed back for the caller to
+//     close. The caller then had to clear the module-level handle too, and the
+//     check that did so compared against a field it had already set to undefined
+//     — so it never fired, and cleanup's "graceful close" always ran against a
+//     dead handle.
+async function attempt(newSession, attemptNum, attemptDeadline) {
+  let session = null;
+  let chromiumVersion = "";
+  let chromiumMajor = 0;
+  let launchMs = 0;
+
+  try {
+    session = await newSession(attemptDeadline);
+    chromiumVersion = session.chromiumVersion;
+    chromiumMajor = session.chromiumMajor;
+    launchMs = session.launchMs;
+
+    const { page, jar } = session;
     const budgetMs = Math.max(1000, attemptDeadline - Date.now());
 
     await page.goto(url, {
@@ -448,7 +591,7 @@ async function attempt(attemptNum, attemptDeadline) {
       timeout: budgetMs,
     });
 
-    const outcome = await waitForClearance(browser, page, attemptDeadline);
+    const outcome = await waitForClearance(jar, page, attemptDeadline);
     if (!outcome.cleared && outcome.challenged && attemptNum < MAX_ATTEMPTS) {
       // Still sitting on a challenge with a retry left. A fresh tab often gets
       // a different challenge variant, so skip the behavior simulation and let
@@ -456,7 +599,7 @@ async function attempt(attemptNum, attemptDeadline) {
       // challenge page itself, and abandoning the attempt used to throw it away,
       // so a run whose retry also failed reported nothing at all when it had in
       // fact collected something usable.
-      return { ...(await harvest(browser, page)), chromiumVersion, chromiumMajor, launchMs };
+      return { ...(await harvest(jar, page)), chromiumVersion, chromiumMajor, launchMs };
     }
 
     // Whether clearance was present or not, harvest behavior data so even
@@ -464,15 +607,15 @@ async function attempt(attemptNum, attemptDeadline) {
     await simulateHumanBehavior(page);
 
     // Re-read cookies post-behavior (interaction can elevate __cf_bm).
-    return { ...(await harvest(browser, page)), chromiumVersion, chromiumMajor, launchMs };
+    return { ...(await harvest(jar, page)), chromiumVersion, chromiumMajor, launchMs };
   } catch (err) {
     // Harvest before giving up. A navigation timeout or a deadline hit is not a
     // reason to throw away cookies the challenge page already set — a run whose
     // goto timed out reported nothing at all, when the jar held the challenge's
     // own cookies. The error is still what the status reports; the cookies ride
-    // along so the caller and solve()'s best-attempt pick can use them.
-    const salvaged = browser
-      ? await harvest(browser, page).catch(() => null)
+    // along so the caller and solveExit()'s best-attempt pick can use them.
+    const salvaged = session
+      ? await harvest(session.jar, session.page).catch(() => null)
       : null;
     return {
       ...(salvaged || {}),
@@ -485,11 +628,10 @@ async function attempt(attemptNum, attemptDeadline) {
   } finally {
     // Always tear the session down before the caller decides whether to retry:
     // a reused session carries stale fingerprint state into the next attempt.
-    if (browser) {
+    if (session) {
       try {
-        await browser.close();
+        await session.close();
       } catch {}
-      untrackBrowser(browser);
     }
   }
 }
@@ -507,17 +649,22 @@ function betterResult(a, b) {
   return rankResult(b) > rankResult(a) ? b : a || b;
 }
 
-async function solve() {
+// solveExit works one exit to a conclusion and returns the result object.
+//
+// budgetMs is this exit's whole share of the clock. In single mode that is the
+// run's timeout; in a batch every exit gets the same share, and the rounds they
+// run in are what the caller's watchdog is sized against.
+async function solveExit(newSession, budgetMs, proxyLabel) {
   const startTs = Date.now();
-  // Single overall deadline shared by every attempt, so the solver cannot
-  // overshoot the parent's (blaze's) outer timeout. The per-attempt split below
-  // is what keeps a slow first attempt from leaving the second with no time.
-  const overallDeadline = startTs + TIMEOUT_MS;
+  // Single overall deadline shared by every attempt, so an exit cannot overshoot
+  // the budget the caller sized its watchdog against. The per-attempt split
+  // below is what keeps a slow first attempt from leaving the second with none.
+  const overallDeadline = startTs + budgetMs;
   let lastResult = null;
   let attemptsMade = 0;
 
   for (let i = 1; i <= MAX_ATTEMPTS; i++) {
-    // Stop early if we've already overshot the global deadline.
+    // Stop early if we've already overshot the deadline.
     if (Date.now() >= overallDeadline) break;
 
     // Give a non-final attempt only part of what is left, so a first attempt
@@ -529,7 +676,7 @@ async function solve() {
         ? Date.now() + Math.round(remaining * 0.6)
         : overallDeadline;
 
-    const r = await attempt(i, attemptDeadline);
+    const r = await attempt(newSession, i, attemptDeadline);
     attemptsMade = i;
     // Keep the best attempt, not the most recent one. A retry that fails to
     // launch, or lands on a harder challenge variant, must not erase cookies
@@ -537,7 +684,7 @@ async function solve() {
     lastResult = betterResult(lastResult, r);
 
     if (r.status === "ok") {
-      const out = {
+      return {
         status: "ok",
         url: r.url,
         user_agent: r.user_agent,
@@ -547,10 +694,9 @@ async function solve() {
         attempts: i,
         chromium_version: r.chromiumVersion || "",
         chromium_major: r.chromiumMajor || 0,
-        proxy: PROXY_LABEL,
+        proxy: proxyLabel,
         launch_ms: r.launchMs || 0,
       };
-      return finish(out);
     }
 
     // Non-ok and we have another attempt: small jittered backoff so the
@@ -562,33 +708,137 @@ async function solve() {
   }
 
   // All attempts exhausted.
+  const base = {
+    duration_ms: Date.now() - startTs,
+    attempts: attemptsMade,
+    chromium_version: (lastResult && lastResult.chromiumVersion) || "",
+    chromium_major: (lastResult && lastResult.chromiumMajor) || 0,
+    proxy: proxyLabel,
+    launch_ms: (lastResult && lastResult.launchMs) || 0,
+  };
   if (lastResult && lastResult.status === "no_clearance") {
-    const out = {
+    return {
       status: "no_clearance",
       url: lastResult.url || url,
       user_agent: lastResult.user_agent || TARGET_UA,
       cookies: lastResult.cookies || "",
       cookie_list: lastResult.cookie_list || [],
-      duration_ms: Date.now() - startTs,
-      attempts: attemptsMade,
-      chromium_version: lastResult.chromiumVersion || "",
-      chromium_major: lastResult.chromiumMajor || 0,
-      proxy: PROXY_LABEL,
-      launch_ms: lastResult.launchMs || 0,
+      ...base,
     };
-    return finish(out);
   }
-
-  return finish({
+  return {
     status: "error",
     error: (lastResult && lastResult.error) || "solve failed",
-    duration_ms: Date.now() - startTs,
-    attempts: attemptsMade,
-    chromium_version: (lastResult && lastResult.chromiumVersion) || "",
-    chromium_major: (lastResult && lastResult.chromiumMajor) || 0,
-    proxy: PROXY_LABEL,
-    launch_ms: (lastResult && lastResult.launchMs) || 0,
-  }, 1);
+    ...base,
+  };
 }
 
-solve().catch((err) => finish({ status: "error", error: errorMessage(err) }, 1));
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
+
+// solveSingle is the original contract: one exit from SOLVER_PROXY, one browser,
+// one JSON line. Unchanged on purpose — one exit does not need a shared browser,
+// and leaving this path exactly as it was is what keeps the common case off the
+// newer machinery.
+async function solveSingle() {
+  const out = await solveExit(ownBrowserSession(), TIMEOUT_MS, PROXY_LABEL);
+  return finish(out, out.status === "error" ? 1 : 0);
+}
+
+// solveBatch works a list of exits through one browser.
+//
+// The launch is paid once instead of once per exit, which is the entire saving:
+// on a small VPS Chromium takes ~20s to come up, so a hundred exits spent over
+// half an hour doing nothing but starting browsers. Contexts cost milliseconds.
+//
+// Results stream out as NDJSON, one line per exit as it finishes, rather than a
+// single object at the end. A batch runs for minutes and the caller can act on
+// the exits that are ready — and if the process dies halfway, the exits that
+// did solve have already been reported rather than lost with it.
+async function solveBatch(job) {
+  // Rounds, not exits: `parallel` of them run at a time, so the wall clock is
+  // ceil(exits/parallel) budgets. The caller sizes its own timeout the same way.
+  const rounds = Math.ceil(job.exits.length / job.parallel);
+  armWatchdog(rounds * TIMEOUT_MS);
+
+  const shared = await withDeadline(
+    launch(),
+    Date.now() + TIMEOUT_MS,
+    "browser launch did not finish before the batch deadline",
+    (late) => {
+      if (!late || !late.browser) return;
+      untrackBrowser(late.browser);
+      return late.browser.close();
+    }
+  );
+
+  const queue = job.exits.slice();
+  const runner = async () => {
+    for (;;) {
+      const exit = queue.shift();
+      if (!exit) return;
+      let out;
+      try {
+        out = await solveExit(
+          sharedContextSession(shared, exit.proxy),
+          TIMEOUT_MS,
+          proxyLabel(exit.proxy)
+        );
+      } catch (err) {
+        // solveExit is written not to throw; this is the backstop that keeps one
+        // exit's surprise from taking the whole batch and every result with it.
+        out = { status: "error", error: errorMessage(err), proxy: proxyLabel(exit.proxy) };
+      }
+      emit({ exit: exit.id, ...out });
+    }
+  };
+
+  await Promise.all(Array.from({ length: job.parallel }, runner));
+
+  try {
+    await shared.browser.close();
+  } catch {}
+  untrackBrowser(shared.browser);
+
+  cleanup();
+  process.exit(0);
+}
+
+// proxyLabel names an exit without its credentials, the same way the Go side
+// redacts them: this goes to stdout and from there into logs.
+function proxyLabel(proxy) {
+  try {
+    const parsed = parseProxyURL(proxy);
+    return parsed ? `${parsed.host}:${parsed.port}` : "";
+  } catch {
+    return "";
+  }
+}
+
+async function main() {
+  if (!BATCH) return solveSingle();
+
+  let job;
+  try {
+    job = parseJobs(await readAll(process.stdin));
+  } catch (err) {
+    die(errorMessage(err));
+    return;
+  }
+  // Every proxy is parsed before the browser starts, for the same reason the
+  // Client Hints are: finding out about a malformed one after a launch is an
+  // expensive way to learn it, and in a batch it would strand the exits behind
+  // it too.
+  for (const exit of job.exits) {
+    try {
+      parseProxyURL(exit.proxy);
+    } catch (err) {
+      die(`exit ${exit.id}: ${errorMessage(err)}`);
+      return;
+    }
+  }
+  return solveBatch(job);
+}
+
+main().catch((err) => finish({ status: "error", error: errorMessage(err) }, 1));

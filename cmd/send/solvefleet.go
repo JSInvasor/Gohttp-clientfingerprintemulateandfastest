@@ -130,9 +130,69 @@ func solveFleet(ctx context.Context, o *options, target string, exits []exit) ([
 	seeds := make([]*solveSeed, len(exits))
 	errs := make([]error, len(exits))
 
+	// The cache first, and on its own. A warm cache is the difference between a
+	// run that starts now and one that starts in ten minutes, and consulting it
+	// before anything is launched means a fully cached list never starts a
+	// browser at all.
+	var pending []int
+	for i, e := range exits {
+		if !o.solveRefresh {
+			if hit := loadSolveCache(o.solveCache, target, e.identity(), o.solveMaxAge); hit != nil {
+				seeds[i] = seedFromCache(e.proxy, hit)
+				continue
+			}
+		}
+		pending = append(pending, i)
+	}
+	if len(pending) == 0 {
+		return seeds, errs
+	}
+
+	// One browser for the rest, unless there is only one to solve or the caller
+	// asked for the old shape. A context per exit costs milliseconds where a
+	// browser costs seconds — see solvebatch.go — and it is also what makes
+	// -solve-parallel cheap enough to raise.
+	if len(pending) > 1 && !o.solveIsolate {
+		todo := make([]exit, 0, len(pending))
+		for _, i := range pending {
+			todo = append(todo, exits[i])
+		}
+		index := make(map[string]int, len(todo))
+		for _, i := range pending {
+			index[exits[i].identity()] = i
+		}
+
+		logSolve("", "solving %d exit(s) in one browser, %d at a time",
+			len(todo), min(o.solveParallel, len(todo)))
+
+		err := runSolverBatch(ctx, o, target, todo, func(e exit, res *solveResult, err error) {
+			i, ok := index[e.identity()]
+			if !ok {
+				return
+			}
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			seeds[i] = seedFromResult(o, target, e, res)
+		})
+		if err != nil {
+			// A batch that could not start at all is every pending exit's error.
+			for _, i := range pending {
+				if seeds[i] == nil && errs[i] == nil {
+					errs[i] = err
+				}
+			}
+		}
+		return seeds, errs
+	}
+
+	// A single exit, or -solve-isolate: a browser of its own, which is the path
+	// that has always existed and the one to fall back to if a shared browser
+	// ever turns out to be measurably different.
 	slots := make(chan struct{}, o.solveParallel)
 	var wg sync.WaitGroup
-	for i, e := range exits {
+	for _, i := range pending {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -149,7 +209,7 @@ func solveFleet(ctx context.Context, o *options, target string, exits []exit) ([
 				errs[i] = err
 				return
 			}
-			seeds[i], errs[i] = solveOne(ctx, o, target, e)
+			seeds[i], errs[i] = solveOne(ctx, o, target, exits[i])
 		}()
 	}
 	wg.Wait()

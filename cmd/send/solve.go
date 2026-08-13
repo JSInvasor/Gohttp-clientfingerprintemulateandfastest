@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,6 +60,7 @@ type solveResult struct {
 	CookieList    []solvedCookie `json:"cookie_list"`
 	DurationMS    int64          `json:"duration_ms"`
 	Attempts      int            `json:"attempts"`
+	Exit          string         `json:"exit"` // batch only: the id this line answers for
 	Chromium      string         `json:"chromium_version"`
 	ChromiumMajor int            `json:"chromium_major"`
 	Proxy         string         `json:"proxy"`
@@ -165,14 +165,8 @@ func (r *solveResult) clearance() (solvedCookie, bool) {
 // it.
 func runSolver(ctx context.Context, o *options, target, proxy string) (*solveResult, error) {
 	script := filepath.Join(o.solverDir, "index.js")
-	if _, err := os.Stat(script); err != nil {
-		return nil, fmt.Errorf("%s not found: %w", script, err)
-	}
-	// index.js imports puppeteer-real-browser, so a missing install fails with a
-	// Node module-resolution error that says nothing about how to fix it.
-	if _, err := os.Stat(filepath.Join(o.solverDir, "node_modules")); err != nil {
-		return nil, fmt.Errorf("%s/node_modules not found — run `npm install` in %s first",
-			o.solverDir, o.solverDir)
+	if err := checkSolverDir(o); err != nil {
+		return nil, err
 	}
 
 	// The solver gets its own budget plus a margin: it has its own watchdog at
@@ -188,21 +182,8 @@ func runSolver(ctx context.Context, o *options, target, proxy string) (*solveRes
 	cmd := exec.CommandContext(solveCtx, "node", script, target, strconv.Itoa(seconds))
 	cmd.Stderr = os.Stderr // puppeteer's launch diagnostics are worth seeing
 
-	// The solver's identity is set on the environment rather than inherited from
-	// it. An exported SOLVER_PROXY used to reach the browser on its own, so a
-	// solve this run believed was direct went out through an exit it never asked
-	// for — and the cookie was cached under "direct" and replayed from this box,
-	// which is the silent 403 the whole file is about. SOLVER_LANG is passed for
-	// the same reason it is passed at all: the run advertises one
-	// Accept-Language and the solve has to advertise the same one.
-	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		return strings.HasPrefix(kv, "SOLVER_PROXY=") || strings.HasPrefix(kv, "SOLVER_LANG=")
-	})
-	if proxy != "" {
-		env = append(env, "SOLVER_PROXY="+proxy)
-	}
-	env = append(env, "SOLVER_LANG="+acceptLanguage(o))
-	cmd.Env = env
+	// The solver's identity is set rather than inherited — see solverEnv.
+	cmd.Env = solverEnv(proxy, acceptLanguage(o))
 
 	out, err := cmd.Output()
 	if err != nil && len(out) == 0 {
@@ -341,7 +322,19 @@ func solveOne(ctx context.Context, o *options, target string, e exit) (*solveSee
 		return nil, err
 	}
 
+	return seedFromResult(o, target, e, res), nil
+}
+
+// seedFromResult turns one solver result into the seed a session replays, and
+// reports what it cost.
+//
+// Shared by the one-browser-per-exit path and the batch, so an exit is reported
+// and cached the same way whichever produced it — the batch would otherwise be
+// a second place for the cache write to be forgotten.
+func seedFromResult(o *options, target string, e exit, res *solveResult) *solveSeed {
+	proxy := e.proxy
 	cf, gotClearance := res.clearance()
+
 	// Assembled and printed as one write. The exits of a -proxy-file run solve
 	// in parallel, and a report built from four Fprintf calls arrives
 	// interleaved with three other exits' — which is how a warning ends up
@@ -353,7 +346,9 @@ func solveOne(ctx context.Context, o *options, target string, e exit) (*solveSee
 	// The budget is what the browser startup does not eat. A challenge with a
 	// Turnstile widget needs 15-30s of it, and a launch on a small VPS takes
 	// 20s of every attempt — which is how a run fails with no cookie at all
-	// while looking like the target simply refused.
+	// while looking like the target simply refused. A batch pays that launch
+	// once for the whole list, so this only fires on the path that pays it per
+	// exit.
 	if launch := time.Duration(res.LaunchMS) * time.Millisecond; launch > 0 {
 		if solving := o.solveTimeout - launch*time.Duration(max(res.Attempts, 1)); solving < 20*time.Second {
 			report += fmt.Sprintf("\nnote: browser startup took %s of the %s budget — "+
@@ -383,7 +378,7 @@ func solveOne(ctx context.Context, o *options, target string, e exit) (*solveSee
 	if gotClearance {
 		storeSolveCache(o.solveCache, target, e.identity(), res)
 	}
-	return seed, nil
+	return seed
 }
 
 // reportSolveDrift checks the solved identity against the one this client will

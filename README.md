@@ -640,12 +640,46 @@ bound to. `-solve-ip-check` takes any URL that answers with an address (a bare
 `1.2.3.4` body works too), and `-solve-ip-check ""` turns the whole thing off and
 solves one per line as before.
 
-What is left after that is genuinely one challenge per identity, which is why
-`-solve-parallel` (default 2) exists — each solve is a real Chromium under Xvfb,
-several hundred MB while it runs, so the whole list at once thrashes a small box
-into timing every attempt out. Raise it as far as the RAM allows. The per-exit
-cache below is what makes the second run cheap, and `send` says so when a solve
-outlasted the cookies it was earning.
+#### One browser for the whole list
+
+What is left after that is genuinely one challenge per identity — but it used to
+be one *browser* per identity too, and only the challenge is unavoidable.
+Chromium takes ~20s to come up under Xvfb on the kind of box this runs on, so a
+hundred exits spent half an hour doing nothing but starting browsers that
+differed only in which proxy they dialled.
+
+Chrome takes a proxy per BrowserContext, not only on the command line, so one
+browser serves every exit: a context each, with its own cookie jar, its own
+storage and its own egress. Measured against this repo's own solver driving a
+real Chromium — 8 exits through 8 local proxies:
+
+| | per-exit browser | shared browser |
+|---|---|---|
+| opening one exit | 612 ms | 102–192 ms |
+| 8 exits, 2 at a time | 28.5 s | 24.5 s |
+
+The 4-second gap is exactly the launch cost times the seven exits that no longer
+pay it, which is the whole mechanism — and on the small VPS the 20s figure comes
+from, that same arithmetic is ~2.3 minutes on 8 exits and ~33 minutes on 100.
+This box simply starts Chromium quickly.
+
+It also changes what `-solve-parallel` costs. Four at a time used to mean four
+Chromiums resident at once, which is what kept the default at 2; four contexts
+in one browser is four tabs, so raise it much further than you would have.
+
+Results stream back one line per exit as it finishes, so a batch that runs for
+minutes reports as it goes — and one that dies partway has already handed over
+the exits that solved. An exit the solver never mentions is treated as a
+failure, not as a success with no cookie.
+
+`-solve-isolate` goes back to a browser per exit. A context is Chrome's
+incognito primitive: same process and same BoringSSL, so the JA3/JA4 the cookie
+is bound to is identical either way — but the flag is there if a shared browser
+ever turns out to measure differently on a real target.
+
+The per-exit cache below is what makes the second run cheap — it is consulted
+before anything is launched, so a fully cached list never starts a browser at
+all — and `send` says so when a solve outlasted the cookies it was earning.
 
 A solve is slow because most of it is Cloudflare's own challenge — its
 JavaScript runs, the Turnstile widget executes, the edge decides. A real browser

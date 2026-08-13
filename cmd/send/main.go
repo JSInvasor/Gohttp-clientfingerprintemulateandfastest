@@ -136,6 +136,7 @@ type options struct {
 	solveMaxAge   time.Duration
 	solveParallel int
 	exitCheck     string
+	solveIsolate  bool
 
 	// solveSeeds is what -solve earned, one entry per exit, filled in before the
 	// session pool is built. Empty when the run solves nothing or has a single
@@ -308,6 +309,7 @@ func parseFlags(args []string) (*options, string, error) {
 	fs.DurationVar(&o.solveMaxAge, "solve-max-age", 30*time.Minute, "")
 	fs.IntVar(&o.solveParallel, "solve-parallel", 2, "")
 	fs.StringVar(&o.exitCheck, "solve-ip-check", defaultExitCheck, "")
+	fs.BoolVar(&o.solveIsolate, "solve-isolate", false, "")
 
 	// Proxy
 	fs.StringVar(&o.proxy, "proxy", "", "")
@@ -560,6 +562,10 @@ cloudflare
                         startup comes out of this, so a small VPS needs more
   -solve-parallel int   how many exits to solve at once with -proxy-file
                         (default 2). Each one is a real Chromium
+  -solve-isolate        give every exit its own browser instead of a context in
+                        a shared one. Slower — a launch each rather than once
+                        for the list — and there if a shared browser ever turns
+                        out to measure differently
   -solve-ip-check url   before solving, ask each proxy where it leaves from and
                         solve once per address rather than once per line — a
                         hundred-entry list is usually a handful of exits. Also
@@ -761,6 +767,7 @@ func splitArgs(args []string) (posArgs []string, flagArgs []string) {
 		"-fingerprint":   true,
 		"-solve":         true,
 		"-solve-refresh": true,
+		"-solve-isolate": true,
 		"-assets":        true,
 	}
 

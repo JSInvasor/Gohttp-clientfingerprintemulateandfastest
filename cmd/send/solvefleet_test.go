@@ -35,6 +35,10 @@ func fleetOptions(t *testing.T, script string, sessions int, proxies ...string) 
 	// and rotation checks have their own tests against real sockets in
 	// exitip_test.go; here every entry is meant to stand for its own exit.
 	o.exitCheck = ""
+	// A browser per exit, which is what these stubs speak. The shared-browser
+	// path has the same invariants pinned against a batch-speaking stub in
+	// solvebatch_test.go.
+	o.solveIsolate = true
 	return o
 }
 
