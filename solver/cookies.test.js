@@ -65,23 +65,9 @@ test("a cookie with no domain is never in scope", () => {
   assert.ok(!cookieInScope({ domain: "", path: "/" }, scope("https://example.com/")));
 });
 
-test("cookiesForUrl prefers page.cookies and passes the url through", async () => {
-  const seen = [];
-  const page = {
-    cookies: async (...urls) => {
-      seen.push(urls);
-      return [{ name: "cf_clearance", value: "target", domain: "example.com" }];
-    },
-  };
-  const browser = { cookies: async () => assert.fail("should not reach the whole-profile jar") };
-  const got = await cookiesForUrl(browser, page, "https://example.com/");
-  assert.deepEqual(seen, [["https://example.com/"]]);
-  assert.equal(got[0].value, "target");
-});
-
-test("cookiesForUrl filters the whole-profile jar when page.cookies is gone", async () => {
-  // The regression this pins: the jar carries a cf_clearance for another
-  // origin, and the unfiltered list would have handed that back as the solve.
+test("cookiesForUrl reads the profile jar and filters it", async () => {
+  // The jar carries a cf_clearance for another origin, and the unfiltered list
+  // would have handed that back as the solve.
   const browser = {
     cookies: async () => [
       { name: "cf_clearance", value: "third-party", domain: "challenges.cloudflare.com", path: "/" },
@@ -94,13 +80,45 @@ test("cookiesForUrl filters the whole-profile jar when page.cookies is gone", as
   assert.equal(got[0].value, "target");
 });
 
-test("cookiesForUrl falls back when page.cookies throws", async () => {
+// The regression this pins: page.cookies was the primary read, and it returns
+// an empty list — not an error — when the page handle is no longer attached to
+// the target that did the solving, which is what puppeteer-real-browser's
+// targetcreated rewrapping produces. A live run reported "cookie_list":[] for a
+// site that had just issued a cf_clearance.
+test("an empty page read does not mask the profile jar", async () => {
+  const page = { cookies: async () => [] };
+  const browser = {
+    cookies: async () => [
+      { name: "cf_clearance", value: "target", domain: "example.com", path: "/" },
+      { name: "__cf_bm", value: "bm", domain: "example.com", path: "/" },
+    ],
+  };
+  const got = await cookiesForUrl(browser, page, "https://example.com/");
+  assert.equal(got.length, 2, "the profile jar was not consulted");
+  assert.ok(got.some((c) => c.name === "cf_clearance"));
+});
+
+test("cookiesForUrl falls back to the page when the browser has no jar API", async () => {
+  // puppeteer below 23.7 has no Browser.cookies at all.
+  const seen = [];
   const page = {
-    cookies: async () => {
-      throw new Error("not supported in this build");
+    cookies: async (...urls) => {
+      seen.push(urls);
+      return [{ name: "sess", value: "1", domain: "example.com", path: "/" }];
     },
   };
+  const got = await cookiesForUrl({}, page, "https://example.com/");
+  assert.deepEqual(seen, [["https://example.com/"]], "the target url was not passed through");
+  assert.equal(got[0].name, "sess");
+});
+
+test("cookiesForUrl falls back to the page when the jar read throws", async () => {
   const browser = {
+    cookies: async () => {
+      throw new Error("protocol error");
+    },
+  };
+  const page = {
     cookies: async () => [{ name: "sess", value: "1", domain: "example.com", path: "/" }],
   };
   const got = await cookiesForUrl(browser, page, "https://example.com/");

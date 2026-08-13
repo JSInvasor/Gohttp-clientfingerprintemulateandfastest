@@ -60,19 +60,36 @@ export function cookieInScope(cookie, scope) {
 }
 
 // cookiesForUrl returns only the cookies that belong on a request to target.
+//
+// The whole-profile jar is the read, and the filter above is what makes it
+// correct. page.cookies(url) does the matching in the browser and was the
+// primary path here, which was a mistake: puppeteer-real-browser re-wraps pages
+// on targetcreated to drive the challenge widget, so the page handle this code
+// holds is not always attached to the target that did the solving. When it is
+// not, page.cookies returns an empty list — and an empty list is not an error,
+// so it was taken as the answer and a solved session reported no cookies at all.
+// Against a live Cloudflare challenge that produced `"cookie_list":[]` for a
+// site that had just issued a cf_clearance.
+//
+// browser.cookies() reads the profile rather than a page, so it does not depend
+// on which handle is live. It only became usable in puppeteer 23.7; the page
+// read stays as the fallback for older trees, where it is the only option.
 export async function cookiesForUrl(browser, page, target) {
-  if (page && typeof page.cookies === "function") {
-    try {
-      return await page.cookies(target);
-    } catch {}
-  }
-  if (!browser || typeof browser.cookies !== "function") return [];
-  const all = await browser.cookies().catch(() => []);
   let scope;
   try {
     scope = targetScope(target);
   } catch {
     return [];
   }
-  return all.filter((c) => cookieInScope(c, scope));
+
+  if (browser && typeof browser.cookies === "function") {
+    const all = await browser.cookies().catch(() => null);
+    if (all) return all.filter((c) => cookieInScope(c, scope));
+  }
+  if (page && typeof page.cookies === "function") {
+    try {
+      return await page.cookies(target);
+    } catch {}
+  }
+  return [];
 }

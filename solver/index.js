@@ -60,11 +60,15 @@ import { cookiesForUrl } from "./cookies.js";
 const MAX_ATTEMPTS = 2;
 const DEFAULT_TIMEOUT_SEC = 75;
 
+// Exactly one result line is ever printed. Every exit path goes through
+// finish(), and this guard is what keeps a late watchdog or a stray rejection
+// from appending a second line after the answer is already out.
+let finished = false;
+
 // Everything below is written to the single-JSON-line contract in the header
 // comment, so usage errors go to stdout in the same shape a caller parses.
 function die(message, code = 1) {
-  console.log(JSON.stringify({ status: "error", error: message }));
-  process.exit(code);
+  finish({ status: "error", error: message }, code);
 }
 
 const url = process.argv[2];
@@ -115,27 +119,72 @@ try {
 // return. See cleanup.js for why this is not done with an env-var pkill sweep.
 installExitHandlers({
   onFatal: (err) => {
-    if (err) console.log(JSON.stringify({ status: "error", error: errorMessage(err) }));
+    if (!err || finished) return;
+    finished = true;
+    try {
+      process.stdout.write(JSON.stringify({ status: "error", error: errorMessage(err) }) + "\n");
+    } catch {}
   },
 });
 
 // Hard backstop: even if the run hangs forever, we self-terminate at
 // (timeout + 30s) so we never become the zombie ourselves.
 setTimeout(() => {
-  try {
-    console.log(
-      JSON.stringify({ status: "error", error: "watchdog timeout" })
-    );
-  } catch {}
-  cleanup();
-  process.exit(2);
+  finish({ status: "error", error: "watchdog timeout" }, 2);
 }, TIMEOUT_MS + 30_000).unref();
+
+// finish prints the one result line and ends the process.
+//
+// Returning from solve() and letting the event loop drain was not enough:
+// puppeteer-real-browser leaves handles behind — an Xvfb session, a
+// chrome-launcher child — that keep node alive after the answer is known. A run
+// that had already printed its error at 1.1s sat there until the watchdog fired
+// and printed a *second* JSON line, and a caller reading the last line saw
+// "watchdog timeout" instead of the real cause.
+//
+// The write callback is what makes this safe: process.exit() truncates pending
+// stdout on a pipe, which is exactly how this is invoked.
+function finish(result, code = 0) {
+  if (finished) return;
+  finished = true;
+  const line = JSON.stringify(result) + "\n";
+  try {
+    process.stdout.write(line, () => {
+      cleanup();
+      process.exit(code);
+    });
+  } catch {
+    cleanup();
+    process.exit(code);
+  }
+  // Backstop for a stdout that never drains (a closed pipe, a full buffer).
+  setTimeout(() => {
+    cleanup();
+    process.exit(code);
+  }, 2000).unref();
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 function rand(a, b) {
   return Math.floor(Math.random() * (b - a + 1)) + a;
+}
+
+// withDeadline rejects if promise has not settled by deadline. The work itself
+// keeps running — nothing here can cancel a launch mid-flight — but cleanup.js
+// kills the process tree on the way out, so an abandoned browser does not
+// outlive us.
+function withDeadline(promise, deadline, message) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(new Error(message));
+  let timer;
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), remaining);
+    }),
+  ]);
 }
 
 // Launch a fresh real-browser session with stealth shims layered on top of
@@ -299,6 +348,34 @@ async function simulateHumanBehavior(page) {
   await sleep(rand(600, 1100));
 }
 
+// harvest reads the session's cookies for the target and shapes the result the
+// caller prints. Status is decided by the cookie that matters: everything else
+// in the jar is context.
+async function harvest(browser, page) {
+  const cookies = await cookiesForUrl(browser, page, url);
+  const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => TARGET_UA);
+  const finalUrl = (() => {
+    try {
+      return page.url();
+    } catch {
+      return url;
+    }
+  })();
+
+  return {
+    status: cookies.some((c) => c.name === "cf_clearance") ? "ok" : "no_clearance",
+    url: finalUrl,
+    user_agent: userAgent,
+    cookies: cookies.map((c) => `${c.name}=${c.value}`).join("; "),
+    cookie_list: cookies.map((c) => ({
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      expires: c.expires,
+    })),
+  };
+}
+
 // One full attempt: launch, navigate, wait for clearance, simulate behavior,
 // capture cookies. Caller decides whether to retry on failure.
 //
@@ -323,7 +400,16 @@ async function attempt(attemptNum, attemptDeadline) {
   let chromiumMajor = 0;
 
   try {
-    const launched = await launch();
+    // connect() is unbounded on its own, and on a slow box it is the longest
+    // step in the attempt: a 90-second budget produced a 111-second run because
+    // two launches happened outside it. Racing it against the deadline keeps
+    // the budget meaning what it says, and a launch that loses the race is a
+    // real failure — the alternative is a browser nobody is waiting for.
+    const launched = await withDeadline(
+      launch(),
+      attemptDeadline,
+      "browser launch did not finish before the attempt deadline"
+    );
     browser = launched.browser;
     chromiumVersion = launched.chromiumVersion;
     chromiumMajor = launched.chromiumMajor;
@@ -339,9 +425,12 @@ async function attempt(attemptNum, attemptDeadline) {
     const outcome = await waitForClearance(browser, page, attemptDeadline);
     if (!outcome.cleared && outcome.challenged && attemptNum < MAX_ATTEMPTS) {
       // Still sitting on a challenge with a retry left. A fresh tab often gets
-      // a different challenge variant, so signal the caller rather than
-      // harvesting a jar we know has no clearance in it.
-      return { status: "no_clearance", chromiumVersion, chromiumMajor };
+      // a different challenge variant, so skip the behavior simulation and let
+      // the caller start over — but read the jar first. __cf_bm is set by the
+      // challenge page itself, and abandoning the attempt used to throw it away,
+      // so a run whose retry also failed reported nothing at all when it had in
+      // fact collected something usable.
+      return { ...(await harvest(browser, page)), chromiumVersion, chromiumMajor };
     }
 
     // Whether clearance was present or not, harvest behavior data so even
@@ -349,25 +438,7 @@ async function attempt(attemptNum, attemptDeadline) {
     await simulateHumanBehavior(page);
 
     // Re-read cookies post-behavior (interaction can elevate __cf_bm).
-    const cookies = await cookiesForUrl(browser, page, url);
-    const cfFinal = cookies.find((c) => c.name === "cf_clearance");
-    const userAgent = await page.evaluate(() => navigator.userAgent);
-    const finalUrl = page.url();
-
-    return {
-      status: cfFinal ? "ok" : "no_clearance",
-      url: finalUrl,
-      user_agent: userAgent,
-      cookies: cookies.map((c) => `${c.name}=${c.value}`).join("; "),
-      cookie_list: cookies.map((c) => ({
-        name: c.name,
-        value: c.value,
-        domain: c.domain,
-        expires: c.expires,
-      })),
-      chromiumVersion,
-      chromiumMajor,
-    };
+    return { ...(await harvest(browser, page)), chromiumVersion, chromiumMajor };
   } catch (err) {
     return {
       status: "error",
@@ -385,6 +456,19 @@ async function attempt(attemptNum, attemptDeadline) {
       untrackBrowser(browser);
     }
   }
+}
+
+// betterResult ranks two attempts: a clearance beats anything, then more
+// cookies, then anything at all over an error. It exists so the retry is a
+// second chance rather than a replacement.
+function rankResult(r) {
+  if (!r) return -1;
+  if (r.status === "ok") return 1_000_000;
+  return (r.cookie_list || []).length;
+}
+
+function betterResult(a, b) {
+  return rankResult(b) > rankResult(a) ? b : a || b;
 }
 
 async function solve() {
@@ -410,8 +494,11 @@ async function solve() {
         : overallDeadline;
 
     const r = await attempt(i, attemptDeadline);
-    lastResult = r;
     attemptsMade = i;
+    // Keep the best attempt, not the most recent one. A retry that fails to
+    // launch, or lands on a harder challenge variant, must not erase cookies
+    // the earlier attempt already collected.
+    lastResult = betterResult(lastResult, r);
 
     if (r.status === "ok") {
       const out = {
@@ -426,8 +513,7 @@ async function solve() {
         chromium_major: r.chromiumMajor || 0,
         proxy: PROXY_LABEL,
       };
-      console.log(JSON.stringify(out));
-      return;
+      return finish(out);
     }
 
     // Non-ok and we have another attempt: small jittered backoff so the
@@ -452,26 +538,18 @@ async function solve() {
       chromium_major: lastResult.chromiumMajor || 0,
       proxy: PROXY_LABEL,
     };
-    console.log(JSON.stringify(out));
-    return;
+    return finish(out);
   }
 
-  console.log(
-    JSON.stringify({
-      status: "error",
-      error: (lastResult && lastResult.error) || "solve failed",
-      duration_ms: Date.now() - startTs,
-      attempts: attemptsMade,
-      chromium_version: (lastResult && lastResult.chromiumVersion) || "",
-      chromium_major: (lastResult && lastResult.chromiumMajor) || 0,
-      proxy: PROXY_LABEL,
-    })
-  );
+  return finish({
+    status: "error",
+    error: (lastResult && lastResult.error) || "solve failed",
+    duration_ms: Date.now() - startTs,
+    attempts: attemptsMade,
+    chromium_version: (lastResult && lastResult.chromiumVersion) || "",
+    chromium_major: (lastResult && lastResult.chromiumMajor) || 0,
+    proxy: PROXY_LABEL,
+  }, 1);
 }
 
-solve().catch((err) => {
-  console.log(
-    JSON.stringify({ status: "error", error: errorMessage(err) })
-  );
-  process.exit(1);
-});
+solve().catch((err) => finish({ status: "error", error: errorMessage(err) }, 1));
