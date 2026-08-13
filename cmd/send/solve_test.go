@@ -213,7 +213,7 @@ func TestChromiumDriftIsReported(t *testing.T) {
 	// The solver's own output has to reach the seed, or there is nothing to
 	// compare in the first place.
 	o := solveOptions(stubSolverDir(t, printJS(okSolve)))
-	seed, err := solveOne(context.Background(), o, "https://site.test/", "")
+	seed, err := solveOne(context.Background(), o, "https://site.test/", exit{})
 	if err != nil {
 		t.Fatalf("solveOne: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestRedactProxy(t *testing.T) {
 
 func TestSolveAndSeedSeedsCookiesAndUA(t *testing.T) {
 	o := solveOptions(stubSolverDir(t, printJS(okSolve)))
-	if err := solveAndSeed(context.Background(), o, "https://site.test/"); err != nil {
+	if err := solveAndSeed(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAndSeed: %v", err)
 	}
 	want := []string{"cf_clearance=abc", "__cf_bm=xyz"}
@@ -312,7 +312,7 @@ func TestSolveAndSeedSeedsCookiesAndUA(t *testing.T) {
 func TestSolveAndSeedKeepsExplicitUA(t *testing.T) {
 	o := solveOptions(stubSolverDir(t, printJS(okSolve)))
 	o.userAgent = "mine"
-	if err := solveAndSeed(context.Background(), o, "https://site.test/"); err != nil {
+	if err := solveAndSeed(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAndSeed: %v", err)
 	}
 	if o.userAgent != "mine" {
@@ -326,7 +326,7 @@ func TestSolveAndSeedPreservesValuesContainingEquals(t *testing.T) {
 	const padded = `{"status":"ok","user_agent":"UA-151","cookie_list":` +
 		`[{"name":"cf_clearance","value":"a=b==","domain":"site.test"}]}`
 	o := solveOptions(stubSolverDir(t, printJS(padded)))
-	if err := solveAndSeed(context.Background(), o, "https://site.test/"); err != nil {
+	if err := solveAndSeed(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAndSeed: %v", err)
 	}
 	if len(o.cookies) != 1 || o.cookies[0] != "cf_clearance=a=b==" {
@@ -344,7 +344,7 @@ func TestSolveAndSeedContinuesWithoutClearance(t *testing.T) {
 	const noClearance = `{"status":"no_clearance","user_agent":"UA-151","cookie_list":` +
 		`[{"name":"__cf_bm","value":"xyz","domain":"site.test"}]}`
 	o := solveOptions(stubSolverDir(t, printJS(noClearance)))
-	if err := solveAndSeed(context.Background(), o, "https://site.test/"); err != nil {
+	if err := solveAndSeed(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("no_clearance aborted the run: %v", err)
 	}
 	if len(o.cookies) != 1 || o.cookies[0] != "__cf_bm=xyz" {

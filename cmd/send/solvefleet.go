@@ -39,7 +39,7 @@ import (
 
 // solveAcrossProxies earns one identity per exit and leaves the run holding the
 // exits that worked, paired with what they earned.
-func solveAcrossProxies(ctx context.Context, o *options, target string) error {
+func solveAcrossProxies(ctx context.Context, o *options, profile gofire.BrowserProfile, target string) error {
 	// Loaded here rather than taken from the session pool because the pool is
 	// built after the solve — and it is built from what this leaves behind,
 	// which is a narrower list than the file.
@@ -47,25 +47,36 @@ func solveAcrossProxies(ctx context.Context, o *options, target string) error {
 	if err != nil {
 		return fmt.Errorf("proxy file: %w", err)
 	}
-	proxies := rotator.ProxyURLs()
 
-	// Sessions pin proxies[i % len(proxies)], so only the first -s entries are
-	// ever a session's own exit. Solving the rest would cost a browser launch
-	// and a challenge each for cookies nothing replays.
-	n := min(len(proxies), o.sessions)
-	if len(proxies) > n {
-		fmt.Fprintf(os.Stderr, "%d proxies loaded but only %d session(s) — solving %d of them; "+
-			"raise -s to spread the run across more exits\n", len(proxies), o.sessions, n)
+	// What gets solved is one exit per address, not one per line: entries that
+	// leave from the same address are one identity, so the second solve would
+	// buy a copy of the first cookie for another full challenge. Dead and
+	// rotating entries come out here too, where they cost a second each rather
+	// than a solve timeout each. See exitip.go — on a real hundred-entry list
+	// this is most of the hour.
+	exits, err := resolveExits(ctx, o, profile, rotator.ProxyURLs())
+	if err != nil {
+		return err
 	}
+
+	// Sessions pin exits[i % len(exits)], so only the first -s are ever a
+	// session's own. Solving the rest would cost a browser launch and a
+	// challenge each for cookies nothing replays.
+	n := min(len(exits), o.sessions)
+	if len(exits) > n {
+		fmt.Fprintf(os.Stderr, "%d exits available but only %d session(s) — solving %d of them; "+
+			"raise -s to spread the run across more\n", len(exits), o.sessions, n)
+	}
+	exits = exits[:n]
 
 	// Worst case, not an estimate: every exit taking the full budget, in
 	// -solve-parallel-sized rounds. Worth printing because it is the number that
-	// surprises people — a 20-proxy list two at a time is ten rounds deep.
+	// surprises people — a 20-exit list two at a time is ten rounds deep.
 	rounds := (n + o.solveParallel - 1) / o.solveParallel
 	fmt.Fprintf(os.Stderr, "solving %s through %d exit(s), %d at a time (up to %s)\n",
 		target, n, o.solveParallel, round(time.Duration(rounds)*o.solveTimeout))
 
-	seeds, errs := solveFleet(ctx, o, target, proxies[:n])
+	seeds, errs := solveFleet(ctx, o, target, exits)
 	// A Ctrl-C during the solve is not a partial success to carry into a run.
 	if err := ctx.Err(); err != nil {
 		return err
@@ -77,10 +88,10 @@ func solveAcrossProxies(ctx context.Context, o *options, target string) error {
 	for i, seed := range seeds {
 		if seed == nil {
 			failed++
-			logSolve(proxies[i], "solve failed, dropping this exit: %v", errs[i])
+			logSolve(exits[i].proxy, "solve failed, dropping this exit: %v", errs[i])
 			continue
 		}
-		kept = append(kept, proxies[i])
+		kept = append(kept, exits[i].proxy)
 		keptSeeds = append(keptSeeds, *seed)
 	}
 	if len(kept) == 0 {
@@ -98,6 +109,7 @@ func solveAcrossProxies(ctx context.Context, o *options, target string) error {
 	// issued to is a silent 403.
 	reportSolveDrift(&keptSeeds[0])
 	warnOnMixedUA(keptSeeds)
+	warnOnExpiredSeeds(keptSeeds)
 
 	// The list the session pool builds its rotator from is now the solved one,
 	// so a dropped exit cannot come back through the file and be dialled by a
@@ -114,13 +126,13 @@ func solveAcrossProxies(ctx context.Context, o *options, target string) error {
 // of cores while it runs — so the whole list at once would thrash a small box
 // into timing every attempt out. Which is a slow failure that reads as "the
 // proxies are bad".
-func solveFleet(ctx context.Context, o *options, target string, proxies []string) ([]*solveSeed, []error) {
-	seeds := make([]*solveSeed, len(proxies))
-	errs := make([]error, len(proxies))
+func solveFleet(ctx context.Context, o *options, target string, exits []exit) ([]*solveSeed, []error) {
+	seeds := make([]*solveSeed, len(exits))
+	errs := make([]error, len(exits))
 
 	slots := make(chan struct{}, o.solveParallel)
 	var wg sync.WaitGroup
-	for i, proxy := range proxies {
+	for i, e := range exits {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -137,11 +149,40 @@ func solveFleet(ctx context.Context, o *options, target string, proxies []string
 				errs[i] = err
 				return
 			}
-			seeds[i], errs[i] = solveOne(ctx, o, target, proxy)
+			seeds[i], errs[i] = solveOne(ctx, o, target, e)
 		}()
 	}
 	wg.Wait()
 	return seeds, errs
+}
+
+// warnOnExpiredSeeds reports cookies that did not survive the solve that earned
+// them.
+//
+// A cf_clearance is commonly good for about half an hour, and a long list took
+// longer than that to work through — so the exits solved first were dead before
+// the last one finished, and the run started on them anyway. Collapsing the list
+// to one solve per address is what makes that rare; saying so is what keeps it
+// from being silent when it still happens.
+func warnOnExpiredSeeds(seeds []solveSeed) {
+	now := time.Now()
+	expired, expiring := 0, 0
+	for _, s := range seeds {
+		switch {
+		case s.expiresAt.IsZero():
+		case !now.Before(s.expiresAt):
+			expired++
+		case s.expiresAt.Sub(now) < 5*time.Minute:
+			expiring++
+		}
+	}
+	if expired == 0 && expiring == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "warning: %d of %d clearances expired while the rest were still solving, "+
+		"and %d expire within 5 minutes —\n"+
+		"  the solve outlasted the cookie. Cut the exits (-s), raise -solve-parallel, or run the\n"+
+		"  solve again now that the cache is warm\n", expired, len(seeds), expiring)
 }
 
 // warnOnMixedUA reports exits whose solve came back with a different UA from the

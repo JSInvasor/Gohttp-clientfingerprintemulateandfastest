@@ -600,10 +600,52 @@ Three things keep the pairing honest:
 Passwords are stripped from every line these print, so a `user:pass@host` list
 does not end up in a terminal scrollback or a pasted log.
 
-The cost is one challenge per exit, which is why `-solve-parallel` (default 2)
-exists — each solve is a real Chromium under Xvfb, several hundred MB while it
-runs, so the whole list at once thrashes a small box into timing every attempt
-out. The per-exit cache below is what makes the second run cheap.
+#### Why a hundred proxies is not a hundred solves
+
+The cost is one challenge per exit, and at 65s each a hundred-entry list would be
+the better part of an hour — longer than a `cf_clearance` usually lives, so the
+exits solved first would be dead before the last one finished. That is not a
+slow feature, it is a broken one.
+
+What makes it work is that the cost is per **address**, not per line. A
+hundred-entry list is usually a provider's gateway addressed a hundred ways: a
+port range onto one pool, or a handful of exits repeated. Two entries that leave
+from the same address are one identity to Cloudflare, so the second solve buys a
+copy of the first cookie for another full challenge. So the exits are measured
+before anything is solved:
+
+```
+checking where 100 proxies leave from (https://www.cloudflare.com/cdn-cgi/trace)
+100 proxies resolve to 12 exit(s) in 6.1s, 74 sharing an address with one already counted, 9 unreachable, 5 rotating
+solving https://site.com through 8 exit(s), 2 at a time (up to 20m0s)
+```
+
+One request per proxy, all at once, answering three questions at once:
+
+- **which entries share an address** — the list collapses to the exits it really
+  has, and they share a solve and a cache entry;
+- **which entries are dead** — a second each here instead of a 150s solve
+  timeout each;
+- **which entries rotate** — and those are dropped, because per-exit solving
+  cannot work through them at all. A backconnect gateway hands out a different
+  address per connection: the cookie is bound to whichever one the browser got,
+  every request after it leaves from somewhere else, the solve looks like it
+  succeeded and the run 403s from the first request. Two reads over two
+  connections is what tells a rotating gateway from a fixed one. If your provider
+  offers sticky or session ports, that is what to point this at.
+
+The check is Cloudflare's own `/cdn-cgi/trace`, which is the point: it reports
+the address *as Cloudflare sees it*, which is the address `cf_clearance` gets
+bound to. `-solve-ip-check` takes any URL that answers with an address (a bare
+`1.2.3.4` body works too), and `-solve-ip-check ""` turns the whole thing off and
+solves one per line as before.
+
+What is left after that is genuinely one challenge per identity, which is why
+`-solve-parallel` (default 2) exists — each solve is a real Chromium under Xvfb,
+several hundred MB while it runs, so the whole list at once thrashes a small box
+into timing every attempt out. Raise it as far as the RAM allows. The per-exit
+cache below is what makes the second run cheap, and `send` says so when a solve
+outlasted the cookies it was earning.
 
 A solve is slow because most of it is Cloudflare's own challenge — its
 JavaScript runs, the Turnstile widget executes, the edge decides. A real browser

@@ -86,6 +86,10 @@ type solveSeed struct {
 	userAgent     string
 	cookies       []string
 	chromiumMajor int
+	// expiresAt is when the cf_clearance stops being worth anything, zero when
+	// the solve produced none. A fleet solve can outlast it — see
+	// warnOnExpiredSeeds.
+	expiresAt time.Time
 }
 
 // solveLog serialises the progress lines. Exits solve in parallel, and a
@@ -269,8 +273,20 @@ func decodeSolve(b []byte) (*solveResult, error) {
 // This is the single-exit path: no proxy at all, or one -proxy every session
 // shares. A -proxy-file run goes through solveAcrossProxies instead, because
 // there the identity is per session rather than per run.
-func solveAndSeed(ctx context.Context, o *options, target string) error {
-	seed, err := solveOne(ctx, o, target, o.proxy)
+func solveAndSeed(ctx context.Context, o *options, profile gofire.BrowserProfile, target string) error {
+	// Even one proxy is worth measuring: a rotating gateway cannot hold a
+	// cf_clearance, and finding that out here costs a second rather than a
+	// solve followed by a run that 403s from its first request.
+	only := exit{proxy: o.proxy}
+	if o.proxy != "" {
+		exits, err := resolveExits(ctx, o, profile, []string{o.proxy})
+		if err != nil {
+			return err
+		}
+		only = exits[0]
+	}
+
+	seed, err := solveOne(ctx, o, target, only)
 	if err != nil {
 		return err
 	}
@@ -297,19 +313,25 @@ func solveAndSeed(ctx context.Context, o *options, target string) error {
 // It is the unit both paths are built from, so a single-exit run and one exit of
 // a fleet cost, cache and report the same thing. It holds no shared state:
 // solveAcrossProxies calls it from several goroutines at once.
-func solveOne(ctx context.Context, o *options, target, proxy string) (*solveSeed, error) {
+func solveOne(ctx context.Context, o *options, target string, e exit) (*solveSeed, error) {
+	proxy := e.proxy
+
 	// A cookie that is still valid is worth more than a fresh one: it costs
 	// nothing and it is the same cookie. Most of a solve is the edge's own
 	// challenge, so this is the only real answer to "the solve takes too long".
+	//
+	// The key is the exit's identity rather than the proxy string, so two
+	// entries that leave from one address share the entry — which is the same
+	// reason they share a solve.
 	if !o.solveRefresh {
-		if e := loadSolveCache(o.solveCache, target, proxy, o.solveMaxAge); e != nil {
-			return seedFromCache(proxy, e), nil
+		if hit := loadSolveCache(o.solveCache, target, e.identity(), o.solveMaxAge); hit != nil {
+			return seedFromCache(proxy, hit), nil
 		}
 	}
 
 	where := "direct"
 	if proxy != "" {
-		where = "via " + redactProxy(proxy)
+		where = "via " + e.label()
 	}
 	logSolve(proxy, "solving %s with the browser in %s/ (%s, up to %s)",
 		target, o.solverDir, where, o.solveTimeout)
@@ -352,11 +374,14 @@ func solveOne(ctx context.Context, o *options, target, proxy string) (*solveSeed
 	logSolve(proxy, "%s", report)
 
 	seed := &solveSeed{proxy: proxy, userAgent: res.UserAgent, chromiumMajor: res.ChromiumMajor}
+	if gotClearance && cf.Expires > 0 {
+		seed.expiresAt = time.Unix(int64(cf.Expires), 0)
+	}
 	for _, c := range res.CookieList {
 		seed.cookies = append(seed.cookies, c.Name+"="+c.Value)
 	}
 	if gotClearance {
-		storeSolveCache(o.solveCache, target, proxy, res)
+		storeSolveCache(o.solveCache, target, e.identity(), res)
 	}
 	return seed, nil
 }

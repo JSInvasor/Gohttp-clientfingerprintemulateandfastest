@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
 )
 
 // proxyFile writes a proxy list and returns its path.
@@ -29,6 +31,10 @@ func fleetOptions(t *testing.T, script string, sessions int, proxies ...string) 
 	o.solveMaxAge = 30 * time.Minute
 	o.sessions = sessions
 	o.proxyFile = proxyFile(t, proxies...)
+	// These exits are fictional, so there is nothing to measure. The grouping
+	// and rotation checks have their own tests against real sockets in
+	// exitip_test.go; here every entry is meant to stand for its own exit.
+	o.exitCheck = ""
 	return o
 }
 
@@ -39,7 +45,7 @@ func fleetOptions(t *testing.T, script string, sessions int, proxies ...string) 
 func TestSolveAcrossProxiesPairsSeedsWithExits(t *testing.T) {
 	o := fleetOptions(t, echoProxyJS, 3, "http://a.test:1", "http://b.test:2", "http://c.test:3")
 
-	if err := solveAcrossProxies(context.Background(), o, "https://site.test/"); err != nil {
+	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAcrossProxies: %v", err)
 	}
 	if len(o.solveSeeds) != 3 || len(o.proxyList) != 3 {
@@ -87,7 +93,7 @@ func TestSeedForWrapsWithTheProxyPinning(t *testing.T) {
 func TestSolveAcrossProxiesSolvesOnlyWhatSessionsPin(t *testing.T) {
 	o := fleetOptions(t, echoProxyJS, 2, "http://a.test:1", "http://b.test:2", "http://c.test:3")
 
-	if err := solveAcrossProxies(context.Background(), o, "https://site.test/"); err != nil {
+	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAcrossProxies: %v", err)
 	}
 	if len(o.solveSeeds) != 2 {
@@ -111,7 +117,7 @@ if (p.includes("b.test")) {
 `
 	o := fleetOptions(t, script, 3, "http://a.test:1", "http://b.test:2", "http://c.test:3")
 
-	if err := solveAcrossProxies(context.Background(), o, "https://site.test/"); err != nil {
+	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAcrossProxies: %v", err)
 	}
 	if len(o.proxyList) != 2 {
@@ -137,7 +143,7 @@ func TestSolveAcrossProxiesFailsWhenNoExitSolved(t *testing.T) {
 	o := fleetOptions(t, printJS(`{"status":"error","error":"challenge not solved"}`), 2,
 		"http://a.test:1", "http://b.test:2")
 
-	err := solveAcrossProxies(context.Background(), o, "https://site.test/")
+	err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/")
 	if err == nil {
 		t.Fatal("a run with no solved exit was allowed to start")
 	}
@@ -151,7 +157,7 @@ func TestSolveAcrossProxiesFailsWhenNoExitSolved(t *testing.T) {
 // challenge per exit.
 func TestSolveAcrossProxiesReusesThePerExitCache(t *testing.T) {
 	o := fleetOptions(t, echoProxyJS, 2, "http://a.test:1", "http://b.test:2")
-	if err := solveAcrossProxies(context.Background(), o, "https://site.test/"); err != nil {
+	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("first solve: %v", err)
 	}
 
@@ -160,7 +166,7 @@ func TestSolveAcrossProxiesReusesThePerExitCache(t *testing.T) {
 		"http://a.test:1", "http://b.test:2")
 	again.solveCache = o.solveCache
 
-	if err := solveAcrossProxies(context.Background(), again, "https://site.test/"); err != nil {
+	if err := solveAcrossProxies(context.Background(), again, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("second solve did not come from the cache: %v", err)
 	}
 	for i, seed := range again.solveSeeds {
@@ -192,7 +198,7 @@ setTimeout(() => {
 		"http://d.test:4", "http://e.test:5", "http://f.test:6")
 	o.solveParallel = 2
 
-	if err := solveAcrossProxies(context.Background(), o, "https://site.test/"); err != nil {
+	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAcrossProxies: %v", err)
 	}
 	if len(o.solveSeeds) != 6 {
@@ -228,7 +234,7 @@ func TestSolveAcrossProxiesStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := solveAcrossProxies(ctx, o, "https://site.test/"); err == nil {
+	if err := solveAcrossProxies(ctx, o, gofire.Chrome151, "https://site.test/"); err == nil {
 		t.Fatal("a cancelled solve reported success")
 	}
 	if len(o.solveSeeds) != 0 || len(o.proxyList) != 0 {

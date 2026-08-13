@@ -135,6 +135,7 @@ type options struct {
 	solveRefresh  bool
 	solveMaxAge   time.Duration
 	solveParallel int
+	exitCheck     string
 
 	// solveSeeds is what -solve earned, one entry per exit, filled in before the
 	// session pool is built. Empty when the run solves nothing or has a single
@@ -239,7 +240,7 @@ func run() error {
 		if o.proxyFile != "" {
 			solve = solveAcrossProxies
 		}
-		if err := solve(ctx, o, target); err != nil {
+		if err := solve(ctx, o, profile, target); err != nil {
 			return err
 		}
 	}
@@ -306,6 +307,7 @@ func parseFlags(args []string) (*options, string, error) {
 	fs.BoolVar(&o.solveRefresh, "solve-refresh", false, "")
 	fs.DurationVar(&o.solveMaxAge, "solve-max-age", 30*time.Minute, "")
 	fs.IntVar(&o.solveParallel, "solve-parallel", 2, "")
+	fs.StringVar(&o.exitCheck, "solve-ip-check", defaultExitCheck, "")
 
 	// Proxy
 	fs.StringVar(&o.proxy, "proxy", "", "")
@@ -558,6 +560,12 @@ cloudflare
                         startup comes out of this, so a small VPS needs more
   -solve-parallel int   how many exits to solve at once with -proxy-file
                         (default 2). Each one is a real Chromium
+  -solve-ip-check url   before solving, ask each proxy where it leaves from and
+                        solve once per address rather than once per line — a
+                        hundred-entry list is usually a handful of exits. Also
+                        drops the dead ones (a second each, not a solve timeout
+                        each) and the rotating ones, which cannot hold a
+                        clearance at all. Empty disables it
 
                         -solve routes through -proxy when one is set, because
                         the cookie is bound to the issuing IP too. With

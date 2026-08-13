@@ -137,7 +137,8 @@ func seedFromCache(proxy string, e *solveCacheEntry) *solveSeed {
 	logSolve(proxy, "reusing the solve from %s ago (%d cookie(s), expires in %s) — "+
 		"pass -solve-refresh to earn a new one", age, len(e.Cookies), left)
 
-	seed := &solveSeed{proxy: proxy, userAgent: e.UserAgent, chromiumMajor: e.ChromiumMajor}
+	seed := &solveSeed{proxy: proxy, userAgent: e.UserAgent, chromiumMajor: e.ChromiumMajor,
+		expiresAt: e.ExpiresAt}
 	for _, c := range e.Cookies {
 		seed.cookies = append(seed.cookies, c.Name+"="+c.Value)
 	}
