@@ -171,7 +171,15 @@ async function launch() {
   // up claiming Chrome 151 in User-Agent while sending no sec-ch-ua at all —
   // a combination no real Chrome emits, on the very request that earns
   // cf_clearance. See profile.js for the measurement.
-  await page.setUserAgent(TARGET_UA, UA_METADATA);
+  //
+  // The metadata is rebuilt here rather than reused from startup so the
+  // high-entropy hints can carry this browser's real build. UA_METADATA was
+  // still worth building up front: it fails on a bad pin before a browser is
+  // launched, which is the expensive way to find out.
+  await page.setUserAgent(
+    TARGET_UA,
+    userAgentMetadata(undefined, undefined, undefined, undefined, chromiumVersion)
+  );
 
   // Stealth shim, singular.
   //

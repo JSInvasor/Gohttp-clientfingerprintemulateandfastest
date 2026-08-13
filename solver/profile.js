@@ -60,12 +60,19 @@ export const TARGET_SEC_CH_UA =
   `"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"`;
 
 // Sec-Ch-Ua-Platform, without the quotes the header carries, and the
-// platformVersion that accompanies it. On Linux Chrome reports the kernel
-// release; the value below is an ordinary current one. These must agree with
-// the OS token in TARGET_UA — that pairing is checked in userAgentMetadata().
+// platformVersion that accompanies it. These must agree with the OS token in
+// TARGET_UA — that pairing is checked in userAgentMetadata().
+//
+// platformVersion is empty on Linux, and that is not an omission. Chrome only
+// populates it on Windows, macOS and Android; asked for high-entropy hints on
+// Linux a real browser answers "". Measured here against an untouched Chromium:
+//
+//   {"platform":"Linux","platformVersion":"", ...}
+//
+// Filling in a kernel release would be a value no Chrome on Linux reports.
 export const TARGET_PLATFORM = process.env.SOLVER_PLATFORM || "Linux";
 export const TARGET_PLATFORM_VERSION =
-  process.env.SOLVER_PLATFORM_VERSION || "6.8.0";
+  process.env.SOLVER_PLATFORM_VERSION ?? (TARGET_PLATFORM === "Linux" ? "" : "10.0.0");
 
 // LAUNCH_ARGS and CONNECT_OPTIONS are shared so the fingerprint probe measures
 // the same browser configuration the solver runs. Launch flags can move the
@@ -194,13 +201,29 @@ export function userAgentMetadata(
   ua = TARGET_UA,
   secChUa = TARGET_SEC_CH_UA,
   platform = TARGET_PLATFORM,
-  platformVersion = TARGET_PLATFORM_VERSION
+  platformVersion = TARGET_PLATFORM_VERSION,
+  browserVersion = ""
 ) {
-  const fullVersion = chromeVersionFromUA(ua);
-  if (!fullVersion) {
+  const uaVersion = chromeVersionFromUA(ua);
+  if (!uaVersion) {
     throw new Error(`cannot build Client Hints: no Chrome/<version> in UA ${JSON.stringify(ua)}`);
   }
-  const major = fullVersion.split(".")[0];
+  const major = uaVersion.split(".")[0];
+
+  // The UA string freezes the build to <major>.0.0.0 — Chrome has done that
+  // since 101 — but the high-entropy hints do not. Asked for fullVersionList or
+  // uaFullVersion, a real browser answers with its actual build. Measured
+  // against an untouched Chromium:
+  //
+  //   uaFullVersion "141.0.7390.37", fullVersionList Chromium 141.0.7390.37
+  //
+  // Reporting <major>.0.0.0 there is a build number no Chrome ships, on a call
+  // a managed challenge makes. browserVersion is browser.version(), used when
+  // its major agrees with the identity being claimed; when it does not, the
+  // frozen value is the safer answer and fpcheck's chromium.version check is
+  // what reports the underlying mismatch.
+  const realVersion = chromeVersionFromUA(browserVersion) || String(browserVersion || "").match(/\d+(?:\.\d+){3}/)?.[0] || "";
+  const fullVersion = realVersion.split(".")[0] === major ? realVersion : uaVersion;
 
   const brands = parseSecChUa(secChUa);
   if (brands.length === 0) {
