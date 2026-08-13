@@ -2361,6 +2361,30 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 					}
 					continue
 				}
+				// One map lookup, not a scan of every header.
+				//
+				// The order lists are in canonical MIME form and so are the keys
+				// net/http stores, so the common case resolves directly. What it
+				// replaces was an O(order x headers) walk — thirteen ordered
+				// names against a dozen headers, each pair an asciiEqualFold —
+				// run twice per request, once to size the block and once to
+				// encode it, and both times holding cc.wmu. That is not merely
+				// CPU: it is the lock every other stream on the connection is
+				// queued behind, which is why one connection plateaus well
+				// below what the machine can do.
+				if vv, ok := req.Header[orderedKey]; ok {
+					if !emitted[orderedKey] {
+						emitted[orderedKey] = true
+						emitHeader(orderedKey, vv)
+					}
+					continue
+				}
+				// A key only ends up non-canonical by being written into the
+				// map directly rather than through Set or Add, which nothing in
+				// this package does — but net/http allows it, so the scan stays
+				// as the fallback. (With both "Accept" and "accept" present it
+				// now emits the canonical one first where map order used to
+				// decide; the other still follows in the second pass.)
 				for k, vv := range req.Header {
 					if asciiEqualFold(k, orderedKey) && !emitted[k] {
 						emitted[k] = true

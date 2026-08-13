@@ -464,11 +464,39 @@ behaviour tells those apart.
 
 `-mode` picks the entry point, and the guarantees drop as throughput rises:
 
-| mode | path | gives up |
-|---|---|---|
-| `client` (default) | `Client.Do` | nothing |
-| `fast` | `FastDo` on a prepared template | cookie jar, redirects, retries |
-| `pipeline` | the `Pipeline` worker pool | as `fast`, plus per-request submission control |
+| mode | path | gives up | measured¹ |
+|---|---|---|---|
+| `client` (default) | `Client.Do` | nothing | 34.9k req/s, 102 µs cpu/req |
+| `fast` | `FastDo` on a prepared template | cookie jar, redirects, retries | **43.5k req/s, 73 µs cpu/req** |
+| `pipeline` | the `Pipeline` worker pool | as `fast`, plus per-request submission control | 38.5k req/s, 100 µs cpu/req |
+
+¹ 120k requests, 256 workers, one session, local HTTP/2 target, 4 cores. Client
+and server share the box, so treat these as relative, not as a ceiling.
+
+`pipeline` is **not** the fastest, which it used to claim to be — `fast` beat it
+at 256, 1024 and 3000 workers, by 19%, 29% and 12%, at 20-30% less CPU per
+request. A pipelined request carries two extra channel hops and a goroutine
+handoff for the asynchronous body drain. What the pipeline buys is submission
+control and per-request outcomes at high concurrency without a channel per
+request; if you only want throughput, `fast` is the shorter path.
+
+### Getting the rate up
+
+Two dials matter more than the transport knobs, and both are easy to get wrong:
+
+**`-s` is a throughput dial, not only an identity dial.** HTTP/2 puts every
+stream on one connection, and the header block for each is encoded while holding
+that connection's write lock — so all the threads in one session queue behind one
+mutex. Measured on the same box, `fast` at 256 workers: `-s 1` → 43.5k req/s,
+`-s 2` → 55.5k, `-s 4` → 53.6k. One extra session is worth ~28%; past the core
+count it stops helping.
+
+**`-c` should be about rate × round-trip time, not "as high as possible."** A
+worker is one request in flight, so 50k RPS against a target 5ms away needs ~250
+of them and the same rate at 100ms needs ~5000. Above that they are not in
+flight, they are queued, and they cost scheduling and memory to sit there —
+3000 workers against a local target measured *half* the throughput of 256 at
+double the CPU.
 
 Response bodies are always drained rather than abandoned. Closing an unfinished
 body makes HTTP/2 emit RST_STREAM, which is the abusive-client signal this

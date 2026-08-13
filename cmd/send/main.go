@@ -93,8 +93,11 @@ const (
 	// straight into the transport. No jar, no redirects, no retries.
 	modeFast = "fast"
 	// modePipeline is the Pipeline worker pool with FireAndForget and an
-	// OnResult callback, which is the highest-throughput path that still
-	// reports per-request outcomes. Bodies drain in the pipeline's own pool.
+	// OnResult callback. Bodies drain in the pipeline's own pool, which is what
+	// it is for — submission control and per-request outcomes without a channel
+	// per request. It is not the fastest: measured, fast beats it at every
+	// concurrency tried, since the drain handoff costs two channel hops a
+	// request.
 	modePipeline = "pipeline"
 )
 
@@ -517,18 +520,22 @@ load shape
   -n int          number of requests (default 1)
   -t duration     [1st] run for this long instead of a fixed count, e.g. 30s, 5m
   -c int          [2nd] threads: concurrent requests in flight (default 50 for
-                  a load run)
+                  a load run). Useful count is roughly rate x round-trip time —
+                  more than that queues rather than flies, and costs throughput
   -s int          [3rd] clients: independent sessions to spread the threads
                   across (default 1). Each is its own Client: own cookie jar,
                   own connection pool, and own pinned proxy when -proxy-file is
-                  set
+                  set. Also a throughput dial: HTTP/2 puts every stream on one
+                  connection behind one write lock, so -s 2 measured ~28% faster
+                  than -s 1 on the same box
   -rps int        [4th] hold the whole run at this many requests per second
                   (0 = as fast as it will go). -rate is the same flag
 
   -mode string    client | fast | pipeline (default client)
                     client   Client.Do — cookie jar, redirects, retries
                     fast     FastDo on a prepared template — none of the above
-                    pipeline the Pipeline worker pool, highest throughput
+                    pipeline the Pipeline worker pool: submission control at
+                             high concurrency, ~20% slower than fast
   -warmup int     pre-warm this many TLS connections per session before starting
 
 identity

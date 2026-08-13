@@ -26,10 +26,17 @@ type PipelineStats struct {
 	TotalBytes atomic.Int64
 }
 
-// Pipeline provides maximum throughput request sending with a fixed worker pool.
-// Workers are pre-allocated and reuse connections for minimal overhead.
+// Pipeline sends through a fixed worker pool, pre-allocated and reusing
+// connections, and reports every outcome through OnResult without a channel per
+// request.
 //
-// For 100k+ RPS, use 3000-5000 workers with FireAndForget mode.
+// It is not the fastest path, which it used to claim to be. Measured against a
+// local server at 256, 1024 and 3000 workers, FastDo beat it at every one — by
+// 19%, 29% and 12% — and cost 20-30% less CPU per request, because a pipelined
+// request carries two extra channel hops and a goroutine handoff for the
+// asynchronous body drain. What the pipeline buys is submission control and
+// per-request results at high concurrency without a channel per request; if the
+// goal is only throughput, PrepareRequest + FastDo is the shorter path.
 type Pipeline struct {
 	client  *Client
 	workers int
@@ -116,11 +123,24 @@ type PipelineConfig struct {
 // newPipeline creates a new Pipeline with the specified number of workers.
 // Workers run continuously, pulling jobs from a shared channel.
 //
-// Recommended workers by target RPS:
+// How many workers is a function of latency, not of a target RPS. A worker is
+// one request in flight, so by Little's Law the useful count is
+// rate × round-trip time: 50k RPS against a target 5ms away needs ~250 in
+// flight, and the same 50k against one 100ms away needs ~5000. Past that point
+// the extra workers are not in flight, they are queued behind the same
+// connection, and they cost scheduling and memory to sit there.
 //
-//	1000-2000  → 10-50k RPS
-//	3000-5000  → 50-150k RPS
-//	5000-10000 → 150k+ RPS
+// The table that used to be here recommended 3000-5000 workers for 50-150k RPS
+// with no mention of distance, which is badly wrong for a near target. Measured
+// against a local server, two sessions, 120k requests:
+//
+//	 256 workers   45.7k req/s    80.6 us cpu/req
+//	1024 workers   40.5k req/s    94.4 us cpu/req
+//	3000 workers   23.5k req/s   163.0 us cpu/req
+//
+// — half the throughput at double the CPU, following the advice. Start from
+// rate × RTT and measure; there is no number here that is right for every
+// target.
 func newPipeline(c *Client, workers int) *Pipeline {
 	return newPipelineWithConfig(c, PipelineConfig{Workers: workers})
 }

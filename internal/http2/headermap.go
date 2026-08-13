@@ -78,6 +78,25 @@ func buildCommonHeaderMaps() {
 		"www-authenticate",
 		"x-forwarded-for",
 		"x-forwarded-proto",
+
+		// The headers this client actually sends on every request, which the
+		// list above does not have because it is Go's and it predates both
+		// Client Hints and Sec-Fetch.
+		//
+		// A name that misses this table takes asciiToLower instead — a
+		// strings.ToLower and an allocation, per header, per request. Nine of
+		// the fifteen headers a Chrome-profile navigation carries were missing,
+		// so the profile this package exists to emit was also the one it was
+		// slowest to encode. Adding them is free: the maps are built once.
+		"sec-ch-ua",
+		"sec-ch-ua-mobile",
+		"sec-ch-ua-platform",
+		"sec-fetch-site",
+		"sec-fetch-mode",
+		"sec-fetch-user",
+		"sec-fetch-dest",
+		"upgrade-insecure-requests",
+		"priority",
 	}
 	commonLowerHeader = make(map[string]string, len(common))
 	commonCanonHeader = make(map[string]string, len(common))
