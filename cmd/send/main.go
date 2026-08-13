@@ -37,6 +37,7 @@
 //
 //	send -solve https://site.com
 //	send -solve https://site.com 30s 100 -proxy socks5://host:1080
+//	send -solve https://site.com 1m 100 8 -proxy-file proxies.txt
 package main
 
 import (
@@ -127,12 +128,18 @@ type options struct {
 	assetParallel int
 
 	// Challenge solving
-	solve        bool
-	solverDir    string
-	solveTimeout time.Duration
-	solveCache   string
-	solveRefresh bool
-	solveMaxAge  time.Duration
+	solve         bool
+	solverDir     string
+	solveTimeout  time.Duration
+	solveCache    string
+	solveRefresh  bool
+	solveMaxAge   time.Duration
+	solveParallel int
+
+	// solveSeeds is what -solve earned, one entry per exit, filled in before the
+	// session pool is built. Empty when the run solves nothing or has a single
+	// identity — that one goes into cookies and userAgent instead.
+	solveSeeds []solveSeed
 
 	// Proxy
 	proxy         string
@@ -140,6 +147,10 @@ type options struct {
 	proxyCooldown time.Duration
 	proxyFails    int
 	proxyStats    bool
+
+	// proxyList narrows proxyFile to the exits a solve actually earned a cookie
+	// through. Empty means the file itself is the list.
+	proxyList []string
 
 	// Network
 	timeout       time.Duration
@@ -221,7 +232,14 @@ func run() error {
 			return fmt.Errorf("-solve needs -p chrome: the solver earns the cookie with a real "+
 				"Chromium, and %s replays it with a TLS fingerprint the cookie was never issued to", profile)
 		}
-		if err := solveAndSeed(ctx, o, profile, target); err != nil {
+		// A list of exits is a list of identities: the cookie is bound to the IP
+		// that earned it, so each one is solved and seeded separately rather
+		// than sharing a single solve none of them would match.
+		solve := solveAndSeed
+		if o.proxyFile != "" {
+			solve = solveAcrossProxies
+		}
+		if err := solve(ctx, o, target); err != nil {
 			return err
 		}
 	}
@@ -287,6 +305,7 @@ func parseFlags(args []string) (*options, string, error) {
 	fs.StringVar(&o.solveCache, "solve-cache", defaultSolveCachePath(), "")
 	fs.BoolVar(&o.solveRefresh, "solve-refresh", false, "")
 	fs.DurationVar(&o.solveMaxAge, "solve-max-age", 30*time.Minute, "")
+	fs.IntVar(&o.solveParallel, "solve-parallel", 2, "")
 
 	// Proxy
 	fs.StringVar(&o.proxy, "proxy", "", "")
@@ -408,15 +427,21 @@ func (o *options) normalize() error {
 			return fmt.Errorf("-solve-timeout %s is below the %s a browser launch needs",
 				o.solveTimeout, minSolveTimeout)
 		}
-		// One solve produces one cookie bound to one IP. A rotator hands each
-		// session a different exit, so all but the one that happened to match
-		// would replay a cookie issued to an address they are not using —
-		// which looks like the target blocking the client, not like a config
-		// error. Solving per session is a different design, not a flag.
-		if o.proxyFile != "" {
-			return errors.New("-solve cannot be combined with -proxy-file: cf_clearance is bound " +
-				"to the IP that earned it, and a rotator gives each session a different one. " +
-				"Use -proxy to solve and replay through a single exit")
+		// One solve produces one cookie bound to one IP, so a rotator needs one
+		// per exit rather than one per run — see solvefleet.go. Which is a
+		// browser launch and a challenge each, so the parallelism is a knob
+		// rather than a constant.
+		if o.solveParallel < 1 {
+			return fmt.Errorf("-solve-parallel must be at least 1, got %d", o.solveParallel)
+		}
+		// The rotator wins at dial time, so -proxy would be solved through and
+		// then never used — every session replaying a cookie earned at an
+		// address it does not dial from. Ambiguity about which exit a cookie
+		// belongs to is the one thing this must not have.
+		if o.proxy != "" && o.proxyFile != "" {
+			return errors.New("-solve takes -proxy or -proxy-file, not both: the list is what " +
+				"the sessions dial through, so a cookie solved through -proxy would be replayed " +
+				"from an exit it was never issued to")
 		}
 		// The solver drives a real Chromium, so the cookie is issued to a Chrome
 		// TLS fingerprint. Replaying it from the Safari profile presents a JA4
@@ -472,6 +497,8 @@ examples
   send -p chrome https://site.com           Chrome profile instead of Safari
   send -solve https://site.com              solve a Cloudflare challenge first
   send -solve https://site.com 30s 100      ...then load-test past it
+  send -solve https://site.com 1m 100 8 -proxy-file proxies.txt
+                                            ...one solve per exit, 8 clients
   send https://site.com 1m 200 50 -proxy-file proxies.txt
   send -n 50000 -c 300 -mode pipeline https://site.com
   send -X POST -H 'Content-Type: application/json' -d '{"a":1}' https://site.com/api
@@ -529,10 +556,18 @@ cloudflare
   -solve-max-age dur    how old a cached solve may be (default 30m)
   -solve-timeout dur    how long the solve may take (default 150s). Browser
                         startup comes out of this, so a small VPS needs more
+  -solve-parallel int   how many exits to solve at once with -proxy-file
+                        (default 2). Each one is a real Chromium
 
                         -solve routes through -proxy when one is set, because
-                        the cookie is bound to the issuing IP too. It cannot be
-                        combined with -proxy-file: one solve covers one exit
+                        the cookie is bound to the issuing IP too. With
+                        -proxy-file it solves once per exit instead — as many as
+                        -s has sessions to pin — and each session replays only
+                        the cookie its own proxy earned. Exits that fail to
+                        solve are dropped, and the ones that survive stop
+                        failing over to each other, since a cookie replayed from
+                        the wrong IP is a 403 that looks like the target simply
+                        blocking you. Give one or the other, not both
 
 request
   -X string       HTTP method (default GET)

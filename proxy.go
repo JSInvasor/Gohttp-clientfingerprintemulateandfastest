@@ -34,6 +34,10 @@ type ProxyRotator struct {
 	// Per-client views created via Pinned share the same proxyEntry pointers
 	// (and thus health) but carry their own primaryIdx + counter.
 	primaryIdx int
+
+	// noFailover drops the rotation from a pinned view: NextEntry returns the
+	// primary and nothing else, cooldown or not. See PinnedOnly.
+	noFailover bool
 }
 
 // proxyHealth is the failure policy shared by a rotator and all of its views.
@@ -123,6 +127,26 @@ func (pr *ProxyRotator) Pinned(idx int) *ProxyRotator {
 	}
 }
 
+// PinnedOnly is Pinned without the failover: the view returns proxies[idx] and
+// nothing else, even while that proxy is in cooldown.
+//
+// It exists for a run whose cookies are bound to an exit. Cloudflare issues
+// cf_clearance against (User-Agent, TLS fingerprint, source IP), so a client
+// that quietly rotates onto a sibling proxy replays the cookie from an address
+// it was never issued to — and the edge answers that with 403s indistinguishable
+// from the target simply blocking the client. Failing the dial is the honest
+// outcome: it names the dead proxy instead of hiding it behind a cookie that no
+// longer matches.
+//
+// Health is still shared with the parent and every sibling view, so failures on
+// this proxy are counted and reported like any other; only the rotation away
+// from them is dropped.
+func (pr *ProxyRotator) PinnedOnly(idx int) *ProxyRotator {
+	v := pr.Pinned(idx)
+	v.noFailover = true
+	return v
+}
+
 // NewProxyRotatorFromFile loads proxies from a file (one per line).
 func NewProxyRotatorFromFile(path string) (*ProxyRotator, error) {
 	f, err := os.Open(path)
@@ -185,8 +209,11 @@ func (pr *ProxyRotator) NextEntry() *proxyEntry {
 	// Sticky primary: prefer the pinned proxy while it is alive. Once it enters
 	// cooldown we fall through to the round-robin sweep for a live backup, and
 	// when its cooldown expires this check picks it up again (re-probing it).
+	//
+	// A PinnedOnly view never takes that fall-through: its caller holds state
+	// bound to this exit, so a backup would be worse than a failed dial.
 	if pr.primaryIdx >= 0 && pr.primaryIdx < n {
-		if p := pr.proxies[pr.primaryIdx]; p.deadUntilNs.Load() <= now {
+		if p := pr.proxies[pr.primaryIdx]; pr.noFailover || p.deadUntilNs.Load() <= now {
 			return p
 		}
 	}

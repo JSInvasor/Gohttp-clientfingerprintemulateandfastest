@@ -505,6 +505,7 @@ cd solver && npm install && cd ..
 go run ./cmd/send -solve https://site.com                       # solve, then one request
 go run ./cmd/send -solve https://site.com 30s 100                # solve, then a load run
 go run ./cmd/send -solve -proxy socks5://host:1080 https://site.com
+go run ./cmd/send -solve https://site.com 1m 100 8 -proxy-file proxies.txt
 ```
 
 ```
@@ -520,7 +521,7 @@ the handover from the browser that earned it to the client that replays it:
 |---|---|---|
 | User-Agent | the solver returns the UA it used, and the run is pinned to it | 403 on the first request |
 | JA3/JA4 | `-solve` implies `-p chrome`, since a real Chromium earned the cookie | works once, dies under load |
-| source IP | `-proxy` is handed to the solver, so it solves through the same exit | 403 from the first replay |
+| source IP | the exit is handed to the solver, so it solves through the address that will replay | 403 from the first replay |
 
 The solver claims the OS it is actually running, which for most deployments is
 Linux — `Chrome151LinuxUserAgent`, the same Chrome 151 identity with the Linux
@@ -535,11 +536,48 @@ self-consistent without a second knob.
 None of those fail loudly. A mismatch produces a cookie that works for one
 request and then stops, which looks exactly like the target simply blocking the
 client — so `send` refuses the combinations it cannot make consistent (`-p
-safari`, `-proxy-file`) rather than letting them fail that way at runtime.
+safari`) rather than letting them fail that way at runtime.
 
-`-proxy-file` is refused because one solve earns one cookie bound to one IP,
-while a rotator hands each session a different exit. Solving per session is a
-different design, not a flag.
+#### A proxy list
+
+One solve earns one cookie bound to one IP, and a rotator hands each session a
+different exit — so `-solve -proxy-file` solves the list rather than solving
+once and hoping. One exit, one solve, one identity, kept paired all the way into
+the session pool:
+
+```
+$ send -solve https://site.com 1m 100 4 -proxy-file proxies.txt
+12 proxies loaded but only 4 session(s) — solving 4 of them; raise -s to spread the run across more exits
+solving https://site.com through 4 exit(s), 2 at a time (up to 5m0s)
+1.2.3.4:8080: solving https://site.com with the browser in solver/ (via 1.2.3.4:8080, up to 2m30s)
+5.6.7.8:8080: solving https://site.com with the browser in solver/ (via 5.6.7.8:8080, up to 2m30s)
+1.2.3.4:8080: solved in 1m4s, 1 attempt(s), 4 cookie(s), chromium Chrome/151.0.7922.108
+1.2.3.4:8080: cf_clearance issued for .site.com
+...
+3 of 4 exits solved — the run uses those, and 4 session(s) share them
+```
+
+Three things keep the pairing honest:
+
+- **only the exits a session will pin are solved.** Sessions take
+  `proxies[i % len]`, so with `-s 4` the fifth proxy onward is never a session's
+  own exit — solving it would buy a cookie nothing replays.
+- **an exit that fails to solve is dropped from the list.** A proxy that cannot
+  get past the challenge in a real browser will not get past it here either, and
+  leaving it in spends a session's whole share of the run on 403s.
+- **the surviving sessions stop failing over to each other.** Normally a session
+  whose proxy is benched routes through a live sibling; with a solved cookie that
+  would present it from an address it was never issued to, so the pin is hard
+  (`ProxyRotator.PinnedOnly`) and a dead proxy fails its own session's dials
+  instead. Loud beats silent — `-proxy-stats` names it.
+
+Passwords are stripped from every line these print, so a `user:pass@host` list
+does not end up in a terminal scrollback or a pasted log.
+
+The cost is one challenge per exit, which is why `-solve-parallel` (default 2)
+exists — each solve is a real Chromium under Xvfb, several hundred MB while it
+runs, so the whole list at once thrashes a small box into timing every attempt
+out. The per-exit cache below is what makes the second run cheap.
 
 A solve is slow because most of it is Cloudflare's own challenge — its
 JavaScript runs, the Turnstile widget executes, the edge decides. A real browser
@@ -557,7 +595,10 @@ reusing the solve from 2m14s ago (1 cookie(s), expires in 27m45s)
 
 The entry is keyed by host **and** proxy, because `cf_clearance` is bound to the
 IP that earned it — a run through a different exit gets a miss rather than a
-dead cookie. `-solve-refresh` forces a new solve, `-solve-max-age` caps how old
+dead cookie. That key is also what makes a proxy list affordable: each exit has
+its own entry, so a second run through the same list starts from the cache
+rather than paying twelve challenges again. `-solve-refresh` forces a new solve,
+`-solve-max-age` caps how old
 an entry may be (default 30m, since Cloudflare can invalidate server-side well
 before the stated expiry), and `-solve-cache ""` turns it off. The file is
 written 0600: it holds a bearer token for the origin.

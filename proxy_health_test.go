@@ -81,6 +81,45 @@ func TestProxyRotatorConcurrentSettings(t *testing.T) {
 	wg.Wait()
 }
 
+// TestPinnedOnlyNeverRotates pins the difference between the two views. A
+// client holding a cf_clearance issued to one exit must never present it from
+// another, so a dead primary is a failed dial rather than a silent detour.
+func TestPinnedOnlyNeverRotates(t *testing.T) {
+	pr, err := NewProxyRotator([]string{"1.2.3.4:8080", "5.6.7.8:8080"})
+	if err != nil {
+		t.Fatalf("NewProxyRotator: %v", err)
+	}
+	pr.SetFailThreshold(1)
+	pr.SetCooldown(time.Hour)
+
+	strict := pr.PinnedOnly(0)
+	primary := strict.NextEntry()
+	if primary != pr.proxies[0] {
+		t.Fatal("PinnedOnly(0) did not start on proxies[0]")
+	}
+
+	// Bench it. The sticky view is expected to find a backup; the strict one is
+	// expected to keep handing back the exit its caller's cookie belongs to.
+	strict.MarkFailure(primary)
+	if pr.LiveCount() != 1 {
+		t.Fatalf("LiveCount = %d after one failure at threshold 1, want 1", pr.LiveCount())
+	}
+	for i := 0; i < 3; i++ {
+		if got := strict.NextEntry(); got != primary {
+			t.Fatalf("call %d rotated off the pinned exit", i)
+		}
+	}
+	if got := pr.Pinned(0).NextEntry(); got == primary {
+		t.Error("the ordinary Pinned view stopped failing over")
+	}
+
+	// Health is still shared, so the failure is visible to -proxy-stats and to
+	// every sibling rather than swallowed by the strict view.
+	if stats := pr.Stats(); stats[0].Failed != 1 || stats[0].Alive {
+		t.Errorf("stats[0] = %+v, want one failure and a benched proxy", stats[0])
+	}
+}
+
 // TestProxyRotatorNextOnEmpty pins that Next does not dereference a nil entry.
 func TestProxyRotatorNextOnEmpty(t *testing.T) {
 	var pr ProxyRotator

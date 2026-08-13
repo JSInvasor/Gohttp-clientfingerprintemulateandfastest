@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -120,21 +119,20 @@ func storeSolveCache(path, target, proxy string, res *solveResult) {
 	_ = os.WriteFile(filepath.Join(path, solveCacheKey(target, proxy)+".json"), raw, 0o600)
 }
 
-// seedFromCache applies a cached entry to the run, the same way a fresh solve
-// would.
-func seedFromCache(o *options, e *solveCacheEntry) {
+// seedFromCache turns a cached entry into the seed a fresh solve through this
+// exit would have produced, so the caller cannot tell the two apart.
+func seedFromCache(proxy string, e *solveCacheEntry) *solveSeed {
 	age := time.Since(e.SolvedAt).Truncate(time.Second)
 	left := "unknown"
 	if !e.ExpiresAt.IsZero() {
 		left = time.Until(e.ExpiresAt).Truncate(time.Second).String()
 	}
-	fmt.Fprintf(os.Stderr, "reusing the solve from %s ago (%d cookie(s), expires in %s) — "+
-		"pass -solve-refresh to earn a new one\n", age, len(e.Cookies), left)
+	logSolve(proxy, "reusing the solve from %s ago (%d cookie(s), expires in %s) — "+
+		"pass -solve-refresh to earn a new one", age, len(e.Cookies), left)
 
-	if o.userAgent == "" {
-		o.userAgent = e.UserAgent
-	}
+	seed := &solveSeed{proxy: proxy, userAgent: e.UserAgent}
 	for _, c := range e.Cookies {
-		o.cookies = append(o.cookies, c.Name+"="+c.Value)
+		seed.cookies = append(seed.cookies, c.Name+"="+c.Value)
 	}
+	return seed
 }

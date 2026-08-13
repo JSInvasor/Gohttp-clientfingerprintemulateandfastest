@@ -42,12 +42,12 @@ func TestSolveCacheRoundTrip(t *testing.T) {
 		t.Fatalf("entry = %+v", e)
 	}
 
-	seedFromCache(o, e)
-	if o.userAgent != "UA-151" {
-		t.Errorf("userAgent = %q, want the solved one", o.userAgent)
+	seed := seedFromCache("", e)
+	if seed.userAgent != "UA-151" {
+		t.Errorf("userAgent = %q, want the solved one", seed.userAgent)
 	}
-	if len(o.cookies) != 2 || o.cookies[0] != "cf_clearance=abc" {
-		t.Errorf("cookies = %v", o.cookies)
+	if len(seed.cookies) != 2 || seed.cookies[0] != "cf_clearance=abc" {
+		t.Errorf("cookies = %v", seed.cookies)
 	}
 }
 
