@@ -273,7 +273,10 @@ func runViaChromium(ctx context.Context, profile gofire.BrowserProfile, url, pro
 	// reference. This is the comparison that decides whether a solved cookie
 	// survives being replayed.
 	fmt.Println("\n-- this client against that same browser --")
-	client, err := buildClient(profile, proxy)
+	// Replay with the identity the solver actually presents, which is what
+	// `send -solve` does. Measuring the profile default against a browser on
+	// another OS would report a mismatch nothing at runtime has.
+	client, err := buildClient(profile, proxy, probe.SolverUserAgent)
 	if err != nil {
 		return err
 	}
@@ -283,7 +286,7 @@ func runViaChromium(ctx context.Context, profile gofire.BrowserProfile, url, pro
 	if err != nil {
 		return fmt.Errorf("capture this client's fingerprint: %w", err)
 	}
-	failed += report(diffCaptures(probe.Capture, *ours))
+	failed += report(diffCaptures(probe.Capture, *ours, profile == gofire.Chrome151))
 
 	if failed > 0 {
 		fmt.Printf("\n%d mismatch(es). Any of them can invalidate a cf_clearance issued by "+

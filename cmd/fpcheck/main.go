@@ -121,11 +121,17 @@ func selectProfiles(name string) ([]gofire.BrowserProfile, error) {
 	}
 }
 
-// buildClient creates the emulating client used for a live capture.
-func buildClient(profile gofire.BrowserProfile, proxy string) (*gofire.Client, error) {
+// buildClient creates the emulating client used for a live capture. userAgent
+// overrides the profile default, which -via-chromium needs: the solver claims
+// the OS it runs on, and comparing a Linux browser against a client still
+// pinned to Windows reports a difference the actual replay does not have.
+func buildClient(profile gofire.BrowserProfile, proxy, userAgent string) (*gofire.Client, error) {
 	opts := []gofire.Option{gofire.WithTimeout(25 * time.Second)}
 	if proxy != "" {
 		opts = append(opts, gofire.WithProxy(proxy))
+	}
+	if userAgent != "" {
+		opts = append(opts, gofire.WithUserAgent(userAgent))
 	}
 	client, err := gofire.Emulate(profile, opts...)
 	if err != nil {
@@ -166,7 +172,7 @@ func fetchRaw(ctx context.Context, client *gofire.Client, url string) ([]byte, e
 }
 
 func run(ctx context.Context, profile gofire.BrowserProfile, url, proxy, compare, save string, showFrames bool) error {
-	client, err := buildClient(profile, proxy)
+	client, err := buildClient(profile, proxy, "")
 	if err != nil {
 		return err
 	}
@@ -207,7 +213,7 @@ func run(ctx context.Context, profile gofire.BrowserProfile, url, proxy, compare
 			return err
 		}
 		fmt.Printf("comparing against %s\n\n", compare)
-		checks = diffCaptures(*want, got)
+		checks = diffCaptures(*want, got, profile == gofire.Chrome151)
 	} else {
 		ref := gofire.ReferenceFor(profile)
 		fmt.Printf("reference device: %s\n\n", ref.Device)
@@ -445,16 +451,34 @@ func describePriority(f *frame) string {
 // diffCaptures compares this client's capture against one taken from a real
 // browser hitting the same endpoint. This is the check that can actually move a
 // reference: everything else compares the client to values already committed.
-func diffCaptures(want, got capture) []check {
+//
+// permutesExtensions says the profile shuffles its ClientHello extension order
+// per connection, which Chrome has done since 110. Two captures are two
+// connections, so for such a profile JA3 differs every time — including between
+// two runs of the same real browser. Comparing it would report a failure on
+// every Chrome run and train the reader to ignore the output. JA4 sorts the
+// extensions, which is exactly why it is the check that means something here,
+// and ctls.ChromeReference pins no JA3 for the same reason.
+func diffCaptures(want, got capture, permutesExtensions bool) []check {
 	checks := []check{
 		{name: "user-agent", want: want.UserAgent, got: got.UserAgent},
 		{name: "tls.ja4", want: want.TLS.JA4, got: got.TLS.JA4},
 		{name: "tls.ja4_r", want: want.TLS.JA4R, got: got.TLS.JA4R},
-		{name: "tls.ja3", want: want.TLS.JA3, got: got.TLS.JA3},
-		{name: "tls.ja3_hash", want: want.TLS.JA3Hash, got: got.TLS.JA3Hash},
-		{name: "tls.peetprint_hash", want: want.TLS.PeetPrint, got: got.TLS.PeetPrint},
-		{name: "http2.akamai_fingerprint", want: want.HTTP2.AkamaiFingerprint, got: got.HTTP2.AkamaiFingerprint},
 	}
+	if permutesExtensions {
+		checks = append(checks,
+			check{name: "tls.ja3", skipped: true,
+				note: "this profile permutes its extension order per connection, so JA3 differs " +
+					"between any two connections — ja4 above is the comparable value"})
+	} else {
+		checks = append(checks,
+			check{name: "tls.ja3", want: want.TLS.JA3, got: got.TLS.JA3},
+			check{name: "tls.ja3_hash", want: want.TLS.JA3Hash, got: got.TLS.JA3Hash})
+	}
+	checks = append(checks,
+		check{name: "tls.peetprint_hash", want: want.TLS.PeetPrint, got: got.TLS.PeetPrint},
+		check{name: "http2.akamai_fingerprint", want: want.HTTP2.AkamaiFingerprint, got: got.HTTP2.AkamaiFingerprint},
+	)
 
 	wf, gf := want.headersFrame(), got.headersFrame()
 	if wf != nil && gf != nil {
