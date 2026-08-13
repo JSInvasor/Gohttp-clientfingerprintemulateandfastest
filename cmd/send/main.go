@@ -121,6 +121,11 @@ type options struct {
 	accept     string
 	referer    string
 
+	// Page shape
+	assets        bool
+	assetLimit    int
+	assetParallel int
+
 	// Challenge solving
 	solve        bool
 	solverDir    string
@@ -270,7 +275,11 @@ func parseFlags(args []string) (*options, string, error) {
 	fs.StringVar(&o.accept, "accept", "", "")
 	fs.StringVar(&o.referer, "referer", "", "")
 
-	// Challenge solving
+	// Page shape
+	fs.BoolVar(&o.assets, "assets", false, "")
+	fs.IntVar(&o.assetLimit, "asset-limit", 25, "")
+	fs.IntVar(&o.assetParallel, "asset-parallel", 6, "")
+
 	fs.BoolVar(&o.solve, "solve", false, "")
 	fs.StringVar(&o.solverDir, "solver-dir", "solver", "")
 	fs.DurationVar(&o.solveTimeout, "solve-timeout", defaultSolveTimeout, "")
@@ -497,6 +506,12 @@ identity
   -referer string Referer header to send
   -cookie k=v     seed a cookie into every session (repeatable)
   -fingerprint    print the profile's reference fingerprint and continue
+  -assets         after each document, fetch the stylesheets, scripts, images and
+                  preloaded fonts it references, with the headers Chrome sends
+                  for each. A document request with nothing following it is not
+                  what a page load looks like, and no TLS layer fixes that
+  -asset-limit int      most assets to take from one document (default 25)
+  -asset-parallel int   how many to fetch at once (default 6)
 
 cloudflare
   -solve                earn a cf_clearance with the real browser in solver/ and
@@ -696,6 +711,7 @@ func splitArgs(args []string) (posArgs []string, flagArgs []string) {
 		"-fingerprint":   true,
 		"-solve":         true,
 		"-solve-refresh": true,
+		"-assets":        true,
 	}
 
 	for i := 0; i < len(args); i++ {

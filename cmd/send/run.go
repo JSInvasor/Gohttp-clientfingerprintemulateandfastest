@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"sync"
@@ -53,6 +54,19 @@ func sendOne(ctx context.Context, client *gofire.Client, o *options, target stri
 
 	if bodyErr != nil {
 		return fmt.Errorf("read body: %w", bodyErr)
+	}
+
+	// A document with nothing following it is not what a page load looks like.
+	// This runs after the timings above so the numbers still describe the
+	// document alone.
+	if o.assets {
+		if docURL, err := url.Parse(target); err == nil {
+			found := parseAssets(data, docURL, o.assetLimit)
+			start := time.Now()
+			ok, failed := fetchAssets(ctx, client, docURL, found, o.assetParallel)
+			fmt.Fprintf(os.Stderr, "assets  %d referenced, %d fetched, %d failed  %s\n",
+				len(found), ok, failed, round(time.Since(start)))
+		}
 	}
 
 	switch {
