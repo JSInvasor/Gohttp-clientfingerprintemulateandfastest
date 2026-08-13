@@ -523,6 +523,32 @@ the handover from the browser that earned it to the client that replays it:
 | JA3/JA4 | `-solve` implies `-p chrome`, since a real Chromium earned the cookie | works once, dies under load |
 | source IP | the exit is handed to the solver, so it solves through the address that will replay | 403 from the first replay |
 
+The JA3/JA4 row has a second half the profile alone does not cover: Chrome's
+ClientHello changes between majors, so a cookie earned by the Chromium that
+happens to be installed and replayed as Chrome 151 is presented with a
+fingerprint it was never issued to. The solver reports the browser it drove as
+`chromium_major`, and `send` compares it to the version being replayed:
+
+```
+warning: the solver's Chromium is 141 but this client replays as Chrome 151 —
+  the cookie is bound to the TLS fingerprint that earned it, and the ClientHello moves
+  between majors, so it will work once and then stop under load.
+```
+
+Nothing else surfaces that. The UA is pinned by `solver/profile.js`, so a
+Chromium 141 solving with a Chrome 151 identity looks correct in every header —
+the version it actually shook hands with is the only tell, and it is now read
+rather than printed and discarded. `fpcheck -via-chromium` still measures how far
+apart the two really are.
+
+The language travels with them. `send` hands the solver whatever the run will
+replay with — `-lang`, or the library default — as `SOLVER_LANG`, and the solver
+pins it with `--accept-lang` and `--lang`. Left to itself the browser used the
+box's locale, so a localised image solved in one language and replayed in
+another; worse, the `navigator.languages` shim asserted `["en-US", "en"]`
+regardless, contradicting the browser's own header on any box that was not
+already en-US.
+
 The solver claims the OS it is actually running, which for most deployments is
 Linux — `Chrome151LinuxUserAgent`, the same Chrome 151 identity with the Linux
 OS token. Claiming Windows from a Linux box is a contradiction a JS challenge

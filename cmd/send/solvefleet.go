@@ -92,10 +92,11 @@ func solveAcrossProxies(ctx context.Context, o *options, target string) error {
 			"share them\n", len(kept), n, o.sessions)
 	}
 
-	// Every exit drives the same local Chromium, so the UAs agree unless
-	// something is wrong. Reported once, off the first seed, for the same reason
-	// it is checked at all: a UA the cookie was not issued to is a silent 403.
-	reportUADrift(keptSeeds[0].userAgent)
+	// Every exit drives the same local Chromium, so the identity it reports is
+	// the same for all of them. Checked once, off the first seed, for the same
+	// reason it is checked at all: a cookie replayed by a browser it was not
+	// issued to is a silent 403.
+	reportSolveDrift(&keptSeeds[0])
 	warnOnMixedUA(keptSeeds)
 
 	// The list the session pool builds its rotator from is now the solved one,

@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
 )
 
 // stubSolverDir writes an index.js that prints script verbatim, plus the
@@ -164,6 +167,106 @@ func TestRunSolverNoProxyMeansDirect(t *testing.T) {
 	if res.Proxy != "" {
 		t.Errorf("solver saw SOLVER_PROXY=%q, want it unset", res.Proxy)
 	}
+}
+
+// The solve and the replay have to ask for the same language. The solver had no
+// way to know what the run would advertise, so it used whatever the box's locale
+// produced — which on a localised image is not what gofire replays with.
+func TestRunSolverPassesLanguageThrough(t *testing.T) {
+	const stub = `process.stdout.write(JSON.stringify({status: "ok", user_agent: "UA-151",
+  cookie_list: [], url: process.env.SOLVER_LANG || ""}));
+`
+	o := solveOptions(stubSolverDir(t, stub))
+
+	// Unset, the run replays the library's default, so that is what the solve
+	// has to advertise.
+	res, err := runSolver(context.Background(), o, "https://site.test/", "")
+	if err != nil {
+		t.Fatalf("runSolver: %v", err)
+	}
+	if res.URL != gofire.DefaultAcceptLanguage {
+		t.Errorf("solver saw SOLVER_LANG=%q, want the library default %q",
+			res.URL, gofire.DefaultAcceptLanguage)
+	}
+
+	// -lang moves both halves together.
+	o.lang = "tr-TR,tr;q=0.9"
+	res, err = runSolver(context.Background(), o, "https://site.test/", "")
+	if err != nil {
+		t.Fatalf("runSolver: %v", err)
+	}
+	if res.URL != o.lang {
+		t.Errorf("solver saw SOLVER_LANG=%q, want -lang %q", res.URL, o.lang)
+	}
+}
+
+// The solver has always measured the Chromium it drives and printed it as
+// chromium_major. Nothing read it, so the one binding that can be checked
+// without a capture — the TLS fingerprint moving between Chrome majors — went
+// unreported until a run started failing under load.
+func TestChromiumDriftIsReported(t *testing.T) {
+	pinned := chromeMajorFromUA(gofire.Chrome151UserAgent)
+	if pinned == 0 {
+		t.Fatal("no Chrome major in the pinned UA")
+	}
+
+	// The solver's own output has to reach the seed, or there is nothing to
+	// compare in the first place.
+	o := solveOptions(stubSolverDir(t, printJS(okSolve)))
+	seed, err := solveOne(context.Background(), o, "https://site.test/", "")
+	if err != nil {
+		t.Fatalf("solveOne: %v", err)
+	}
+	if seed.chromiumMajor != 151 {
+		t.Errorf("seed.chromiumMajor = %d, want the solver's 151", seed.chromiumMajor)
+	}
+
+	if got := stderrOf(func() { reportChromiumDrift(pinned - 10) }); !strings.Contains(got, "under load") {
+		t.Errorf("a Chromium %d against a pin of %d produced no warning: %q", pinned-10, pinned, got)
+	}
+	if got := stderrOf(func() { reportChromiumDrift(pinned) }); got != "" {
+		t.Errorf("a matching Chromium warned anyway: %q", got)
+	}
+	// 0 is "not reported" — an older solver, or a cache entry from before this
+	// was recorded. Absence of a measurement is not evidence of drift.
+	if got := stderrOf(func() { reportChromiumDrift(0) }); got != "" {
+		t.Errorf("an unreported version warned: %q", got)
+	}
+}
+
+func TestChromeMajorFromUA(t *testing.T) {
+	if got := chromeMajorFromUA(gofire.Chrome151UserAgent); got != 151 {
+		t.Errorf("pinned UA major = %d, want 151", got)
+	}
+	for _, ua := range []string{"", "Mozilla/5.0", "Chrome/", "Chrome/abc"} {
+		if got := chromeMajorFromUA(ua); got != 0 {
+			t.Errorf("chromeMajorFromUA(%q) = %d, want 0", ua, got)
+		}
+	}
+}
+
+// stderrOf captures what fn writes to stderr.
+func stderrOf(fn func()) string {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return "pipe: " + err.Error()
+	}
+	saved := os.Stderr
+	os.Stderr = w
+
+	done := make(chan string, 1)
+	go func() {
+		var buf strings.Builder
+		io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+
+	fn()
+	w.Close()
+	os.Stderr = saved
+	out := <-done
+	r.Close()
+	return out
 }
 
 // Credentials in a proxy list end up in whatever the run's stderr is piped to.

@@ -38,6 +38,15 @@ type clientConfig struct {
 // callers who want it.
 const defaultMaxResponseBody = 256 << 20
 
+// DefaultAcceptLanguage is the Accept-Language every profile sends unless
+// WithAcceptLanguage overrides it.
+//
+// Exported because it is half of a pair. Anything that earns a credential in
+// one browser and replays it from this one — solver/, above all — has to
+// advertise the same language on both sides, and a value duplicated in two
+// places is a value that drifts.
+const DefaultAcceptLanguage = "en-US,en;q=0.9"
+
 func defaultClientConfig() clientConfig {
 	return clientConfig{
 		transport:       defaultTransportConfig(),
@@ -45,7 +54,7 @@ func defaultClientConfig() clientConfig {
 		followRedirects: true,
 		maxRedirects:    10,
 		timeout:         30 * time.Second,
-		acceptLanguage:  "en-US,en;q=0.9",
+		acceptLanguage:  DefaultAcceptLanguage,
 		accept:          defaultNavigateAccept,
 		maxResponseBody: defaultMaxResponseBody,
 	}

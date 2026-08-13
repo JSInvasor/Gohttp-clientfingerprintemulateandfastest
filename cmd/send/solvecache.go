@@ -32,6 +32,12 @@ type solveCacheEntry struct {
 	Cookies   []solvedCookie `json:"cookies"`
 	SolvedAt  time.Time      `json:"solved_at"`
 	ExpiresAt time.Time      `json:"expires_at"` // from cf_clearance, zero when absent
+
+	// ChromiumMajor is the browser that earned these cookies, so a reused solve
+	// reports the same fingerprint drift a fresh one would. Absent in entries
+	// written before this was recorded, which reads back as 0 — "not measured",
+	// which the check skips rather than treats as a match.
+	ChromiumMajor int `json:"chromium_major,omitempty"`
 }
 
 // solveCacheKey identifies a reusable solve. The UA is not in the key: it is
@@ -95,11 +101,12 @@ func storeSolveCache(path, target, proxy string, res *solveResult) {
 		host = u.Host
 	}
 	e := solveCacheEntry{
-		Host:      host,
-		Proxy:     proxy,
-		UserAgent: res.UserAgent,
-		Cookies:   res.CookieList,
-		SolvedAt:  time.Now(),
+		Host:          host,
+		Proxy:         proxy,
+		UserAgent:     res.UserAgent,
+		Cookies:       res.CookieList,
+		SolvedAt:      time.Now(),
+		ChromiumMajor: res.ChromiumMajor,
 	}
 	for _, c := range res.CookieList {
 		if c.Name == "cf_clearance" && c.Expires > 0 {
@@ -130,7 +137,7 @@ func seedFromCache(proxy string, e *solveCacheEntry) *solveSeed {
 	logSolve(proxy, "reusing the solve from %s ago (%d cookie(s), expires in %s) — "+
 		"pass -solve-refresh to earn a new one", age, len(e.Cookies), left)
 
-	seed := &solveSeed{proxy: proxy, userAgent: e.UserAgent}
+	seed := &solveSeed{proxy: proxy, userAgent: e.UserAgent, chromiumMajor: e.ChromiumMajor}
 	for _, c := range e.Cookies {
 		seed.cookies = append(seed.cookies, c.Name+"="+c.Value)
 	}

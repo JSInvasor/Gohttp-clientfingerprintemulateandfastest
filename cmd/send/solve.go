@@ -53,17 +53,18 @@ const defaultSolveTimeout = 150 * time.Second
 
 // solveResult is what solver/index.js prints.
 type solveResult struct {
-	Status     string         `json:"status"`
-	Error      string         `json:"error"`
-	URL        string         `json:"url"`
-	UserAgent  string         `json:"user_agent"`
-	Cookies    string         `json:"cookies"`
-	CookieList []solvedCookie `json:"cookie_list"`
-	DurationMS int64          `json:"duration_ms"`
-	Attempts   int            `json:"attempts"`
-	Chromium   string         `json:"chromium_version"`
-	Proxy      string         `json:"proxy"`
-	LaunchMS   int64          `json:"launch_ms"`
+	Status        string         `json:"status"`
+	Error         string         `json:"error"`
+	URL           string         `json:"url"`
+	UserAgent     string         `json:"user_agent"`
+	Cookies       string         `json:"cookies"`
+	CookieList    []solvedCookie `json:"cookie_list"`
+	DurationMS    int64          `json:"duration_ms"`
+	Attempts      int            `json:"attempts"`
+	Chromium      string         `json:"chromium_version"`
+	ChromiumMajor int            `json:"chromium_major"`
+	Proxy         string         `json:"proxy"`
+	LaunchMS      int64          `json:"launch_ms"`
 }
 
 type solvedCookie struct {
@@ -81,9 +82,10 @@ type solvedCookie struct {
 // the source IP is part of what the cookie is bound to, so the pairing has to
 // hold all the way into the session pool.
 type solveSeed struct {
-	proxy     string
-	userAgent string
-	cookies   []string
+	proxy         string
+	userAgent     string
+	cookies       []string
+	chromiumMajor int
 }
 
 // solveLog serialises the progress lines. Exits solve in parallel, and a
@@ -106,6 +108,21 @@ func logSolve(proxy, format string, args ...any) {
 	solveLog.Lock()
 	defer solveLog.Unlock()
 	fmt.Fprintln(os.Stderr, msg)
+}
+
+// acceptLanguage is the Accept-Language this run will replay with, which is
+// what the solve has to advertise too.
+//
+// Cloudflare does not bind cf_clearance to the language, but the challenge is
+// served in it and the score is computed from the whole request: a solve that
+// asked for de-DE and a replay that asks for en-US are not the same client, and
+// the difference costs nothing to remove. The library's default is read rather
+// than repeated so the two cannot drift apart.
+func acceptLanguage(o *options) string {
+	if o.lang != "" {
+		return o.lang
+	}
+	return gofire.DefaultAcceptLanguage
 }
 
 // redactProxy renders a proxy URL without its password.
@@ -167,17 +184,20 @@ func runSolver(ctx context.Context, o *options, target, proxy string) (*solveRes
 	cmd := exec.CommandContext(solveCtx, "node", script, target, strconv.Itoa(seconds))
 	cmd.Stderr = os.Stderr // puppeteer's launch diagnostics are worth seeing
 
-	// The exit is set on the environment rather than inherited from it. An
-	// exported SOLVER_PROXY used to reach the browser on its own, so a solve
-	// this run believed was direct went out through an exit it never asked for —
-	// and the cookie was cached under "direct" and replayed from this box, which
-	// is the silent 403 the whole file is about.
+	// The solver's identity is set on the environment rather than inherited from
+	// it. An exported SOLVER_PROXY used to reach the browser on its own, so a
+	// solve this run believed was direct went out through an exit it never asked
+	// for — and the cookie was cached under "direct" and replayed from this box,
+	// which is the silent 403 the whole file is about. SOLVER_LANG is passed for
+	// the same reason it is passed at all: the run advertises one
+	// Accept-Language and the solve has to advertise the same one.
 	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		return strings.HasPrefix(kv, "SOLVER_PROXY=")
+		return strings.HasPrefix(kv, "SOLVER_PROXY=") || strings.HasPrefix(kv, "SOLVER_LANG=")
 	})
 	if proxy != "" {
 		env = append(env, "SOLVER_PROXY="+proxy)
 	}
+	env = append(env, "SOLVER_LANG="+acceptLanguage(o))
 	cmd.Env = env
 
 	out, err := cmd.Output()
@@ -254,7 +274,7 @@ func solveAndSeed(ctx context.Context, o *options, target string) error {
 	if err != nil {
 		return err
 	}
-	reportUADrift(seed.userAgent)
+	reportSolveDrift(seed)
 
 	// The UA the cookie was issued to wins over the profile's default, but not
 	// over an explicit -ua: an override the user typed is a deliberate choice,
@@ -331,7 +351,7 @@ func solveOne(ctx context.Context, o *options, target, proxy string) (*solveSeed
 	}
 	logSolve(proxy, "%s", report)
 
-	seed := &solveSeed{proxy: proxy, userAgent: res.UserAgent}
+	seed := &solveSeed{proxy: proxy, userAgent: res.UserAgent, chromiumMajor: res.ChromiumMajor}
 	for _, c := range res.CookieList {
 		seed.cookies = append(seed.cookies, c.Name+"="+c.Value)
 	}
@@ -339,6 +359,63 @@ func solveOne(ctx context.Context, o *options, target, proxy string) (*solveSeed
 		storeSolveCache(o.solveCache, target, proxy, res)
 	}
 	return seed, nil
+}
+
+// reportSolveDrift checks the solved identity against the one this client will
+// replay it with, and says so rather than silently living with a difference.
+//
+// A fleet solve calls this once rather than once per exit. Every exit drives the
+// same local Chromium, so drift is a property of this box, and repeating it per
+// proxy would bury the per-exit results under copies of one warning.
+func reportSolveDrift(seed *solveSeed) {
+	reportUADrift(seed.userAgent)
+	reportChromiumDrift(seed.chromiumMajor)
+}
+
+// reportChromiumDrift warns when the browser that earned the cookie is not the
+// browser version this client claims to be.
+//
+// The solver has always measured this and printed it as chromium_major, and
+// nothing read it. It is the third binding — JA3/JA4 — arriving in the one form
+// that can be checked without a capture: Chrome's ClientHello changes between
+// majors, so a cookie earned by Chromium 141 and replayed as Chrome 151 is
+// presented with a fingerprint it was never issued to. That is the failure the
+// README describes as "works once, dies under load", and it was diagnosable only
+// by running fpcheck separately and knowing to.
+//
+// A warning rather than an error: the run may still be worth having (Bot Fight
+// Mode alone does not check this hard), and the fix — a Chromium upgrade or a
+// re-pin — is not something to discover mid-run.
+func reportChromiumDrift(major int) {
+	// 0 is "not reported": an older solver, or a cache entry written before this
+	// was recorded. Absence of a measurement is not evidence of a match, but it
+	// is not evidence of drift either.
+	if major == 0 {
+		return
+	}
+	want := chromeMajorFromUA(gofire.Chrome151UserAgent)
+	if want == 0 || want == major {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "warning: the solver's Chromium is %d but this client replays as Chrome %d —\n"+
+		"  the cookie is bound to the TLS fingerprint that earned it, and the ClientHello moves\n"+
+		"  between majors, so it will work once and then stop under load.\n"+
+		"  Upgrade the browser in solver/, or run `go run ./cmd/fpcheck -via-chromium -profile chrome`\n"+
+		"  to see how far apart they actually are\n", major, want)
+}
+
+// chromeMajorFromUA pulls the major out of a Chrome/N.N.N.N token, or 0.
+func chromeMajorFromUA(ua string) int {
+	_, rest, ok := strings.Cut(ua, "Chrome/")
+	if !ok {
+		return 0
+	}
+	major, _, _ := strings.Cut(rest, ".")
+	n, err := strconv.Atoi(major)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // reportUADrift compares the UA a solve came back with against the one this
@@ -349,10 +426,6 @@ func solveOne(ctx context.Context, o *options, target, proxy string) (*solveSeed
 // default: the solver claims the OS it actually has — a Linux VPS stays Linux —
 // and Sec-Ch-Ua-Platform follows the UA, so that difference is expected and
 // already handled. A difference in the browser identity is not.
-//
-// A fleet solve calls this once rather than once per exit. Every exit drives the
-// same local Chromium, so drift is a property of this box, and repeating it per
-// proxy would bury the per-exit results under copies of one warning.
 func reportUADrift(ua string) {
 	if ua == "" {
 		return

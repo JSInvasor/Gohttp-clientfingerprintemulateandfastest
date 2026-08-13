@@ -7,6 +7,14 @@
 //   SOLVER_PROXY   scheme://[user:pass@]host:port — solve through this proxy.
 //                  cf_clearance is bound to the issuing IP, so a cookie earned
 //                  here and replayed from a different exit is dead on arrival.
+//   SOLVER_LANG    the Accept-Language to solve with, e.g. "en-US,en;q=0.9".
+//                  `send` passes whatever the run will replay with. Left unset
+//                  the browser used the box's locale, which on a localised image
+//                  is a language the replay never asks for — and which the
+//                  navigator.languages shim below then contradicted.
+//   SOLVER_UA, SOLVER_SEC_CH_UA, SOLVER_PLATFORM
+//                  re-pin the identity when solving from a box whose OS or
+//                  Chrome major differs; see profile.js.
 //
 // Output (stdout, single JSON line):
 //   { "status": "ok"|"no_clearance"|"error",
@@ -43,8 +51,10 @@
 
 import { connect } from "puppeteer-real-browser";
 import {
+  TARGET_LANG,
   TARGET_UA,
   connectOptions,
+  languageList,
   parseProxyURL,
   userAgentMetadata,
   chromiumMajor as parseChromiumMajor,
@@ -57,6 +67,8 @@ import {
   untrackBrowser,
 } from "./cleanup.js";
 import { cookiesForUrl } from "./cookies.js";
+import { detectChallengeInPage, isChallengeTitle } from "./challenge.js";
+import { withDeadline } from "./deadline.js";
 
 const MAX_ATTEMPTS = 2;
 // 75 was too small on a real box. Chromium under Xvfb takes ~20s to come up,
@@ -179,22 +191,6 @@ function rand(a, b) {
   return Math.floor(Math.random() * (b - a + 1)) + a;
 }
 
-// withDeadline rejects if promise has not settled by deadline. The work itself
-// keeps running — nothing here can cancel a launch mid-flight — but cleanup.js
-// kills the process tree on the way out, so an abandoned browser does not
-// outlive us.
-function withDeadline(promise, deadline, message) {
-  const remaining = deadline - Date.now();
-  if (remaining <= 0) return Promise.reject(new Error(message));
-  let timer;
-  return Promise.race([
-    promise.finally(() => clearTimeout(timer)),
-    new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(message)), remaining);
-    }),
-  ]);
-}
-
 // Launch a fresh real-browser session with stealth shims layered on top of
 // puppeteer-real-browser's existing rebrowser-puppeteer-core patches.
 async function launch() {
@@ -260,18 +256,24 @@ async function launch() {
   // Array of three plain objects: three separate tells in one property, plus a
   // plugins/mimeTypes pair (3 and 2) that no Chrome ever emits.
   //
-  // languages is the one that earns its place. Chrome sends
-  // Accept-Language: en-US,en;q=0.9 while navigator.languages reports only
-  // ["en-US"] here, and a header advertising a language the page object does
-  // not list is the kind of contradiction the rest of this repo exists to
-  // avoid. Restoring the second entry makes the two agree.
-  await page.evaluateOnNewDocument(() => {
+  // languages is the one that earns its place. Chrome sends the full
+  // Accept-Language list — en-US,en;q=0.9 — while navigator.languages reports
+  // only the primary tag, and a header advertising a language the page object
+  // does not list is the kind of contradiction the rest of this repo exists to
+  // avoid. Restoring the remaining entries makes the two agree.
+  //
+  // The list comes from TARGET_LANG rather than a literal. It used to be a
+  // hardcoded ["en-US", "en"], which was correct only for as long as the box's
+  // locale happened to be en-US: on any other image the shim asserted a language
+  // the browser was not asking for, manufacturing the very contradiction it was
+  // written to remove. Now --accept-lang, --lang and this all read one value.
+  await page.evaluateOnNewDocument((languages) => {
     try {
       Object.defineProperty(navigator, "languages", {
-        get: () => ["en-US", "en"],
+        get: () => languages,
       });
     } catch {}
-  });
+  }, languageList(TARGET_LANG));
 
   return { browser, page, chromiumVersion, chromiumMajor: chromiumMajorVersion };
 }
@@ -292,16 +294,19 @@ async function waitForClearance(browser, page, deadline) {
     const cf = cookies.find((c) => c.name === "cf_clearance");
     if (cf) return { cleared: true, cookie: cf };
 
-    const title = await page.title().catch(() => "");
-    if (
-      title &&
-      !/just a moment|attention required|checking your browser|verify you are human/i.test(
-        title
-      )
-    ) {
-      // Page is past the challenge gate even without an explicit clearance
-      // cookie (some sites use Bot Fight Mode without UAM).
-      return { cleared: false, challenged: false };
+    // Structure first, wording second. The markers are language-independent, so
+    // a localised or reworded interstitial keeps its budget instead of being
+    // read as "this site never challenged us" — see challenge.js. A probe that
+    // cannot run (an execution context torn down mid-navigation) answers null
+    // and leaves the decision to the title exactly as before.
+    const challenged = await page.evaluate(detectChallengeInPage).catch(() => null);
+    if (challenged !== true) {
+      const title = await page.title().catch(() => "");
+      if (title && !isChallengeTitle(title)) {
+        // Page is past the challenge gate even without an explicit clearance
+        // cookie (some sites use Bot Fight Mode without UAM).
+        return { cleared: false, challenged: false };
+      }
     }
     await sleep(500);
   }
@@ -419,7 +424,16 @@ async function attempt(attemptNum, attemptDeadline) {
     const launched = await withDeadline(
       launch(),
       attemptDeadline,
-      "browser launch did not finish before the attempt deadline"
+      "browser launch did not finish before the attempt deadline",
+      // A launch that lost the race still comes up. Closing it here is what
+      // keeps the retry from running beside a full Chromium nobody owns —
+      // cleanup() would only collect it at process exit, which on the box this
+      // is tuned for is the difference between one browser and two.
+      (late) => {
+        if (!late || !late.browser) return;
+        untrackBrowser(late.browser);
+        return late.browser.close();
+      }
     );
     launchMs = Date.now() - launchStart;
     browser = launched.browser;

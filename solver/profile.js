@@ -74,6 +74,40 @@ export const TARGET_PLATFORM = process.env.SOLVER_PLATFORM || "Linux";
 export const TARGET_PLATFORM_VERSION =
   process.env.SOLVER_PLATFORM_VERSION ?? (TARGET_PLATFORM === "Linux" ? "" : "10.0.0");
 
+// TARGET_LANG is the Accept-Language the solve advertises, and like the UA it
+// has to be the one gofire replays with — send passes its own value in through
+// SOLVER_LANG so the two cannot drift.
+//
+// It was previously nothing at all: Chromium sent whatever the box's locale
+// produced. On the usual en-US image that happened to match gofire's default and
+// nobody noticed. On a localised image it does not, and it breaks two things at
+// once. The replay advertises a language the solve never did — one more leg of
+// the handover that silently differs — and index.js's navigator.languages shim
+// hardcoded ["en-US", "en"], so the page object contradicted the browser's own
+// header. That shim exists to remove exactly that contradiction; on a de_DE or
+// tr_TR box it was manufacturing it.
+//
+// Pinning it here also makes the README's advice actionable rather than
+// aspirational: match the language to where the exit is, and both halves of the
+// handover follow.
+export const TARGET_LANG = process.env.SOLVER_LANG || "en-US,en;q=0.9";
+
+// languageList turns an Accept-Language header into the array
+// navigator.languages reports: quality values dropped, order kept, duplicates
+// removed. "en-US,en;q=0.9" -> ["en-US", "en"].
+export function languageList(header) {
+  const tags = String(header || "")
+    .split(",")
+    .map((part) => part.split(";")[0].trim())
+    .filter(Boolean);
+  return [...new Set(tags)];
+}
+
+// primaryLanguage is the first tag, which is what --lang takes.
+export function primaryLanguage(header) {
+  return languageList(header)[0] || "";
+}
+
 // LAUNCH_ARGS and CONNECT_OPTIONS are shared so the fingerprint probe measures
 // the same browser configuration the solver runs. Launch flags can move the
 // TLS layer — a --disable-features that switches off post-quantum key agreement
@@ -103,6 +137,11 @@ export const LAUNCH_ARGS = [
   // to an explicit software renderer and only invites the two to disagree.
   "--use-gl=angle",
   "--use-angle=swiftshader",
+  // The language, from one value. --accept-lang sets the header, --lang sets
+  // the UI locale navigator.languages derives from; giving only one of them is
+  // how a browser ends up asking for one language and reporting another.
+  `--accept-lang=${TARGET_LANG}`,
+  `--lang=${primaryLanguage(TARGET_LANG) || "en-US"}`,
 ];
 
 export const CONNECT_OPTIONS = {
@@ -135,9 +174,25 @@ export function parseProxyURL(raw) {
   return {
     host: scheme === "http" ? u.hostname : `${scheme}://${u.hostname}`,
     port: u.port,
-    username: decodeURIComponent(u.username || ""),
-    password: decodeURIComponent(u.password || ""),
+    username: percentDecode(u.username),
+    password: percentDecode(u.password),
   };
+}
+
+// percentDecode undoes the escaping the URL parser applies to credentials, and
+// keeps the raw value when there is nothing valid to undo.
+//
+// decodeURIComponent throws URIError on a lone '%', which a password is entitled
+// to contain — the parser stores it verbatim rather than escaping it, so the
+// round trip is not symmetric. Throwing there rejected a working proxy with
+// "URI malformed", a message that names neither the proxy nor the field.
+function percentDecode(value) {
+  const raw = String(value || "");
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
 }
 
 // connectOptions is CONNECT_OPTIONS plus an optional proxy.
