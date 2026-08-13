@@ -36,7 +36,9 @@ func TestNoDuplicateExtensionTypes(t *testing.T) {
 
 	builders := map[string]func(string, []string, *keyMaterial) ([]byte, error){
 		"safari": buildSafariClientHello,
-		"chrome": buildChromeClientHello,
+		"chrome": func(sn string, alpn []string, km *keyMaterial) ([]byte, error) {
+			return buildChromeClientHello(sn, alpn, km, nil)
+		},
 	}
 
 	for name, build := range builders {
@@ -102,7 +104,9 @@ func TestKeyShareGroupsAreAdvertised(t *testing.T) {
 
 	builders := map[string]func(string, []string, *keyMaterial) ([]byte, error){
 		"safari": buildSafariClientHello,
-		"chrome": buildChromeClientHello,
+		"chrome": func(sn string, alpn []string, km *keyMaterial) ([]byte, error) {
+			return buildChromeClientHello(sn, alpn, km, nil)
+		},
 	}
 
 	for name, build := range builders {
@@ -195,7 +199,9 @@ func TestSNIOmittedForAddressLiterals(t *testing.T) {
 
 	builders := map[string]func(string, []string, *keyMaterial) ([]byte, error){
 		"safari": buildSafariClientHello,
-		"chrome": buildChromeClientHello,
+		"chrome": func(sn string, alpn []string, km *keyMaterial) ([]byte, error) {
+			return buildChromeClientHello(sn, alpn, km, nil)
+		},
 	}
 
 	for name, build := range builders {
@@ -299,7 +305,9 @@ func TestExtensionsAreSelfConsistent(t *testing.T) {
 	}
 	builders := map[string]func(string, []string, *keyMaterial) ([]byte, error){
 		"safari": buildSafariClientHello,
-		"chrome": buildChromeClientHello,
+		"chrome": func(sn string, alpn []string, km *keyMaterial) ([]byte, error) {
+			return buildChromeClientHello(sn, alpn, km, nil)
+		},
 	}
 
 	for bname, build := range builders {

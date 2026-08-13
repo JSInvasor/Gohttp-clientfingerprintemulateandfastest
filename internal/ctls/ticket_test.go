@@ -291,3 +291,109 @@ func testCert(t *testing.T) (tls.Certificate, *x509.CertPool) {
 	pool.AddCert(leaf)
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}, pool
 }
+
+// The one that proves the binder. A wrong binder is not a soft failure: the
+// server rejects the handshake outright, so this passing means the HMAC covers
+// exactly the bytes RFC 8446 §4.2.11.2 says it does.
+func TestResumedHandshake(t *testing.T) {
+	cert, pool := testCert(t)
+	srv := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"http/1.1"},
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", srv)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	resumed := make(chan bool, 4)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				tc := c.(*tls.Conn)
+				if err := tc.HandshakeContext(t.Context()); err != nil {
+					return
+				}
+				resumed <- tc.ConnectionState().DidResume
+				buf := make([]byte, 512)
+				c.Read(buf)
+				io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+				time.Sleep(250 * time.Millisecond)
+			}(c)
+		}
+	}()
+
+	cache := NewSessionCache(8)
+
+	dial := func() *Conn {
+		t.Helper()
+		raw, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		conn, err := WrapConnResuming(t.Context(), raw, "127.0.0.1",
+			[]string{"http/1.1"}, false, pool, BrowserChrome, cache)
+		if err != nil {
+			t.Fatalf("handshake: %v", err)
+		}
+		return conn
+	}
+
+	// First connection: full handshake, and the tickets it earns land in the
+	// cache only once the response has been read past.
+	c1 := dial()
+	if c1.ConnectionState().DidResume {
+		t.Error("the first connection reported a resumption")
+	}
+	if _, err := io.WriteString(c1, "GET / HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && cache.Len() == 0 {
+		c1.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+		if _, err := c1.Read(buf); err != nil {
+			break
+		}
+	}
+	c1.Close()
+
+	if cache.Len() == 0 {
+		t.Fatal("no ticket to resume with")
+	}
+	if got := <-resumed; got {
+		t.Error("the server saw the first connection as resumed")
+	}
+
+	// Second connection: the ticket goes back out as a PSK.
+	c2 := dial()
+	defer c2.Close()
+
+	if !c2.ConnectionState().DidResume {
+		t.Error("the client did not report a resumption")
+	}
+	if got := <-resumed; !got {
+		t.Fatal("the server did not accept the PSK — the binder or the age is wrong")
+	}
+
+	// A resumed connection still has to carry data, which is what proves the
+	// key schedule took the PSK rather than merely surviving the handshake.
+	if _, err := io.WriteString(c2, "GET / HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+		t.Fatalf("write on resumed conn: %v", err)
+	}
+	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := c2.Read(buf)
+	if err != nil {
+		t.Fatalf("read on resumed conn: %v", err)
+	}
+	if !bytes.Contains(buf[:n], []byte("200 OK")) {
+		t.Errorf("resumed connection returned %q", buf[:n])
+	}
+}

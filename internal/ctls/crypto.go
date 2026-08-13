@@ -144,6 +144,36 @@ func newKeySchedule(suite uint16) *tlsKeySchedule {
 	}
 }
 
+// newKeyScheduleWithPSK is newKeySchedule with a resumption PSK as the Extract
+// input instead of zeros:
+//
+//	early_secret = HKDF-Extract(0, PSK)
+//
+// That single substitution is what makes every later secret in the schedule
+// depend on the resumed session. Everything downstream is unchanged, which is
+// why resumption and a full handshake share one code path from here on.
+func newKeyScheduleWithPSK(suite uint16, psk []byte) *tlsKeySchedule {
+	h := hashForCipher(suite)
+	hl := h().Size()
+	if len(psk) == 0 {
+		psk = make([]byte, hl)
+	}
+	return &tlsKeySchedule{
+		suite:       suite,
+		h:           h,
+		earlySecret: hkdfExtract(h, make([]byte, hl), psk),
+	}
+}
+
+// resumableSuites are the suites a cached ticket may have been issued under,
+// most preferred first. It mirrors what the ClientHello offers: a ticket for a
+// suite this client never proposes could never be selected.
+var resumableSuites = []uint16{
+	cipherTLS_AES_128_GCM_SHA256,
+	cipherTLS_AES_256_GCM_SHA384,
+	cipherTLS_CHACHA20_POLY1305_SHA256,
+}
+
 // deriveHandshakeSecrets derives handshake traffic secrets from DHE result.
 // transcriptHash is the hash of ClientHello + ServerHello.
 func (ks *tlsKeySchedule) deriveHandshakeSecrets(dhe []byte, transcriptHash []byte) {

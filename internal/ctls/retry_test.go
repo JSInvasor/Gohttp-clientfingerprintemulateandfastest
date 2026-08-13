@@ -254,7 +254,9 @@ func newRetryState(t *testing.T, browser BrowserType) *handshakeState {
 	}
 	build := buildSafariClientHello
 	if browser == BrowserChrome {
-		build = buildChromeClientHello
+		build = func(sn string, alpn []string, km *keyMaterial) ([]byte, error) {
+			return buildChromeClientHello(sn, alpn, km, nil)
+		}
 	}
 	ch, err := build("example.com", []string{"h2", "http/1.1"}, km)
 	if err != nil {

@@ -32,8 +32,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/net/http/httpguts"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/http2/hpack"
+	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/idna"
 )
 

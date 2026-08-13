@@ -15,7 +15,7 @@ func newHandshakeStateWithHello(t *testing.T, alpn []string) *handshakeState {
 	if err != nil {
 		t.Fatalf("generateKeyMaterial: %v", err)
 	}
-	ch, err := buildChromeClientHello("example.com", alpn, km)
+	ch, err := buildChromeClientHello("example.com", alpn, km, nil)
 	if err != nil {
 		t.Fatalf("buildChromeClientHello: %v", err)
 	}
@@ -394,7 +394,9 @@ func TestClientHelloSessionIDReadBack(t *testing.T) {
 	}
 
 	for name, build := range map[string]func(string, []string, *keyMaterial) ([]byte, error){
-		"chrome": buildChromeClientHello,
+		"chrome": func(sn string, alpn []string, km *keyMaterial) ([]byte, error) {
+			return buildChromeClientHello(sn, alpn, km, nil)
+		},
 		"safari": buildSafariClientHello,
 	} {
 		t.Run(name, func(t *testing.T) {

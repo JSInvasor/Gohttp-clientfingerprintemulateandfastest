@@ -43,6 +43,9 @@ type handshakeState struct {
 	conn       net.Conn
 	br         *bufio.Reader
 	serverName string
+	sessions   *SessionCache
+	psk        *pskOffer
+	resumed    bool
 	alpn       []string
 	skipVerify bool
 	rootCAs    *x509.CertPool
@@ -74,7 +77,7 @@ type handshakeState struct {
 // matters for what this package exists to do: a browser answers a bad
 // certificate or an unusable ServerHello with an alert, so a client that
 // instead vanishes mid-handshake looks like nothing that ships on a phone.
-func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType) (*Conn, error) {
+func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType, sessions *SessionCache) (*Conn, error) {
 	km, err := generateKeyMaterial()
 	if err != nil {
 		return nil, withAlert(alertInternalError, fmt.Errorf("generate keys: %w", err))
@@ -84,6 +87,7 @@ func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool,
 		conn:       conn,
 		br:         newRecordReader(conn),
 		serverName: serverName,
+		sessions:   sessions,
 		alpn:       alpn,
 		skipVerify: skipVerify,
 		rootCAs:    rootCAs,
@@ -250,13 +254,21 @@ func (hs *handshakeState) sendChangeCipherSpec() error {
 }
 
 func (hs *handshakeState) run() (*Conn, error) {
+	// Take a ticket before building the hello: whether one is offered decides
+	// the shape of the message, and the binder is computed from its PSK.
+	hs.psk = newPSKOffer(hs.sessions, hs.serverName, resumableSuites, time.Now())
+
 	var chMsg []byte
 	var err error
 	switch hs.browser {
 	case BrowserChrome:
-		chMsg, err = buildChromeClientHello(hs.serverName, hs.alpn, hs.km)
+		chMsg, err = buildChromeClientHello(hs.serverName, hs.alpn, hs.km, hs.psk)
 	default:
+		// Safari's resumed ClientHello has not been captured, so it is not
+		// offered one. Sending a PSK shaped like a guess would trade a real
+		// fingerprint for an unverified one.
 		chMsg, err = buildSafariClientHello(hs.serverName, hs.alpn, hs.km)
+		hs.psk = nil
 	}
 	if err != nil {
 		return nil, withAlert(alertInternalError, fmt.Errorf("build client hello: %w", err))
@@ -290,7 +302,22 @@ func (hs *handshakeState) run() (*Conn, error) {
 		}
 	} else {
 		hs.suite = shell.suite
-		hs.ks = newKeySchedule(shell.suite)
+
+		// A PSK only enters the key schedule when the server took it *and* kept
+		// the suite it was derived under. Either half missing means a full
+		// handshake, which is the same code path with a zero PSK.
+		if hs.psk != nil {
+			accepted, perr := parseSelectedIdentity(shell.exts)
+			if perr != nil {
+				return nil, perr
+			}
+			hs.resumed = accepted && shell.suite == hs.psk.ticket.suite
+		}
+		if hs.resumed {
+			hs.ks = newKeyScheduleWithPSK(shell.suite, hs.psk.ticket.psk)
+		} else {
+			hs.ks = newKeySchedule(shell.suite)
+		}
 
 		// Initialize transcript with SHA-256 or SHA-384
 		hs.transcript = hs.ks.h()
@@ -509,7 +536,13 @@ func (hs *handshakeState) run() (*Conn, error) {
 	// A chain that never arrived, or one that arrived without a matching
 	// CertificateVerify, means the peer never proved it holds the private key.
 	// Neither may be treated as "nothing to check".
-	if !hs.skipVerify {
+	//
+	// A resumed handshake is the exception: RFC 8446 §2.2 has the server send
+	// neither Certificate nor CertificateVerify when it accepts a PSK, because
+	// the PSK is the authentication — it can only have come from a session this
+	// client already verified. Demanding a chain there would reject every
+	// successful resumption as a protocol violation.
+	if !hs.skipVerify && !hs.resumed {
 		if len(serverCerts) == 0 {
 			return nil, alertErrf(alertCertificateRequired, "server sent no certificate")
 		}
@@ -591,6 +624,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 		serverName:      hs.serverName,
 		negotiatedALPN:  hs.negotiatedALPN,
 		suite:           hs.suite,
+		didResume:       hs.resumed,
 		peerCerts:       serverCerts,
 		ks:              hs.ks,
 		serverAppSecret: hs.ks.serverAppTraffic,
@@ -852,13 +886,16 @@ func (hs *handshakeState) parseServerHello(sh *serverHelloShell) (dhe []byte, er
 		case extKeyShare:
 			keyShareData = extData
 		case extPreSharedKey:
-			// This stack never offers a PSK, so a server selecting one has
-			// picked from an empty list. Ignoring it used to mean deriving the
-			// key schedule without the PSK the server had already mixed in, and
-			// the handshake died several messages later at "server finished MAC
-			// mismatch" — a decryption symptom for what is really a ServerHello
-			// contract violation.
-			return alertErrf(alertIllegalParameter, "server selected a pre-shared key that was never offered")
+			// Selecting from an empty list is still a contract violation.
+			// Ignoring it used to mean deriving the key schedule without the PSK
+			// the server had already mixed in, and the handshake died several
+			// messages later at "server finished MAC mismatch" — a decryption
+			// symptom for what is really a ServerHello violation. When a PSK was
+			// offered, the acceptance was already read in run() and the schedule
+			// built from it, so there is nothing left to check here.
+			if hs.psk == nil {
+				return alertErrf(alertIllegalParameter, "server selected a pre-shared key that was never offered")
+			}
 		default:
 			if containsUint16(serverHelloForbiddenExtensions, extType) {
 				return alertErrf(alertUnsupportedExtension,

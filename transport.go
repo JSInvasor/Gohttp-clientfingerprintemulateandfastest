@@ -53,9 +53,15 @@ type Transport struct {
 	skipVerify  bool
 	browser     BrowserProfile
 	ctlsBrowser ctls.BrowserType // which ClientHello the TLS layer builds
-	dnscache    *dnsCache
-	connCount   atomic.Int64
-	dialer      *net.Dialer
+
+	// sessions carries TLS 1.3 session tickets between the connections this
+	// transport opens. A client that dials a host hundreds of times and resumes
+	// none of them is a client no browser reproduces — the pattern shows up
+	// whatever the ClientHello looks like.
+	sessions  *ctls.SessionCache
+	dnscache  *dnsCache
+	connCount atomic.Int64
+	dialer    *net.Dialer
 
 	// handshakeTimeout bounds one TLS handshake. It is held here because
 	// net/http will not apply it for us: http.Transport.TLSHandshakeTimeout is
@@ -164,6 +170,12 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		browser:    browser,
 
 		handshakeTimeout: cfg.TLSHandshakeTimeout,
+
+		// One cache per transport, which is one per Client — so a session's
+		// tickets stay inside the identity that earned them, the same way its
+		// cookies and its connection pool do. Sharing it across clients would
+		// let two identities present the same resumption credential.
+		sessions: ctls.NewSessionCache(0),
 	}
 
 	// Per-browser fingerprint tables.
@@ -520,7 +532,7 @@ func (t *Transport) wrapTLS(ctx context.Context, rawConn net.Conn, host string, 
 		ctx, cancel = context.WithTimeout(ctx, t.handshakeTimeout)
 		defer cancel()
 	}
-	return ctls.WrapConn(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, t.ctlsBrowser)
+	return ctls.WrapConnResuming(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, t.ctlsBrowser, t.sessions)
 }
 
 // isTransientDialErr classifies errors that are worth retrying. We only

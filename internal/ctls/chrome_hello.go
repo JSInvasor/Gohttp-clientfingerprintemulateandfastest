@@ -41,10 +41,10 @@ import (
 // Both profiles carry an X25519MLKEM768 + X25519 key_share and send no padding.
 
 // buildChromeClientHello builds the Chrome ClientHello handshake message.
-func buildChromeClientHello(serverName string, alpn []string, km *keyMaterial) ([]byte, error) {
+func buildChromeClientHello(serverName string, alpn []string, km *keyMaterial, psk *pskOffer) ([]byte, error) {
 	gs := newGreaseSet()
 
-	exts, err := buildChromeExtensions(serverName, alpn, km, gs)
+	exts, err := buildChromeExtensions(serverName, alpn, km, gs, psk)
 	if err != nil {
 		return nil, err
 	}
@@ -94,6 +94,12 @@ func buildChromeClientHello(serverName string, alpn []string, km *keyMaterial) (
 	msg[3] = byte(len(body))
 	copy(msg[4:], body)
 
+	// The binder is an HMAC over this very message, truncated just before the
+	// binder itself, so it can only be computed once the message is assembled.
+	if psk != nil {
+		finishBinder(msg, hashForCipher(psk.ticket.suite), psk.ticket.psk)
+	}
+
 	return msg, nil
 }
 
@@ -111,7 +117,7 @@ type chromeExt struct {
 // different JA3 hash. A fixed order produces zero JA3 entropy across
 // connections, which Cloudflare/Akamai score as a strong bot signal. JA4 is
 // unaffected — it sorts extensions before hashing.
-func buildChromeExtensions(serverName string, alpn []string, km *keyMaterial, gs greaseSet) ([]byte, error) {
+func buildChromeExtensions(serverName string, alpn []string, km *keyMaterial, gs greaseSet, psk *pskOffer) ([]byte, error) {
 	keyShareData, err := buildChromeKeyShare(km, gs)
 	if err != nil {
 		return nil, err
@@ -165,11 +171,16 @@ func buildChromeExtensions(serverName string, alpn []string, km *keyMaterial, gs
 	for _, e := range middle {
 		out = appendExt(out, e.typ, e.data)
 	}
-	// Last GREASE: pinned at the end, one zero byte. (pre_shared_key would have
-	// to come after this on a resumed session per RFC 8446, but we don't send
-	// PSK on initial connections, so the trailing GREASE is the final
-	// extension.)
+	// Last GREASE: pinned at the end, one zero byte — unless a PSK is offered,
+	// which RFC 8446 §4.2.11 requires to be the final extension. The capture in
+	// testdata/resumed-clienthello.txt shows Chrome doing exactly that: the
+	// trailing GREASE moves to second-to-last and pre_shared_key follows it.
 	out = appendExt(out, gs.extLast, []byte{0x00})
+
+	if psk != nil {
+		out = appendExt(out, extPreSharedKey,
+			buildPSKExtension(psk.ticket.identity, psk.age, hashForCipher(psk.ticket.suite)().Size()))
+	}
 
 	return out, nil
 }

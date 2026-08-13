@@ -44,6 +44,7 @@ type Conn struct {
 	// data stream, so this has to outlive the handshake that set it up.
 	sessions      *SessionCache
 	ticketsStored int
+	didResume     bool
 
 	// writeMu serialises everything that touches clientWriter. The AEAD
 	// sequence number it holds must advance exactly once per record, and
@@ -72,8 +73,7 @@ func (c *Conn) ConnectionState() tls.ConnectionState {
 		NegotiatedProtocolIsMutual: true,
 		CipherSuite:                c.suite,
 		PeerCertificates:           c.peerCerts,
-		// DidResume stays false: this package never offers a PSK, so every
-		// connection is a full handshake.
+		DidResume:                  c.didResume,
 	}
 }
 
@@ -194,8 +194,8 @@ func (c *Conn) Read(b []byte) (int, error) {
 }
 
 // handlePostHandshake processes handshake messages arriving after the handshake
-// completes. NewSessionTicket is dropped (this package never resumes), but
-// KeyUpdate must be acted on: once a server rekeys, every later record is
+// completes. NewSessionTicket is banked for resumption when a cache is attached,
+// and KeyUpdate must be acted on: once a server rekeys, every later record is
 // encrypted under the new secret, so ignoring it turns the rest of the
 // connection into decrypt failures. Long-lived, high-stream-count connections
 // are exactly the ones servers rekey.
@@ -420,6 +420,17 @@ func (c *Conn) SetSessionCache(cache *SessionCache) {
 // WrapConn performs the TLS 1.3 handshake over an existing net.Conn.
 // This is the main entry point for use with pre-dialed connections (proxies, etc.).
 func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType) (*Conn, error) {
+	return WrapConnResuming(ctx, rawConn, serverName, alpn, skipVerify, rootCAs, browser, nil)
+}
+
+// WrapConnResuming is WrapConn with a session cache: tickets from this
+// connection are deposited in it, and one already there is offered as a PSK.
+//
+// A resumed handshake is a shorter one, but that is not why it is here. A client
+// that opens hundreds of connections to a host and resumes none of them is a
+// client no browser reproduces — the pattern is visible whatever the
+// ClientHello looks like.
+func WrapConnResuming(ctx context.Context, rawConn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType, sessions *SessionCache) (*Conn, error) {
 	// Set deadline from the context, falling back to the package default so
 	// this can never run unbounded.
 	deadline, ok := ctx.Deadline()
@@ -431,11 +442,15 @@ func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []s
 		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 
-	tlsConn, err := handshake(rawConn, serverName, alpn, skipVerify, rootCAs, browser)
+	tlsConn, err := handshake(rawConn, serverName, alpn, skipVerify, rootCAs, browser, sessions)
 	if err != nil {
 		rawConn.Close()
 		return nil, fmt.Errorf("tls handshake: %w", err)
 	}
+
+	// Attached before the deadline is cleared so the tickets that follow the
+	// handshake land somewhere.
+	tlsConn.sessions = sessions
 
 	// Clear deadline after handshake
 	if err := rawConn.SetDeadline(time.Time{}); err != nil {
