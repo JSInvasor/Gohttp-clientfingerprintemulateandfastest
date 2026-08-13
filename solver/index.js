@@ -396,6 +396,7 @@ async function harvest(browser, page) {
 //     dead handle.
 async function attempt(attemptNum, attemptDeadline) {
   let browser = null;
+  let page = null;
   let chromiumVersion = "";
   let chromiumMajor = 0;
 
@@ -413,7 +414,7 @@ async function attempt(attemptNum, attemptDeadline) {
     browser = launched.browser;
     chromiumVersion = launched.chromiumVersion;
     chromiumMajor = launched.chromiumMajor;
-    const page = launched.page;
+    page = launched.page;
 
     const budgetMs = Math.max(1000, attemptDeadline - Date.now());
 
@@ -440,7 +441,16 @@ async function attempt(attemptNum, attemptDeadline) {
     // Re-read cookies post-behavior (interaction can elevate __cf_bm).
     return { ...(await harvest(browser, page)), chromiumVersion, chromiumMajor };
   } catch (err) {
+    // Harvest before giving up. A navigation timeout or a deadline hit is not a
+    // reason to throw away cookies the challenge page already set — a run whose
+    // goto timed out reported nothing at all, when the jar held the challenge's
+    // own cookies. The error is still what the status reports; the cookies ride
+    // along so the caller and solve()'s best-attempt pick can use them.
+    const salvaged = browser
+      ? await harvest(browser, page).catch(() => null)
+      : null;
     return {
+      ...(salvaged || {}),
       status: "error",
       error: errorMessage(err),
       chromiumVersion,
