@@ -109,8 +109,8 @@ func sendLoad(ctx context.Context, pool *sessionPool, o *options, target string,
 
 	if o.mode == modePipeline {
 		runPipeline(runCtx, pool, o, target, body, headers, st, limiter, &wg)
-	} else {
-		runWorkers(runCtx, pool, o, target, body, headers, st, limiter, &budget, &wg)
+	} else if err := runWorkers(runCtx, pool, o, target, body, headers, st, limiter, &budget, &wg); err != nil {
+		return err
 	}
 
 	done := make(chan struct{})
@@ -151,14 +151,16 @@ func describeRun(o *options, pool *sessionPool, target string) {
 // an identity, and an identity that jumps between workers mid-run would
 // interleave its cookies and its connection pool with everyone else's, which is
 // the thing having separate sessions was supposed to prevent.
-func runWorkers(ctx context.Context, pool *sessionPool, o *options, target string, body []byte, headers map[string]string, st *stats, lim *limiter, budget *atomic.Int64, wg *sync.WaitGroup) {
+func runWorkers(ctx context.Context, pool *sessionPool, o *options, target string, body []byte, headers map[string]string, st *stats, lim *limiter, budget *atomic.Int64, wg *sync.WaitGroup) error {
 	templates := make([]*http.Request, len(pool.sessions))
 	if o.mode == modeFast {
 		for i, s := range pool.sessions {
 			tmpl, err := newFastTemplate(s.client, o.method, target, headers, body)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "session %d: %v\n", i, err)
-				return
+				// Returned rather than printed. This used to start no workers
+				// and fall through to the summary, so a run that never sent a
+				// request printed a tidy report of zero and exited 0.
+				return fmt.Errorf("session %d: %w", i, err)
 			}
 			templates[i] = tmpl
 		}
@@ -216,6 +218,7 @@ func runWorkers(ctx context.Context, pool *sessionPool, o *options, target strin
 			}
 		}()
 	}
+	return nil
 }
 
 // runPipeline drives the pipeline mode. Each session owns a Pipeline sized to
@@ -358,28 +361,48 @@ func newLimiter(rate int) *limiter {
 	if rate <= 0 {
 		return &limiter{}
 	}
-	perSlice := max(rate/limiterSlicesPerSecond, 1)
 	l := &limiter{
-		// One slice of burst: enough that workers are not serialised on the
-		// refill, small enough that the cap holds over any visible window.
-		tokens: make(chan struct{}, perSlice),
+		// One slice of burst, and never less than one token: enough that
+		// workers are not serialised on the refill, small enough that the cap
+		// holds over any visible window. The floor matters for a rate below one
+		// per slice, where a zero-length bucket would have nowhere to put the
+		// token when it comes.
+		tokens: make(chan struct{}, max(rate/limiterSlicesPerSecond, 1)),
 		done:   make(chan struct{}),
 	}
 	go func() {
 		tick := time.NewTicker(time.Second / limiterSlicesPerSecond)
 		defer tick.Stop()
+
+		// carry is the fraction of a token left over from the previous slice.
+		//
+		// Without it the release per slice was rate/limiterSlicesPerSecond in
+		// integer division, which got both ends of the range wrong. Any rate
+		// below one per slice truncated to zero and was then floored back up to
+		// one, so everything under 100 released a hundred a second — -rps 10
+		// measured 100/s, ten times what was asked for, on the flag whose whole
+		// purpose is to go easy on a target. And any rate that was not a
+		// multiple of 100 rounded down: -rps 250 released 200, a fifth under.
+		//
+		// Carrying the remainder makes it exact on average — 250 goes 2, 3, 2,
+		// 3, and 10 releases one token every tenth slice.
+		carry := 0
 		for {
 			select {
 			case <-l.done:
 				return
 			case <-tick.C:
-				for i := 0; i < perSlice; i++ {
+				carry += rate
+				release := carry / limiterSlicesPerSecond
+				carry -= release * limiterSlicesPerSecond
+				for i := 0; i < release; i++ {
 					select {
 					case l.tokens <- struct{}{}:
 					default:
 						// Bucket full: the run is slower than the cap, so
-						// there is nothing to release.
-						i = perSlice
+						// there is nothing to release. The rest of this slice
+						// is dropped rather than saved into a later burst.
+						i = release
 					}
 				}
 			}

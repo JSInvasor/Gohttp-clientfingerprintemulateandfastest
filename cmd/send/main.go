@@ -271,8 +271,12 @@ func (o *options) singleShot() bool {
 	return o.count == 1 && o.duration == 0
 }
 
-func parseFlags(args []string) (*options, string, error) {
-	o := &options{}
+// newFlagSet declares every flag send accepts.
+//
+// Separate from parseFlags so the declarations have one home: splitArgs reads
+// which of them are booleans straight off this set, and the tests walk it to
+// check that none of them swallows the argument after it.
+func newFlagSet(o *options) *flag.FlagSet {
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 
 	// Request
@@ -350,7 +354,14 @@ func parseFlags(args []string) (*options, string, error) {
 	fs.BoolVar(&o.asJSON, "json", false, "")
 	fs.BoolVar(&o.fingerprint, "fingerprint", false, "")
 
-	posArgs, flagArgs := splitArgs(args)
+	return fs
+}
+
+func parseFlags(args []string) (*options, string, error) {
+	o := &options{}
+	fs := newFlagSet(o)
+
+	posArgs, flagArgs := splitArgs(fs, args)
 
 	fs.Usage = func() { printUsage(fs.Output()) }
 	if err := fs.Parse(flagArgs); err != nil {
@@ -754,28 +765,26 @@ func applyPositionalDials(o *options, args []string, given map[string]bool) ([]s
 // splitArgs separates positional arguments from flag options so that positional
 // parameters like URL, duration, threads, clients and rate can be given before
 // the flags.
-func splitArgs(args []string) (posArgs []string, flagArgs []string) {
-	// Every boolean flag has to be listed here. A bool takes no value, so one
-	// that is missing swallows whatever follows it — `send -solve https://site`
-	// would consume the URL as -solve's argument and then report that no URL was
-	// given. There is no way to derive this from the FlagSet at this point,
-	// because the split has to happen before Parse.
-	boolFlags := map[string]bool{
-		"-proxy-stats":   true,
-		"-http1":         true,
-		"-insecure":      true,
-		"-no-redirect":   true,
-		"-no-keepalive":  true,
-		"-tfo":           true,
-		"-tls-resume":    true,
-		"-i":             true,
-		"-silent":        true,
-		"-json":          true,
-		"-fingerprint":   true,
-		"-solve":         true,
-		"-solve-refresh": true,
-		"-solve-isolate": true,
-		"-assets":        true,
+//
+// Which names are booleans comes from the FlagSet rather than from a list kept
+// by hand. It matters because a bool takes no value, so one that is missing from
+// such a list swallows whatever follows it — `send -solve https://site` would
+// consume the URL as -solve's argument and then report that no URL was given.
+//
+// The list lived here because the split has to happen before Parse, and that is
+// true; but registration is not parsing. Every flag is declared by the time this
+// runs, so the FlagSet can simply be asked, and a bool added later cannot be
+// forgotten.
+func splitArgs(fs *flag.FlagSet, args []string) (posArgs []string, flagArgs []string) {
+	isBool := func(name string) bool {
+		f := fs.Lookup(name)
+		if f == nil {
+			return false
+		}
+		// The flag package marks value-less flags with this method, and reads it
+		// the same way to decide whether -x consumes what follows it.
+		bf, ok := f.Value.(interface{ IsBoolFlag() bool })
+		return ok && bf.IsBoolFlag()
 	}
 
 	for i := 0; i < len(args); i++ {
@@ -786,7 +795,7 @@ func splitArgs(args []string) (posArgs []string, flagArgs []string) {
 				continue
 			}
 			flagName := strings.TrimLeft(arg, "-")
-			if !boolFlags["-"+flagName] && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			if !isBool(flagName) && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 				i++
 				flagArgs = append(flagArgs, args[i])
 			}
