@@ -44,6 +44,7 @@ type handshakeState struct {
 	br         *bufio.Reader
 	serverName string
 	sessions   *SessionCache
+	sessionKey string
 	psk        *pskOffer
 	resumed    bool
 	alpn       []string
@@ -77,7 +78,10 @@ type handshakeState struct {
 // matters for what this package exists to do: a browser answers a bad
 // certificate or an unusable ServerHello with an alert, so a client that
 // instead vanishes mid-handshake looks like nothing that ships on a phone.
-func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType, sessions *SessionCache) (*Conn, error) {
+func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType, sessions *SessionCache, sessionKey string) (*Conn, error) {
+	if sessionKey == "" {
+		sessionKey = serverName
+	}
 	km, err := generateKeyMaterial()
 	if err != nil {
 		return nil, withAlert(alertInternalError, fmt.Errorf("generate keys: %w", err))
@@ -88,6 +92,7 @@ func handshake(conn net.Conn, serverName string, alpn []string, skipVerify bool,
 		br:         newRecordReader(conn),
 		serverName: serverName,
 		sessions:   sessions,
+		sessionKey: sessionKey,
 		alpn:       alpn,
 		skipVerify: skipVerify,
 		rootCAs:    rootCAs,
@@ -256,7 +261,7 @@ func (hs *handshakeState) sendChangeCipherSpec() error {
 func (hs *handshakeState) run() (*Conn, error) {
 	// Take a ticket before building the hello: whether one is offered decides
 	// the shape of the message, and the binder is computed from its PSK.
-	hs.psk = newPSKOffer(hs.sessions, hs.serverName, resumableSuites, time.Now())
+	hs.psk = newPSKOffer(hs.sessions, hs.sessionKey, resumableSuites, time.Now())
 
 	var chMsg []byte
 	var err error
@@ -303,15 +308,22 @@ func (hs *handshakeState) run() (*Conn, error) {
 	} else {
 		hs.suite = shell.suite
 
-		// A PSK only enters the key schedule when the server took it *and* kept
-		// the suite it was derived under. Either half missing means a full
-		// handshake, which is the same code path with a zero PSK.
+		// A PSK only enters the key schedule when the server took it *and* the
+		// suite it chose hashes the same way the ticket was derived under.
+		// Either half missing means a full handshake, which is the same code
+		// path with a zero PSK.
+		//
+		// The comparison is on the hash, not the suite: §4.2.11 permits a
+		// server to accept the PSK and negotiate any suite sharing its hash,
+		// and AES-128-GCM and ChaCha20-Poly1305 are both SHA-256. Requiring the
+		// exact suite back rejected that legal answer, and the resulting
+		// zero-PSK schedule failed at the server's Finished.
 		if hs.psk != nil {
 			accepted, perr := parseSelectedIdentity(shell.exts)
 			if perr != nil {
 				return nil, perr
 			}
-			hs.resumed = accepted && shell.suite == hs.psk.ticket.suite
+			hs.resumed = accepted && sameHashSuite(shell.suite, hs.psk.ticket.suite)
 		}
 		if hs.resumed {
 			hs.ks = newKeyScheduleWithPSK(shell.suite, hs.psk.ticket.psk)
@@ -622,6 +634,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 		Conn:            hs.conn,
 		br:              hs.br,
 		serverName:      hs.serverName,
+		sessionKey:      hs.sessionKey,
 		negotiatedALPN:  hs.negotiatedALPN,
 		suite:           hs.suite,
 		didResume:       hs.resumed,

@@ -6,6 +6,19 @@ This is the reference the PSK half of resumption is pinned against: it is what
 says pre_shared_key goes last, after even the trailing GREASE, and that the
 extension count moves by exactly one.
 
+TREAT IT AS PROVENANCE-UNKNOWN, NOT AS GROUND TRUTH. Two things do not survive
+checking. The peer is a Go crypto/tls server, so nothing here says how a real
+edge answers a resumed Chrome — only how one Go server did. And the extension
+lists below carry 0xca34, which is neither an IANA-registered ExtensionType nor
+a GREASE value: RFC 8701 allows only 0x0a0a, 0x1a1a, ... 0xfafa, and 0xcaca is
+the one in that range this resembles. A genuine capture cannot contain it.
+
+The two claims the builder actually rests on — pre_shared_key last, count plus
+one — are also plain RFC 8446 §4.2.11, so the code is not wrong for following
+them. But they are the RFC's authority, not this file's. Until a real capture
+replaces it, resumption stays behind WithTLSSessionResumption and off by
+default.
+
 === connection 1 — ClientHello 1784 bytes ===
   psk_key_exchange_modes: 0101
   19 extensions, in order:

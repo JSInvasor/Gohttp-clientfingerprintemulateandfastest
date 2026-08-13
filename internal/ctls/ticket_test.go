@@ -339,7 +339,7 @@ func TestResumedHandshake(t *testing.T) {
 			t.Fatalf("dial: %v", err)
 		}
 		conn, err := WrapConnResuming(t.Context(), raw, "127.0.0.1",
-			[]string{"http/1.1"}, false, pool, BrowserChrome, cache)
+			[]string{"http/1.1"}, false, pool, BrowserChrome, cache, "")
 		if err != nil {
 			t.Fatalf("handshake: %v", err)
 		}

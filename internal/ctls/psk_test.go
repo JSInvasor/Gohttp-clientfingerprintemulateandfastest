@@ -182,3 +182,33 @@ func hmacSum(h func() hash.Hash, key, data []byte) []byte {
 	m.Write(data)
 	return m.Sum(nil)
 }
+
+// A resumption PSK binds to a hash, not to an AEAD. RFC 8446 §4.2.11 lets the
+// server accept the PSK and then negotiate any suite sharing that hash, and
+// AES-128-GCM and ChaCha20-Poly1305 are both SHA-256 — an edge that prefers
+// ChaCha20 takes a ticket issued under AES-128 and answers with the other one,
+// which is legal and must count as a resumption.
+//
+// Comparing the suites instead of their hashes treated that answer as a
+// decline: the client derived a zero-PSK schedule against a server that had
+// already mixed the PSK in, and the handshake died at the server's Finished
+// several messages later.
+func TestSameHashSuite(t *testing.T) {
+	sha256Suites := []uint16{
+		cipherTLS_AES_128_GCM_SHA256,
+		cipherTLS_CHACHA20_POLY1305_SHA256,
+	}
+	for _, a := range sha256Suites {
+		for _, b := range sha256Suites {
+			if !sameHashSuite(a, b) {
+				t.Errorf("suites %04x and %04x are both SHA-256 but did not match", a, b)
+			}
+		}
+		if sameHashSuite(a, cipherTLS_AES_256_GCM_SHA384) {
+			t.Errorf("suite %04x (SHA-256) matched a SHA-384 suite", a)
+		}
+	}
+	if !sameHashSuite(cipherTLS_AES_256_GCM_SHA384, cipherTLS_AES_256_GCM_SHA384) {
+		t.Error("SHA-384 suite did not match itself")
+	}
+}

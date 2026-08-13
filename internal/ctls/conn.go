@@ -43,6 +43,7 @@ type Conn struct {
 	// supplied a cache. Tickets arrive after the handshake, on the application
 	// data stream, so this has to outlive the handshake that set it up.
 	sessions      *SessionCache
+	sessionKey    string
 	ticketsStored int
 	didResume     bool
 
@@ -258,7 +259,7 @@ func (c *Conn) handlePostHandshake(data []byte) error {
 			if len(psk) == 0 {
 				break
 			}
-			c.sessions.put(c.serverName, &sessionTicket{
+			c.sessions.put(c.sessionKey, &sessionTicket{
 				psk:        psk,
 				identity:   ticket,
 				ageAdd:     ageAdd,
@@ -420,7 +421,7 @@ func (c *Conn) SetSessionCache(cache *SessionCache) {
 // WrapConn performs the TLS 1.3 handshake over an existing net.Conn.
 // This is the main entry point for use with pre-dialed connections (proxies, etc.).
 func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType) (*Conn, error) {
-	return WrapConnResuming(ctx, rawConn, serverName, alpn, skipVerify, rootCAs, browser, nil)
+	return WrapConnResuming(ctx, rawConn, serverName, alpn, skipVerify, rootCAs, browser, nil, "")
 }
 
 // WrapConnResuming is WrapConn with a session cache: tickets from this
@@ -430,7 +431,15 @@ func WrapConn(ctx context.Context, rawConn net.Conn, serverName string, alpn []s
 // that opens hundreds of connections to a host and resumes none of them is a
 // client no browser reproduces — the pattern is visible whatever the
 // ClientHello looks like.
-func WrapConnResuming(ctx context.Context, rawConn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType, sessions *SessionCache) (*Conn, error) {
+//
+// sessionKey scopes the cache. It defaults to serverName, which is right only
+// when every connection to that host leaves from the same place. A ticket is a
+// credential the server issued to one peer, and offering it from somewhere else
+// is a claim to be that peer: an edge that sees a ticket it minted for one exit
+// IP come back from another has been handed a correlation no browser would ever
+// produce. Callers that rotate egress must fold the egress identity in here so
+// tickets stay with the route that earned them.
+func WrapConnResuming(ctx context.Context, rawConn net.Conn, serverName string, alpn []string, skipVerify bool, rootCAs *x509.CertPool, browser BrowserType, sessions *SessionCache, sessionKey string) (*Conn, error) {
 	// Set deadline from the context, falling back to the package default so
 	// this can never run unbounded.
 	deadline, ok := ctx.Deadline()
@@ -442,7 +451,7 @@ func WrapConnResuming(ctx context.Context, rawConn net.Conn, serverName string, 
 		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 
-	tlsConn, err := handshake(rawConn, serverName, alpn, skipVerify, rootCAs, browser, sessions)
+	tlsConn, err := handshake(rawConn, serverName, alpn, skipVerify, rootCAs, browser, sessions, sessionKey)
 	if err != nil {
 		rawConn.Close()
 		return nil, fmt.Errorf("tls handshake: %w", err)

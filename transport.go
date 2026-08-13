@@ -135,6 +135,21 @@ type TransportConfig struct {
 	// even though nothing above the transport can see it. Turn it on only when
 	// throughput matters more than blending in.
 	TCPFastOpen bool
+	// TLSSessionResumption offers a cached TLS 1.3 session ticket as a
+	// pre_shared_key on the second and later connections to a host.
+	//
+	// Default off. Real Chrome resumes, and a client that opens hundreds of
+	// connections to one host and resumes none of them is showing a pattern no
+	// browser produces — that is why the machinery exists. But offering a PSK
+	// changes the ClientHello: it adds a 17th counted extension and moves JA4
+	// from t13d1516h2 to t13d1517h2, so a resumed connection presents a
+	// different fingerprint from a fresh one. That shape has only ever been
+	// checked against a Go crypto/tls server, never against a capture of real
+	// Chrome resuming against a real edge, and a fingerprint pinned to an
+	// unverified reference is worth less than no fingerprint claim at all.
+	//
+	// Turn it on once the resumed hello has been measured against the target.
+	TLSSessionResumption bool
 }
 
 func defaultTransportConfig() TransportConfig {
@@ -170,12 +185,18 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		browser:    browser,
 
 		handshakeTimeout: cfg.TLSHandshakeTimeout,
+	}
 
-		// One cache per transport, which is one per Client — so a session's
-		// tickets stay inside the identity that earned them, the same way its
-		// cookies and its connection pool do. Sharing it across clients would
-		// let two identities present the same resumption credential.
-		sessions: ctls.NewSessionCache(0),
+	// One cache per transport, which is one per Client — so a session's tickets
+	// stay inside the identity that earned them, the same way its cookies and
+	// its connection pool do. Sharing it across clients would let two identities
+	// present the same resumption credential.
+	//
+	// A nil cache is the off switch the whole way down: the TLS layer neither
+	// banks a ticket nor offers one, and every connection is a full handshake
+	// with the ClientHello this package was verified against.
+	if cfg.TLSSessionResumption {
+		t.sessions = ctls.NewSessionCache(0)
 	}
 
 	// Per-browser fingerprint tables.
@@ -326,7 +347,7 @@ func (t *Transport) dialWithDNSCache() func(ctx context.Context, network, addr s
 			host, port = addr, "80"
 		}
 
-		conn, err := t.dialRaw(ctx, network, host, port)
+		conn, _, err := t.dialRaw(ctx, network, host, port)
 		if err != nil {
 			return nil, err
 		}
@@ -484,7 +505,7 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 			}
 		}
 
-		rawConn, err := t.dialRaw(ctx, network, host, port)
+		rawConn, exit, err := t.dialRaw(ctx, network, host, port)
 		if err != nil {
 			lastErr = err
 			if !isTransientDialErr(err) {
@@ -493,7 +514,7 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 			continue
 		}
 
-		tlsConn, err := t.wrapTLS(ctx, rawConn, host, alpn)
+		tlsConn, err := t.wrapTLS(ctx, rawConn, host, exit, alpn)
 		if err != nil {
 			// WrapConn closes rawConn on every failure path, so there is
 			// nothing to close here.
@@ -526,13 +547,35 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 //
 // A deadline already on ctx still wins when it is the earlier of the two, so a
 // per-request timeout is never extended by this.
-func (t *Transport) wrapTLS(ctx context.Context, rawConn net.Conn, host string, alpn []string) (net.Conn, error) {
+// exit identifies the egress this connection leaves from — the proxy it was
+// dialled through, or "" for a direct dial. It never reaches the wire; it only
+// scopes the session cache, so a ticket is offered back through the same exit
+// that earned it.
+func (t *Transport) wrapTLS(ctx context.Context, rawConn net.Conn, host, exit string, alpn []string) (net.Conn, error) {
 	if t.handshakeTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, t.handshakeTimeout)
 		defer cancel()
 	}
-	return ctls.WrapConnResuming(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, t.ctlsBrowser, t.sessions)
+	return ctls.WrapConnResuming(ctx, rawConn, host, alpn, t.skipVerify, t.rootCAs, t.ctlsBrowser,
+		t.sessions, sessionScope(host, exit))
+}
+
+// sessionScope is the session cache key: the host a ticket was issued for, plus
+// the egress it was issued to.
+//
+// The exit belongs in the key because a session ticket is a credential bound to
+// the peer that received it. Under a rotator the transport picks a proxy per
+// dial, so a cache keyed on host alone hands connection 2 — leaving from a
+// different exit IP — the ticket connection 1 earned from another. To the edge
+// that is one session resuming from two addresses, which is both a correlation
+// across the exits that were rotated to avoid exactly that and a pattern no
+// browser generates. Keying on the pair keeps every ticket with its own route.
+func sessionScope(host, exit string) string {
+	if exit == "" {
+		return host
+	}
+	return host + "\x00" + exit
 }
 
 // isTransientDialErr classifies errors that are worth retrying. We only
@@ -579,7 +622,10 @@ func secureRandIntn(n int) int {
 // proxyDialAttempts times against different rotator entries before giving up.
 // This keeps a few dead members of a large proxy list from translating into
 // per-request failures.
-func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (net.Conn, error) {
+// The second return value identifies the egress the connection left from — the
+// proxy's redacted URL, or "" for a direct dial. It exists so the TLS layer can
+// scope its session cache to the route: see sessionScope.
+func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (net.Conn, string, error) {
 	t.proxyMu.RLock()
 	proxyFunc := t.proxyFunc
 	rotator := t.proxyRotator
@@ -603,12 +649,12 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 			conn, err := t.dialViaProxy(ctx, network, targetAddr, proxyURL)
 			if err == nil {
 				rotator.MarkSuccess(entry)
-				return conn, nil
+				return conn, proxyURL.Redacted(), nil
 			}
 			rotator.MarkFailure(entry)
 			lastErr = err
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return nil, "", ctx.Err()
 			}
 		}
 		// A configured rotator MUST NOT silently fall through to a direct
@@ -616,17 +662,21 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 		// Surface the failure (or an explicit "no proxies" error if the rotator
 		// is empty) instead of leaking the client's real IP.
 		if lastErr != nil {
-			return nil, lastErr
+			return nil, "", lastErr
 		}
-		return nil, fmt.Errorf("proxy rotator: no usable proxies")
+		return nil, "", fmt.Errorf("proxy rotator: no usable proxies")
 	} else if proxyFunc != nil {
 		dummyReq := &http.Request{URL: &url.URL{Scheme: "https", Host: targetAddr}}
 		proxyURL, err := proxyFunc(dummyReq)
 		if err != nil {
-			return nil, fmt.Errorf("proxy func: %w", err)
+			return nil, "", fmt.Errorf("proxy func: %w", err)
 		}
 		if proxyURL != nil {
-			return t.dialViaProxy(ctx, network, targetAddr, proxyURL)
+			conn, err := t.dialViaProxy(ctx, network, targetAddr, proxyURL)
+			if err != nil {
+				return nil, "", err
+			}
+			return conn, proxyURL.Redacted(), nil
 		}
 	}
 
@@ -643,9 +693,9 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 
 	conn, err := t.dialer.DialContext(ctx, network, dialAddr)
 	if err != nil {
-		return nil, fmt.Errorf("dial tcp: %w", err)
+		return nil, "", fmt.Errorf("dial tcp: %w", err)
 	}
-	return conn, nil
+	return conn, "", nil
 }
 
 // dialViaProxy connects through a proxy. Supports HTTP CONNECT, HTTPS CONNECT
@@ -1125,7 +1175,8 @@ func (t *Transport) dialPreconnect(ctx context.Context, addr string, isTLS bool)
 	if err != nil {
 		return nil, err
 	}
-	return t.dialRaw(ctx, "tcp", host, port)
+	conn, _, err := t.dialRaw(ctx, "tcp", host, port)
+	return conn, err
 }
 
 // CloseIdleConnections closes all idle connections.

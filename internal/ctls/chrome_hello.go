@@ -20,12 +20,17 @@ import (
 // extension list in wire order, so a Chrome JA3 is a different value per
 // connection by design. JA4 sorts before hashing and is therefore stable.
 //
-// An earlier revision documented t13d1517h2_8daaf6152771_b6f405a00624. That
-// value was read off a capture of a RESUMED session, which carries
-// pre_shared_key (0x0029) as a 17th counted extension. This builder never
-// sends PSK (see the trailing-GREASE note in buildChromeExtensions), so it
-// emits 16 counted extensions and can never produce that hash — and the
-// device confirms 16.
+// t13d1516h2 is the fresh hello, which is what this builder emits unless a
+// caller opts into resumption. A RESUMED session carries pre_shared_key
+// (0x0029) as a 17th counted extension and hashes to t13d1517h2 instead — a
+// different fingerprint from the one above, presented by the same client on its
+// second connection to a host.
+//
+// That is what real Chrome does, but the resumed shape here has only been
+// checked against a Go crypto/tls server, never against a capture of Chrome
+// resuming against a real edge. Hence WithTLSSessionResumption, and hence its
+// being off by default: this package's claim is the verified hello, and a
+// second, unverified one is not something to start sending unasked.
 //
 // Key differences from Safari on iPhone:
 //   - 15 cipher suites, no 3DES and no ECDSA-CBC legacy suites, and the TLS 1.3

@@ -254,6 +254,26 @@ func WithTCPFastOpen() Option {
 	}
 }
 
+// WithTLSSessionResumption offers a cached TLS 1.3 session ticket as a
+// pre_shared_key on the second and later connections to a host, the way a
+// browser does.
+//
+// Off by default. Resuming is what Chrome does, and never resuming across
+// hundreds of connections to one host is itself a pattern — but offering a PSK
+// adds an extension to the ClientHello and moves JA4 from t13d1516h2 to
+// t13d1517h2, so the resumed connection no longer carries the fingerprint this
+// package pins. That resumed shape has been checked against a Go TLS server,
+// not against a capture of real Chrome resuming against a real edge.
+//
+// Tickets are scoped to the egress that earned them, so this is safe to combine
+// with a proxy rotator: a ticket is never offered from an exit other than the
+// one the server issued it to.
+func WithTLSSessionResumption() Option {
+	return func(c *clientConfig) {
+		c.transport.TLSSessionResumption = true
+	}
+}
+
 // WithWriteByteTimeout caps how long an HTTP/2 frame write may block.
 // Default 30s is browser-lenient; for high-RPS workloads with proxies that
 // occasionally stall, 5-10s prevents a slow peer from pinning a worker.

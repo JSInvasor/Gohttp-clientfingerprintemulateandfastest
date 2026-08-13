@@ -26,6 +26,23 @@ func hashForCipher(suite uint16) func() hash.Hash {
 	}
 }
 
+// sameHashSuite reports whether two cipher suites share a hash, which is the
+// only thing a resumption PSK actually binds to.
+//
+// RFC 8446 §4.2.11 lets a server accept a PSK and then negotiate any suite with
+// the same hash — the binder and the key schedule are derived from the hash, not
+// from the AEAD. TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256 are the
+// pair that matters: both are SHA-256, and an edge that prefers ChaCha20 will
+// routinely take a ticket issued under AES-128 and answer with the other one.
+//
+// Comparing the suites themselves instead treats that legal answer as a decline,
+// so the client derives a schedule with a zero PSK while the server derived one
+// with the real PSK, and the handshake dies at "server finished MAC mismatch" —
+// several messages after the actual disagreement.
+func sameHashSuite(a, b uint16) bool {
+	return hashLen(a) == hashLen(b)
+}
+
 // hashLen returns the hash output length for the given cipher suite.
 func hashLen(suite uint16) int {
 	if suite == cipherTLS_AES_256_GCM_SHA384 {

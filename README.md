@@ -278,6 +278,27 @@ your proxies exit, since bot scoring compares the two.
 | `WithWriteBufferSize` | 64KB | Per-connection write buffer |
 | `WithReadBufferSize` | 64KB | Per-connection read buffer |
 | `WithTCPFastOpen` | off | TCP Fast Open on Linux — saves an RTT, but no browser uses it |
+| `WithTLSSessionResumption` | off | Offer a cached TLS 1.3 ticket as `pre_shared_key` — see below |
+
+### TLS session resumption
+
+Off by default. Chrome resumes, and a client that opens hundreds of connections
+to one host and resumes none of them shows a pattern no browser produces — that
+is the case for the feature. The case against turning it on blind is that
+offering a PSK **changes the ClientHello**: it adds a 17th counted extension and
+moves JA4 from `t13d1516h2` to `t13d1517h2`, so connections 2..n present a
+different fingerprint from connection 1. The resumed shape here has been checked
+against a Go `crypto/tls` server, not against a capture of real Chrome resuming
+against a real edge, so it is opt-in until you have measured it on your target:
+
+```go
+client, _ := gofire.Emulate(gofire.Chrome151, gofire.WithTLSSessionResumption())
+```
+
+Tickets are scoped to the egress that earned them, so this is safe to combine
+with `-proxy-file` / `SetProxyRotator`. A ticket is a credential the server
+issued to one peer; offering it from a different exit IP tells the target those
+exits are one session, which is the correlation a rotator exists to prevent.
 
 ## Performance Tuning
 
