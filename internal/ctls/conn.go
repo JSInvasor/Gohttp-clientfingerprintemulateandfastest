@@ -39,6 +39,12 @@ type Conn struct {
 	postHS       []byte           // partial post-handshake message reassembly
 	keyUpdates   int              // KeyUpdates honoured, bounded by maxKeyUpdates
 
+	// sessions receives the tickets this connection is handed, if the dialer
+	// supplied a cache. Tickets arrive after the handshake, on the application
+	// data stream, so this has to outlive the handshake that set it up.
+	sessions      *SessionCache
+	ticketsStored int
+
 	// writeMu serialises everything that touches clientWriter. The AEAD
 	// sequence number it holds must advance exactly once per record, and
 	// http2 calls Close from a different goroutine than the one running the
@@ -236,7 +242,32 @@ func (c *Conn) handlePostHandshake(data []byte) error {
 			}
 
 		case handshakeTypeNewSessionTicket:
-			// Ignored: no session resumption.
+			// A ticket is only worth keeping when someone asked for a cache and
+			// the connection actually derived a resumption secret. Anything
+			// malformed is dropped rather than fatal: a bad ticket costs a
+			// resumption, and killing a working connection over one would be a
+			// worse trade than the feature is worth.
+			if c.sessions == nil || c.ks == nil || c.ticketsStored >= maxTicketsPerSession {
+				break
+			}
+			lifetime, ageAdd, nonce, ticket, allowEarly, err := parseNewSessionTicket(body)
+			if err != nil || lifetime <= 0 {
+				break
+			}
+			psk := c.ks.resumptionPSK(nonce)
+			if len(psk) == 0 {
+				break
+			}
+			c.sessions.put(c.serverName, &sessionTicket{
+				psk:        psk,
+				identity:   ticket,
+				ageAdd:     ageAdd,
+				received:   time.Now(),
+				lifetime:   lifetime,
+				suite:      c.suite,
+				allowEarly: allowEarly,
+			})
+			c.ticketsStored++
 
 		default:
 			// Anything else post-handshake (for example a CertificateRequest
@@ -373,6 +404,18 @@ func DialWithConfig(ctx context.Context, network, addr, serverName string, alpn 
 // deliberately generous; it is a backstop, not a policy. Callers that care set a
 // deadline on the context, which always wins when it is the earlier of the two.
 const DefaultHandshakeTimeout = 30 * time.Second
+
+// SetSessionCache tells the connection where to deposit the session tickets the
+// server sends it.
+//
+// It is a setter rather than a handshake parameter because tickets are
+// post-handshake messages: they arrive on the application data stream, so a
+// cache attached any time before the first Read catches them all. Keeping it
+// off WrapConn's signature also keeps resumption from becoming something every
+// caller has to know about.
+func (c *Conn) SetSessionCache(cache *SessionCache) {
+	c.sessions = cache
+}
 
 // WrapConn performs the TLS 1.3 handshake over an existing net.Conn.
 // This is the main entry point for use with pre-dialed connections (proxies, etc.).

@@ -88,6 +88,7 @@ const (
 	extExtendedMasterSecret = 0x0017
 	extCompressCertificate  = 0x001B
 	extSessionTicket        = 0x0023
+	extEarlyData            = 0x002a
 	extKeyShare             = 0x0033
 	extSupportedVersions    = 0x002B
 	extCookie               = 0x002C

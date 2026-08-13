@@ -121,6 +121,12 @@ type tlsKeySchedule struct {
 	serverHSTraffic  []byte
 	clientAppTraffic []byte
 	serverAppTraffic []byte
+
+	// resumptionMaster is the secret every session ticket for this connection
+	// is derived from. It is taken from the transcript through the client's own
+	// Finished, which is later than every other secret here — hence its own
+	// derivation step rather than a line in deriveMasterSecrets.
+	resumptionMaster []byte
 }
 
 // newKeySchedule initializes the TLS 1.3 key schedule with no PSK.
@@ -173,6 +179,32 @@ func (ks *tlsKeySchedule) deriveMasterSecrets(transcriptHash []byte) {
 	// Application traffic secrets
 	ks.clientAppTraffic = deriveSecret(ks.h, ks.masterSecret, "c ap traffic", transcriptHash)
 	ks.serverAppTraffic = deriveSecret(ks.h, ks.masterSecret, "s ap traffic", transcriptHash)
+}
+
+// deriveResumptionMaster computes the secret session tickets are bound to.
+//
+//	resumption_master_secret = Derive-Secret(master_secret, "res master",
+//	                                         ClientHello...client Finished)
+//
+// RFC 8446 §7.1. The transcript runs one message further than the application
+// traffic secrets do: those stop at the server's Finished, this one includes
+// the client's. Deriving it from the wrong transcript produces a PSK the server
+// will not recognise, and the failure surfaces one connection later as a
+// rejected ticket rather than as an error here.
+func (ks *tlsKeySchedule) deriveResumptionMaster(transcriptHash []byte) {
+	ks.resumptionMaster = deriveSecret(ks.h, ks.masterSecret, "res master", transcriptHash)
+}
+
+// resumptionPSK derives the pre-shared key a ticket stands for.
+//
+//	PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce)
+//
+// The nonce is what makes several tickets from one connection distinct keys.
+func (ks *tlsKeySchedule) resumptionPSK(ticketNonce []byte) []byte {
+	if len(ks.resumptionMaster) == 0 {
+		return nil
+	}
+	return hkdfExpandLabel(ks.h, ks.resumptionMaster, "resumption", ticketNonce, ks.h().Size())
 }
 
 // makeTrafficKeys creates AEAD + IV from a traffic secret.

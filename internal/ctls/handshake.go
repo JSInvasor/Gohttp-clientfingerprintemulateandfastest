@@ -549,6 +549,12 @@ func (hs *handshakeState) run() (*Conn, error) {
 	copy(finishedMsg[4:], clientFinishedMAC)
 	flight = append(flight, finishedMsg...)
 
+	// The resumption secret is the only one taken from the transcript through
+	// the client's own Finished, so it is derived here rather than beside the
+	// application traffic secrets above.
+	hs.transcript.Write(finishedMsg)
+	hs.ks.deriveResumptionMaster(hs.transcript.Sum(nil))
+
 	// Middlebox-compatibility ChangeCipherSpec. A retried handshake already
 	// sent it ahead of the second ClientHello, so this is a no-op there.
 	if err := hs.sendChangeCipherSpec(); err != nil {
