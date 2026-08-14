@@ -103,6 +103,59 @@ installExitHandlers();
 
 const entry = cookiesFromCache(url);
 
+// Cookies a passing browser keeps, as opposed to the working state a challenge
+// leaves behind.
+//
+// cf_clearance is the credential. cf_chl_* are the challenge's own bookkeeping —
+// rc is a retry counter, and the rest are stage markers — and a browser that has
+// finished has no reason to keep presenting them. Handing them back says "I am
+// part-way through a challenge", which is a different claim from "I finished
+// one", and the edge is entitled to act on it.
+//
+// Worth testing rather than assuming, which is what attempt() below is for: the
+// solver captures every cookie it can see, and if the bookkeeping is what breaks
+// the replay then the fix is in this repo rather than in somebody's proxy list.
+function isChallengeState(name) {
+  return name.startsWith("cf_chl_") || name.startsWith("_cf_chl");
+}
+
+async function attempt(browser, cookies, label) {
+  // A context of its own, so the only thing this session has is the cookies
+  // being tested. Reusing one would carry whatever the last attempt left.
+  const context = await browser.createBrowserContext();
+  const page = await context.newPage();
+
+  if (cookies.length > 0) {
+    await context.setCookie(
+      ...cookies.map((c) => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain || new URL(url).hostname,
+        path: "/",
+        secure: true,
+      }))
+    );
+  }
+
+  const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 })
+    .catch(() => null);
+  await new Promise((r) => setTimeout(r, 3_000));
+
+  const challenged = await page
+    .evaluate(() => typeof window._cf_chl_opt === "object" && window._cf_chl_opt !== null)
+    .catch(() => true);
+
+  const out = {
+    presented: cookies.map((c) => c.name),
+    http_status: response ? response.status() : 0,
+    challenged,
+    title: await page.title().catch(() => ""),
+    url: page.url(),
+  };
+  await context.close().catch(() => {});
+  return { label, ...out };
+}
+
 async function main() {
   let browser;
   try {
@@ -110,9 +163,6 @@ async function main() {
     browser = result.browser;
     trackBrowser(browser);
 
-    // A context of its own, so the only thing this session has is the cookies
-    // being tested. Reusing the default context would carry whatever the
-    // browser picked up on startup and prove nothing.
     const context = await browser.createBrowserContext();
     const page = await context.newPage();
 
@@ -176,6 +226,17 @@ async function main() {
       };
     }
 
+    // The solver captures every cookie the origin set, challenge bookkeeping
+    // included. If presenting that bookkeeping is what breaks the replay, the
+    // same cookies minus it will pass — and the fix is in this repo.
+    let clearanceOnly = null;
+    if (challenged) {
+      const kept = entry.cookies.filter((c) => !isChallengeState(c.name));
+      if (kept.length !== entry.cookies.length) {
+        clearanceOnly = await attempt(browser, kept, "clearance only");
+      }
+    }
+
     out({
       status: "ok",
       url: page.url(),
@@ -185,6 +246,10 @@ async function main() {
       // null when the first navigation already passed, so there was nothing to
       // distinguish. Otherwise: does a clearance earned *here* work here?
       same_session_after_solving: inSession,
+      // null when nothing was dropped, or when the first attempt passed. A pass
+      // here against a fail above means the challenge's own bookkeeping is what
+      // the edge objected to, not the clearance.
+      without_challenge_state: clearanceOnly,
       // A clearance that came back different is the edge replacing the one that
       // was presented, which is its way of saying the presented one was not
       // accepted.
