@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -30,7 +29,14 @@ type stats struct {
 	// is uniform over request index, so the sample is not biased toward the
 	// start of the run the way a "keep the first N" cap would be.
 	latencies []time.Duration
-	stride    int64
+
+	// stride is atomic because record() reads it on every request without the
+	// lock — that is the whole point of the check, to decide whether the lock is
+	// worth taking — and widens it under the lock when the sample fills. As a
+	// plain int64 those two are a data race on the hot path of every load run,
+	// and `go test -race` did not catch it because nothing drove record()
+	// concurrently past the 2M-sample threshold that triggers the write.
+	stride atomic.Int64
 
 	// perSecond is the completed-request rate over each whole second of the
 	// run. The average alone hides the shape: a run that opens at 30k and is
@@ -49,17 +55,20 @@ func newStats(expected int) *stats {
 	if int64(expected) > maxLatencySamples {
 		stride = int64(expected) / maxLatencySamples
 	}
-	return &stats{
+	s := &stats{
 		statuses: make(map[int]int),
 		failures: make(map[string]int),
-		stride:   stride,
 	}
+	s.stride.Store(stride)
+	return s
 }
 
 func (s *stats) record(index int64, d time.Duration, code int, err error) {
 	s.sent.Add(1)
 
-	if index%s.stride == 0 {
+	// Read once. Loading it twice would let the widening land between the two
+	// and divide by a stride this sample was never measured against.
+	if stride := s.stride.Load(); stride > 0 && index%stride == 0 {
 		s.mu.Lock()
 		s.latencies = append(s.latencies, d)
 		// A duration run has no count to size the stride from, so it is
@@ -72,7 +81,9 @@ func (s *stats) record(index int64, d time.Duration, code int, err error) {
 				kept = append(kept, s.latencies[i])
 			}
 			s.latencies = kept
-			s.stride *= 2
+			// Stored under the lock so two goroutines that both filled the
+			// sample cannot double it twice for one halving.
+			s.stride.Store(s.stride.Load() * 2)
 		}
 		s.mu.Unlock()
 	}
@@ -161,7 +172,14 @@ func classify(err error) string {
 // On a terminal the line is redrawn in place. Anywhere else the carriage
 // returns would be literal bytes in the output, so each tick is printed as its
 // own line instead — a piped run still gets its timeline.
-func progress(ctx context.Context, done <-chan struct{}, st *stats, o *options, start time.Time) {
+//
+// It takes no context, deliberately. It used to take one and never read it,
+// which reads as though an interrupt ends the live line — it does not, and it
+// must not: the run's context is done the moment Ctrl-C lands, while the
+// requests in flight are still finishing, and returning there would print the
+// summary over the top of them. done closes when the workers are actually
+// finished, which is the only signal that means the run is over.
+func progress(done <-chan struct{}, st *stats, o *options, start time.Time) {
 	tty := isTerminal(os.Stderr)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -320,6 +338,13 @@ func report(st *stats, elapsed time.Duration, pool *sessionPool, o *options) err
 	conns := pool.connections()
 	shape := summarizeRPS(series)
 
+	// Pipeline mode reads bodies in a pool of its own, so the bytes are counted
+	// there rather than at the call site. See sessionPool.drainedBytes.
+	bodyBytes := st.bodyBytes.Load()
+	if drained, ok := pool.drainedBytes(); ok {
+		bodyBytes = drained
+	}
+
 	if o.asJSON {
 		out := map[string]any{
 			"mode":        o.mode,
@@ -331,7 +356,7 @@ func report(st *stats, elapsed time.Duration, pool *sessionPool, o *options) err
 			"failed":      st.failed.Load(),
 			"elapsed_ms":  elapsed.Milliseconds(),
 			"rps":         rps,
-			"body_bytes":  st.bodyBytes.Load(),
+			"body_bytes":  bodyBytes,
 			"connections": conns,
 			"statuses":    statuses,
 			"failures":    failures,
@@ -355,7 +380,7 @@ func report(st *stats, elapsed time.Duration, pool *sessionPool, o *options) err
 
 	fmt.Fprintf(os.Stderr, "\n%d requests in %s\n", sent, round(elapsed))
 	fmt.Fprintf(os.Stderr, "ok %d   failed %d   tls connections %d   body %s\n",
-		st.ok.Load(), st.failed.Load(), conns, humanBytes(st.bodyBytes.Load()))
+		st.ok.Load(), st.failed.Load(), conns, humanBytes(bodyBytes))
 
 	// The average is what the run achieved; peak and low are what it did along
 	// the way, and on anything longer than a few seconds those are the numbers

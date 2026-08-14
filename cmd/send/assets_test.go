@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
 )
@@ -189,5 +191,70 @@ func TestFetchAssetsHonoursContext(t *testing.T) {
 	}
 	if n := s.calls.Load(); n != 0 {
 		t.Errorf("made %d requests after cancellation", n)
+	}
+}
+
+// A run interrupted while its assets are still in flight has to stop counting
+// before it reports, and it has to have stopped its goroutines.
+//
+// It did neither. The cancellation path returned from inside the loop, reading
+// ok and failed with no lock while the fetches already running were still
+// incrementing them under one — a data race confirmed with `go test -race` — and
+// it returned before wg.Wait(), so the number printed was still moving as it was
+// printed and the goroutines outlived the function that started them.
+//
+// The doer below cancels the run from inside the first request, which is the
+// shape of a Ctrl-C landing mid-page.
+type cancellingDoer struct {
+	cancel  context.CancelFunc
+	calls   atomic.Int64
+	running atomic.Int64
+	max     atomic.Int64
+}
+
+func (d *cancellingDoer) DoWithContext(ctx context.Context, method, rawURL string, body []byte, headers map[string]string) (*gofire.Response, error) {
+	n := d.running.Add(1)
+	for {
+		got := d.max.Load()
+		if n <= got || d.max.CompareAndSwap(got, n) {
+			break
+		}
+	}
+	d.calls.Add(1)
+	d.cancel()
+	time.Sleep(10 * time.Millisecond)
+	d.running.Add(-1)
+	return nil, errors.New("interrupted")
+}
+
+func TestFetchAssetsCancelledMidFlightWaitsForItsOwnGoroutines(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	doc := mustURL(t, "https://site.test/")
+	var list []asset
+	for i := 0; i < 40; i++ {
+		list = append(list, asset{fmt.Sprintf("https://site.test/%d.png", i), destImage})
+	}
+
+	d := &cancellingDoer{cancel: cancel}
+	ok, failed := fetchAssets(ctx, d, doc, list, 8)
+
+	// Nothing is still running by the time the counts are read: that is what
+	// makes reading them without a lock safe, and what makes the printed number
+	// final rather than a snapshot of a moving one.
+	if n := d.running.Load(); n != 0 {
+		t.Errorf("%d fetches were still in flight after fetchAssets returned", n)
+	}
+	if int64(ok+failed) != d.calls.Load() {
+		t.Errorf("reported ok=%d failed=%d but %d requests were made", ok, failed, d.calls.Load())
+	}
+	// The interrupt stopped it early rather than working the whole list.
+	if d.calls.Load() >= int64(len(list)) {
+		t.Errorf("a cancelled run fetched all %d assets", len(list))
+	}
+	// And the parallel ceiling held on the way out.
+	if n := d.max.Load(); n > 8 {
+		t.Errorf("ran %d fetches at once, want at most 8", n)
 	}
 }

@@ -243,6 +243,46 @@ func (p *sessionPool) warm(ctx context.Context, target string, n int) {
 	}
 }
 
+// closePipelines ends the pipelines and waits for their drain pools, so what the
+// run reports is what it finished rather than what it had got round to.
+//
+// It has to happen before the summary, not in the deferred Close(). A pipeline
+// hands each body to a drain pool and returns, so OnResult firing for the last
+// request does not mean the last body has been read — the run's own waiter is
+// satisfied while bodies are still in the queue. Measured against a local h2
+// server, a 20-request run reported 19 bodies' worth about half the time.
+//
+// Pipeline.Close is idempotent, so the pool's own Close still runs afterwards.
+func (p *sessionPool) closePipelines() {
+	for _, s := range p.sessions {
+		if s.pipeline != nil {
+			s.pipeline.Close()
+		}
+	}
+}
+
+// drainedBytes totals what the pipelines actually read off the wire, and reports
+// whether there was a pipeline to ask.
+//
+// It exists because the other two modes count bytes where they read them — the
+// io.Copy in runWorkers returns the number — and pipeline mode cannot: the body
+// is handed to the pipeline's drain pool and read there, so by the time OnResult
+// sees the response there is nothing left to measure. What OnResult had instead
+// was resp.ContentLength, the length the origin *declared*, which is -1 whenever
+// the header is absent. That is every streamed HTTP/2 response, so the run
+// reported no body at all for the mode that moves the most of it.
+func (p *sessionPool) drainedBytes() (int64, bool) {
+	var total int64
+	found := false
+	for _, s := range p.sessions {
+		if s.pipeline != nil {
+			total += s.pipeline.Stats.TotalBytes.Load()
+			found = true
+		}
+	}
+	return total, found
+}
+
 // connections totals the TLS connections every session opened.
 func (p *sessionPool) connections() int64 {
 	var total int64

@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/net/html"
 
@@ -253,39 +254,59 @@ func fetchAssets(ctx context.Context, client requestDoer, doc *url.URL, assets [
 		parallel = 6 // what Chrome opens per host on HTTP/1.1, and a sane cap on h2
 	}
 
+	// Counted atomically rather than under a mutex, because an interrupt has to
+	// be able to stop starting new fetches without stopping the count.
+	//
+	// The cancellation path used to `return ok, failed` from inside the loop,
+	// which read both counters with no lock while the fetches already in flight
+	// were still incrementing them under one — a data race on every Ctrl-C
+	// during -assets, confirmed with `go test -race`. It also returned before
+	// wg.Wait(), so the goroutines outlived the function that owned them and
+	// the number printed was still moving as it was printed.
+	//
+	// Breaking out and waiting is the fix: the fetches already started are
+	// cancelled by their own context, which is what actually stops them, and
+	// the totals are read once nothing can write them.
 	var (
-		mu   sync.Mutex
-		wg   sync.WaitGroup
-		sem  = make(chan struct{}, parallel)
-		done = ctx.Done()
+		okN, failedN atomic.Int64
+		wg           sync.WaitGroup
+		sem          = make(chan struct{}, parallel)
 	)
+
+start:
 	for _, a := range assets {
+		// Checked before the select rather than only inside it. A select with
+		// two ready cases picks at random, so an already-cancelled run would
+		// start a fetch half the time.
+		if ctx.Err() != nil {
+			break
+		}
+		// The slot is taken before the goroutine is registered, and taking it
+		// is itself interruptible: a run cancelled while every slot is busy
+		// would otherwise sit here until one came free.
 		select {
-		case <-done:
-			return ok, failed
-		default:
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break start
 		}
 
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(a asset) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
 			resp, err := client.DoWithContext(ctx, "GET", a.url, nil, assetHeaders(a, doc))
-			mu.Lock()
-			defer mu.Unlock()
 			if err != nil {
-				failed++
+				failedN.Add(1)
 				return
 			}
 			// Drain and close: an abandoned body makes HTTP/2 emit RST_STREAM,
 			// the abusive-client signal this package exists to avoid.
 			_, _ = resp.Bytes()
 			resp.Close()
-			ok++
+			okN.Add(1)
 		}(a)
 	}
 	wg.Wait()
-	return ok, failed
+	return int(okN.Load()), int(failedN.Load())
 }

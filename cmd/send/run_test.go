@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -160,5 +164,79 @@ func TestFastTemplateFailureFailsTheRun(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "session 0") {
 		t.Errorf("error %q does not name the session that failed", err)
+	}
+}
+
+// What a pipeline run says it transferred has to be what it transferred.
+//
+// It was not. OnResult added resp.ContentLength, the length the origin
+// *declared*, guarded by `> 0` — and ContentLength is -1 on any response with no
+// Content-Length header, which is every streamed HTTP/2 response. So the guard
+// dropped all of them and the mode built for the highest throughput reported no
+// body at all.
+//
+// The bytes exist, they are just counted elsewhere: the pipeline drains bodies
+// in a pool of its own and totals what it read. This asserts the run reports
+// that number rather than the declared one.
+func TestPipelineReportsTheBytesItActuallyRead(t *testing.T) {
+	payload := bytes.Repeat([]byte("a"), 8192)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Deliberately no Content-Length, and flushed: a streamed origin, which
+		// is the ordinary case this used to miss entirely.
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write(payload)
+		w.(http.Flusher).Flush()
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	const requests = 20
+	o := &options{
+		mode:        modePipeline,
+		method:      "GET",
+		count:       requests,
+		concurrency: 4,
+		sessions:    1,
+		timeout:     10 * time.Second,
+		handshake:   10 * time.Second,
+		insecure:    true,
+	}
+	pool, err := newSessionPool(o, gofire.Chrome151, srv.URL)
+	if err != nil {
+		t.Fatalf("session pool: %v", err)
+	}
+	defer pool.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	st := newStats(o.count)
+	lim := newLimiter(0)
+	defer lim.stop()
+
+	var wg sync.WaitGroup
+	runPipeline(ctx, pool, o, srv.URL, nil, nil, st, lim, &wg)
+	wg.Wait()
+	// The same step sendLoad takes before it reports: the drain pool is
+	// asynchronous, so the last result is not the last body.
+	pool.closePipelines()
+
+	if sent := st.sent.Load(); sent != requests {
+		t.Fatalf("recorded %d results, want %d", sent, requests)
+	}
+
+	drained, ok := pool.drainedBytes()
+	if !ok {
+		t.Fatal("a pipeline run reported no pipeline to read bytes from")
+	}
+	if want := int64(requests * len(payload)); drained != want {
+		t.Errorf("drained %d bytes, want %d", drained, want)
+	}
+	// And the source that used to be reported is exactly the zero this exists
+	// to stop being printed.
+	if n := st.bodyBytes.Load(); n != 0 {
+		t.Errorf("the per-request counter is %d; pipeline mode does not read bodies at the call site", n)
 	}
 }

@@ -127,8 +127,13 @@ func sendLoad(ctx context.Context, pool *sessionPool, o *options, target string,
 		wg.Wait()
 	}()
 
-	progress(runCtx, done, st, o, start)
+	progress(done, st, o, start)
 	elapsed := time.Since(start)
+
+	// Before the summary, not after: a pipeline's bodies are read in a pool of
+	// its own, and the run's waiter is satisfied by the last result rather than
+	// by the last body. See sessionPool.closePipelines.
+	pool.closePipelines()
 
 	if ctx.Err() != nil {
 		fmt.Fprintf(os.Stderr, "interrupted after %d requests\n", st.sent.Load())
@@ -250,10 +255,16 @@ func runPipeline(ctx context.Context, pool *sessionPool, o *options, target stri
 			code := 0
 			if resp != nil {
 				code = resp.StatusCode()
-				if resp.ContentLength > 0 {
-					st.bodyBytes.Add(resp.ContentLength)
-				}
 			}
+			// No body accounting here. It used to add resp.ContentLength, which
+			// is the *declared* length and is -1 on any response that does not
+			// carry the header — which is every streamed HTTP/2 response, so
+			// the guard dropped them all. Measured against a local h2 server
+			// serving 20 responses of 8 KiB with no Content-Length: run.go
+			// counted 0 bytes where 163840 were read off the wire.
+			//
+			// The body is drained by the pipeline's own pool, which already
+			// counts what it read. sessionPool.drainedBytes reports that.
 			st.record(i, latency, code, err)
 			completed.Add(1)
 		}
