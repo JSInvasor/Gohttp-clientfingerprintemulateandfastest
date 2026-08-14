@@ -166,6 +166,19 @@ func cacheKey(serverName string, suite uint16) string {
 	return fmt.Sprintf("%s|%04x", serverName, suite)
 }
 
+// maxCachedKeys bounds how many (host, suite) entries the cache holds at once.
+//
+// max bounds the tickets under one key; nothing bounded the number of keys. An
+// entry was only ever reclaimed by a take() on that exact key, so a client that
+// visits a host once and never returns left its tickets behind for the life of
+// the process — and Len(), which counts only live tickets, reported them as
+// gone. A thousand hosts visited once measured Len() == 0 against a map still
+// holding a thousand entries.
+//
+// 512 is well past what one target or one page's worth of asset hosts needs,
+// and small enough that the sweep below is never the expensive thing.
+const maxCachedKeys = 512
+
 // put stores a ticket, newest first, dropping the oldest past the limit.
 func (c *SessionCache) put(serverName string, t *sessionTicket) {
 	if c == nil || t == nil || len(t.psk) == 0 {
@@ -175,11 +188,66 @@ func (c *SessionCache) put(serverName string, t *sessionTicket) {
 	defer c.mu.Unlock()
 
 	k := cacheKey(serverName, t.suite)
+	if _, known := c.entries[k]; !known && len(c.entries) >= maxCachedKeys {
+		c.reclaim(time.Now())
+	}
+
 	list := append([]*sessionTicket{t}, c.entries[k]...)
 	if len(list) > c.max {
 		list = list[:c.max]
 	}
 	c.entries[k] = list
+}
+
+// reclaim makes room for a new key. Callers hold c.mu.
+//
+// Dead entries go first, because they are free to lose. Only if that finds
+// nothing does it evict a live one, and then the least recently refreshed —
+// the host that has gone longest without a new ticket is the one least likely
+// to be resumed against next.
+func (c *SessionCache) reclaim(now time.Time) {
+	for k, list := range c.entries {
+		if !anyLive(list, now) {
+			delete(c.entries, k)
+		}
+	}
+	if len(c.entries) < maxCachedKeys {
+		return
+	}
+
+	var oldestKey string
+	var oldest time.Time
+	for k, list := range c.entries {
+		newest := newestReceipt(list)
+		if oldestKey == "" || newest.Before(oldest) {
+			oldestKey, oldest = k, newest
+		}
+	}
+	if oldestKey != "" {
+		delete(c.entries, oldestKey)
+	}
+}
+
+func anyLive(list []*sessionTicket, now time.Time) bool {
+	for _, t := range list {
+		if !t.expired(now) {
+			return true
+		}
+	}
+	return false
+}
+
+// newestReceipt is when this entry last gained a ticket. put prepends, so that
+// is the head — but the list is scanned rather than indexed so an entry that
+// ever stops being newest-first cannot silently make this lie.
+func newestReceipt(list []*sessionTicket) time.Time {
+	var newest time.Time
+	for _, t := range list {
+		if t.received.After(newest) {
+			newest = t.received
+		}
+	}
+	return newest
 }
 
 // take returns the newest unexpired ticket and removes it.
@@ -200,7 +268,12 @@ func (c *SessionCache) take(serverName string, suite uint16, now time.Time) *ses
 		if t.expired(now) {
 			continue
 		}
-		c.entries[k] = append(append([]*sessionTicket{}, list[:i]...), list[i+1:]...)
+		// The ones before it are expired by definition of having been skipped,
+		// so they go with it rather than being walked again on every take.
+		c.entries[k] = append([]*sessionTicket{}, list[i+1:]...)
+		if len(c.entries[k]) == 0 {
+			delete(c.entries, k)
+		}
 		return t
 	}
 	// Everything here is expired; drop it rather than walk it again next time.
