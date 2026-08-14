@@ -835,10 +835,26 @@ been confirmed on hardware other than the one they were taken on:
   `internal/ctls/reference.go` byte for byte — despite those values having been
   taken from Chrome 151 on Windows. The OS token is the only thing a platform
   choice moves.
-- **`fpcheck` passes for both profiles** against a live `tls.peet.ws` from a
-  networked host, which is the check that the Go client emits what the reference
-  says it should. It cannot run from a sandboxed environment, so it is worth
-  re-running on your own box before relying on any of this.
+- **`fpcheck` passes for both profiles** against a live `tls.peet.ws`, which is
+  the separate question of whether the Go client emits what the reference says
+  it should. 20 checks, no failures:
+
+  | | Safari iOS 18 | Chrome 151 |
+  |---|---|---|
+  | JA4 | `t13d2013h2_a09f3c656075_7f0f34a4126d` | `t13d1516h2_8daaf6152771_806a8c22fdea` |
+  | JA3 hash | `ecdf4f49dd59effc439639da29186671` | skipped — permuted per connection |
+  | peetprint | `62b834de729e78a9f0ebd1dd099314a7` | `67c3e9111bed9e7f03d2f21d6d88994b` |
+  | Akamai H2 | `c52879e43202aeb92740be6e8c86ea96` | `52d84b11737d980aef856699f885ca86` |
+  | HEADERS priority | absent | `weight=256 depends_on=0 exclusive=1` |
+  | pseudo-headers | `:method,:scheme,:authority,:path` | `:method,:authority,:scheme,:path` |
+
+  JA4_r, the User-Agent and the full request header order matched on both. The
+  Chrome JA3 skip is the correct result rather than a gap: Chrome permutes its
+  extension order every connection, so any pinned JA3 would fail every correct
+  run — which is why `ChromeReference` leaves it empty.
+
+  It needs real network egress, so it cannot run from a sandbox. Re-run it on
+  your own box before relying on any of this.
 
 What that does *not* cover, and what nothing here should be taken to claim: no
 part of this has been measured against a live Cloudflare challenge end to end.
