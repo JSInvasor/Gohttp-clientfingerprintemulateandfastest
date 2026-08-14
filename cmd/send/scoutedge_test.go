@@ -137,6 +137,47 @@ func TestIdentifyChallenge(t *testing.T) {
 			body:   "<html><body>ok</body></html>",
 			want:   challengeNone,
 		},
+		{
+			// The one that matters most. A Turnstile widget on a login form is on
+			// pages that challenge nobody — the document arrived. Calling it a
+			// challenge sends a real Chromium at a page that was never withheld.
+			name: "a Turnstile widget on a page that was served", status: 200,
+			header: header("cf-ray", "8a1b", "Server", "cloudflare"),
+			body: `<html><head><title>Sign in</title>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script></head>
+<body><form><div class="cf-turnstile"></div></form></body></html>`,
+			want: challengeNone,
+		},
+		{
+			// Cloudflare's invisible bot detection loads this on ordinary pages
+			// too, so on a 2xx it proves only that the site uses Cloudflare.
+			name: "the bot-detection script on a page that was served", status: 200,
+			header: header("cf-ray", "8a1b"),
+			body: `<html><head><title>Home</title></head><body>the actual content
+<script src="/cdn-cgi/challenge-platform/h/b/scripts/jsd/main.js"></script></body></html>`,
+			want: challengeNone,
+		},
+		{
+			// The same marker on a refusal is the interstitial.
+			name: "the same script when the page was withheld", status: 403,
+			header: header("cf-ray", "8a1b"),
+			body:   `<html><body><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/jsch/v1"></script></body></html>`,
+			want:   challengeCloudflare,
+		},
+		{
+			// Prose belongs to whoever wrote the page. A served page called this,
+			// with none of Cloudflare's machinery on it, is a page.
+			name: "a served page that happens to be titled like one", status: 200,
+			header: header("Server", "nginx"),
+			body:   `<html><head><title>Just a moment</title></head><body>a blog post</body></html>`,
+			want:   challengeNone,
+		},
+		{
+			// cf-mitigated names the mitigation, and only one of them is a puzzle.
+			name: "cloudflare mitigated without challenging", status: 403,
+			header: header("cf-mitigated", "block", "cf-ray", "8a1b"),
+			want:   challengeBlocked,
+		},
 	}
 
 	for _, tc := range tests {

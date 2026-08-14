@@ -62,11 +62,18 @@ type scoutReport struct {
 	challenge    challengeKind
 	challengeWhy string
 
-	cookies    []string
-	encoding   string
-	bodySize   int
-	assets     int
-	assetHosts int
+	cookies     []string
+	encoding    string
+	contentType string
+	bodySize    int
+	assets      int
+	assetHosts  int
+
+	// turnstile is a Turnstile widget on a page that was served. Not a challenge
+	// — the document arrived — but the reason -solve is absent is worth saying
+	// out loud, because a Cloudflare-fronted site with a visible widget on it is
+	// exactly where someone would expect to see it suggested.
+	turnstile bool
 
 	localeAware bool
 	langWhy     string
@@ -240,6 +247,8 @@ func scoutDocument(ctx context.Context, client *gofire.Client, r *scoutReport, t
 	r.status = resp.StatusCode()
 	r.proto = resp.Proto
 	r.encoding = resp.Header.Get("Content-Encoding")
+	r.contentType, _, _ = strings.Cut(resp.Header.Get("Content-Type"), ";")
+	r.contentType = strings.TrimSpace(r.contentType)
 	if u := resp.Request; u != nil && u.URL != nil {
 		r.finalURL = u.URL.String()
 	}
@@ -259,6 +268,7 @@ func scoutDocument(ctx context.Context, client *gofire.Client, r *scoutReport, t
 	}
 	r.bodySize = len(body)
 	r.challenge, r.challengeWhy = identifyChallenge(r.status, resp.Header, body)
+	r.turnstile = r.challenge == challengeNone && carriesTurnstile(body)
 	return body, nil
 }
 

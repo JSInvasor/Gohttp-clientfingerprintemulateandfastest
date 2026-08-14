@@ -128,13 +128,27 @@ const (
 // cloudflareMarkers are the challenge platform's own structure. They are the
 // raw-HTML form of the selectors solver/challenge.js looks for in the DOM,
 // because a probe has bytes where the solver has a document.
-var cloudflareMarkers = []struct{ needle, why string }{
-	{"/cdn-cgi/challenge-platform/", "the page loads /cdn-cgi/challenge-platform/"},
-	{"_cf_chl_opt", "the page defines _cf_chl_opt"},
-	{"challenges.cloudflare.com", "the page embeds a Turnstile widget"},
-	{"cf-challenge-running", "the page carries Cloudflare's challenge-running element"},
-	{"id=\"challenge-form\"", "the page carries Cloudflare's challenge form"},
-	{"__cf_chl_", "the page carries a __cf_chl_ parameter"},
+//
+// interstitialOnly separates the markers that only ever appear on a challenge
+// page from the ones an ordinary page can carry too. The solver can use the
+// looser set because it is looking at a page it already knows was withheld — it
+// is asking "am I still on the interstitial". A scout is asking the prior
+// question, "was anything withheld at all", and there the loose markers are the
+// difference between reading a site correctly and sending someone to spend two
+// minutes of browser on a page that was never held back.
+var cloudflareMarkers = []struct {
+	needle, why      string
+	interstitialOnly bool
+}{
+	{needle: "_cf_chl_opt", why: "the page defines _cf_chl_opt, the challenge bootstrap's own object", interstitialOnly: true},
+	{needle: "cf-challenge-running", why: "the page carries Cloudflare's challenge-running element", interstitialOnly: true},
+	{needle: "id=\"challenge-form\"", why: "the page carries Cloudflare's challenge form", interstitialOnly: true},
+	{needle: "__cf_chl_", why: "the page carries a __cf_chl_ parameter", interstitialOnly: true},
+	// Both of these are on ordinary pages as often as on interstitials:
+	// challenge-platform is the invisible bot-detection script, and the
+	// Turnstile host is a widget anyone can put on a form.
+	{needle: "/cdn-cgi/challenge-platform/", why: "the page loads /cdn-cgi/challenge-platform/"},
+	{needle: "challenges.cloudflare.com", why: "the page embeds a Turnstile widget"},
 }
 
 // vendorMarkers are the same idea for the interstitials this tool cannot solve.
@@ -161,21 +175,53 @@ var vendorCookies = []struct{ name, vendor string }{
 }
 
 // identifyChallenge reports what stopped the probe, and why it says so.
+//
+// The bar for saying "challenge" is deliberately high, because the cost of a
+// false positive lands entirely on the user: -solve launches a real Chromium,
+// spends up to 150s on it, and is recommended on the strength of this answer. A
+// site that served the page and merely has Cloudflare's machinery on it must
+// come back as challengeNone — nothing needs solving to fetch what already
+// arrived.
 func identifyChallenge(status int, h http.Header, body []byte) (challengeKind, string) {
 	// Cloudflare labels its own mitigations, and has since 2023. When the header
 	// is there, nothing else needs consulting.
 	if v := h.Get("cf-mitigated"); v != "" {
-		return challengeCloudflare, "cf-mitigated: " + v
+		// The label names the mitigation, and only one of them is a puzzle.
+		// "challenge" is the interstitial; anything else is Cloudflare saying it
+		// decided, and a solver has nothing to offer a decision.
+		if strings.EqualFold(strings.TrimSpace(v), "challenge") {
+			return challengeCloudflare, "cf-mitigated: challenge"
+		}
+		return challengeBlocked, fmt.Sprintf("cf-mitigated: %s — Cloudflare mitigated this without "+
+			"presenting a challenge, so there is nothing for a browser to work through", v)
 	}
 
 	text := string(body)
+	served := status >= 200 && status < 300
+
+	loose := false // a Cloudflare marker that an ordinary page may also carry
 	for _, m := range cloudflareMarkers {
-		if strings.Contains(text, m.needle) {
-			return challengeCloudflare, m.why
+		if !strings.Contains(text, m.needle) {
+			continue
 		}
+		// On a 2xx the page arrived. Cloudflare's script is on an enormous number
+		// of ordinary pages — /cdn-cgi/challenge-platform/ is loaded by its
+		// invisible bot detection, and challenges.cloudflare.com is the Turnstile
+		// widget host, which sits on login and signup forms of sites that
+		// challenge nobody. Treating either as an interstitial would send a
+		// solver at a page that was never withheld.
+		//
+		// _cf_chl_opt and its siblings are the exception: they are the challenge
+		// bootstrap's own structure, defined only by the interstitial, so they
+		// still count on a 2xx — the JS challenge has been served with one.
+		if served && !m.interstitialOnly {
+			loose = true
+			continue
+		}
+		return challengeCloudflare, m.why
 	}
 	for _, m := range vendorMarkers {
-		if strings.Contains(text, m.needle) {
+		if strings.Contains(text, m.needle) && !served {
 			return challengeVendor, fmt.Sprintf("a %s interstitial (%q is in the page)", m.vendor, m.needle)
 		}
 	}
@@ -193,9 +239,15 @@ func identifyChallenge(status int, h http.Header, body []byte) (challengeKind, s
 		}
 	}
 
-	// The wording, last: an interstitial whose markup changed but whose title
-	// did not is still an interstitial.
-	if title := documentTitle(body); title != "" && isChallengeTitle(title) {
+	// The wording, last: an interstitial whose markup changed but whose title did
+	// not is still an interstitial.
+	//
+	// On a 2xx it needs corroboration. A title is prose, and prose belongs to
+	// whoever wrote the page — "Just a moment…" is a plausible thing for a real
+	// page to be called, and a site that served one is not withholding it. The
+	// loose Cloudflare markers are not enough on their own to call a challenge,
+	// but they are enough to stop a matching title from being a coincidence.
+	if title := documentTitle(body); title != "" && isChallengeTitle(title) && (!served || loose) {
 		return challengeCloudflare, fmt.Sprintf("the page is titled %q", title)
 	}
 
@@ -210,6 +262,21 @@ func identifyChallenge(status int, h http.Header, body []byte) (challengeKind, s
 		return challengeBlocked, "503 with no interstitial in it — the edge or the origin is refusing"
 	}
 	return challengeNone, ""
+}
+
+// carriesTurnstile reports whether a page that was served embeds a Turnstile
+// widget.
+//
+// Deliberately separate from identifyChallenge, which answers "was anything
+// withheld". This answers a different question — "is there a puzzle on the page
+// I was given" — and the two must not be conflated: a widget on a login form
+// blocks the form, not the document, and nothing about fetching the document
+// needs solving. Worth reporting only so the report can say why -solve is
+// absent from a page that visibly has Cloudflare's puzzle on it.
+func carriesTurnstile(body []byte) bool {
+	text := string(body)
+	return strings.Contains(text, "challenges.cloudflare.com") ||
+		strings.Contains(text, "cf-turnstile")
 }
 
 // hasSetCookie reports whether the response sets a cookie by this name.

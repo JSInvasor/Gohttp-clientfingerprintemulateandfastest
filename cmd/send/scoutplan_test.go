@@ -253,6 +253,92 @@ func TestRecommendKeepsAssetsOutOfTheLoadCommand(t *testing.T) {
 	}
 }
 
+// HTTP/2 puts every request on one connection with a stream id one higher than
+// the last, and a sustained run leaves a sequence in the tens of thousands that
+// no fingerprint work covers — nothing in the ClientHello or the header order
+// says anything about it.
+func TestRecommendCyclesConnectionsBeforeTheStreamIDsDo(t *testing.T) {
+	r := baseReport()
+	r.rtt = 5 * time.Millisecond // 200 threads-worth of rate on very few threads
+
+	p := recommend(r, &options{})
+	if !strings.Contains(p.command, "-max-streams") {
+		t.Errorf("command %q leaves one connection carrying every stream of the run", p.command)
+	}
+	// The reason has to show the count, or it is an unexplained magic number.
+	why := reasonFor(p, "-max-streams")
+	if !strings.Contains(why, "streams on each") {
+		t.Errorf("the -max-streams reason %q does not say how many streams it is avoiding", why)
+	}
+
+	t.Run("not on HTTP/1.1, which has no stream ids at all", func(t *testing.T) {
+		r := baseReport()
+		r.rtt, r.proto = 5*time.Millisecond, "HTTP/1.1"
+		if p := recommend(r, &options{}); strings.Contains(p.command, "-max-streams") {
+			t.Errorf("command %q caps streams on a protocol that has none", p.command)
+		}
+	})
+
+	// The run's total is rate times duration whatever the round trip is — a
+	// slower target just needs more threads to hold the same rate — so what
+	// decides this is how many connections the total is spread over. A wide
+	// proxy list already spreads it: 40 sessions carry a few hundred streams
+	// each, which is a browser's own order of magnitude and needs no cap.
+	t.Run("not when the sessions already spread them thin", func(t *testing.T) {
+		r := baseReport()
+		r.proxyCount = 40
+		p := recommend(r, &options{proxyFile: "p.txt"})
+		if strings.Contains(p.command, "-max-streams") {
+			t.Errorf("command %q caps a stream count that is already browser-shaped: %q",
+				p.command, reasonFor(p, "-max-streams"))
+		}
+	})
+}
+
+// A widget on a page that was served is not a wall in front of it — but silence
+// about it reads as the scout having missed it, on exactly the sites where
+// someone would expect -solve.
+func TestRecommendExplainsTurnstileWithoutSolving(t *testing.T) {
+	r := baseReport()
+	r.turnstile = true
+
+	p := recommend(r, &options{})
+	if strings.Contains(p.command, "-solve") {
+		t.Errorf("command %q solves for a widget on a page that already arrived", p.command)
+	}
+	if !strings.Contains(warningsJoined(p), "Turnstile") {
+		t.Error("the widget went unmentioned, so the absence of -solve looks like an oversight")
+	}
+}
+
+// Not every target is a page, and the page-shaped advice does not transfer.
+func TestRecommendNoticesANonDocument(t *testing.T) {
+	r := baseReport()
+	r.contentType = "application/json"
+
+	p := recommend(r, &options{})
+	if !strings.Contains(warningsJoined(p), "application/json") {
+		t.Errorf("the notes %q treat a JSON endpoint as a page", warningsJoined(p))
+	}
+}
+
+// The box's own link is a constraint people discover by watching a run fail and
+// blaming the target for it.
+func TestRecommendWeighsTheIngress(t *testing.T) {
+	r := baseReport()
+	r.bodySize = 550 << 10 // ~550 KiB at ~200 req/s is over a gigabit
+
+	p := recommend(r, &options{})
+	if !strings.Contains(warningsJoined(p), "ingress") {
+		t.Errorf("the notes %q say nothing about a rate this link may not carry", warningsJoined(p))
+	}
+
+	r.bodySize = 2 << 10 // a small document costs nothing worth mentioning
+	if p := recommend(r, &options{}); strings.Contains(warningsJoined(p), "ingress") {
+		t.Error("a 2 KiB body raised a bandwidth warning")
+	}
+}
+
 // Every flag the scout adds has to carry the observation that put it there. A
 // flag with no reason is a flag nobody should paste, and the list of them is
 // what separates this from a second copy of the help screen.

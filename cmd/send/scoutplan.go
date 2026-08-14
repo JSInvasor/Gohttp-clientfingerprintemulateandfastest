@@ -26,6 +26,20 @@ import (
 // about the target — so it is a round number, and the report says so.
 const scoutDuration = "30s"
 
+// scoutDurationSeconds is scoutDuration as a number, for the arithmetic that
+// depends on how long the run lasts.
+const scoutDurationSeconds = 30
+
+// scoutStreamCeiling is the -max-streams value suggested when a run would
+// otherwise leave one connection carrying a stream sequence no browser produces.
+// A thousand is comfortably past any single page load and comfortably short of
+// the tens of thousands a sustained run reaches in under a minute.
+const scoutStreamCeiling = 1000
+
+// scoutBandwidthNotice is the ingress rate worth mentioning: 100 Mbit/s, the
+// point past which the box's own link starts being the thing under test.
+const scoutBandwidthNotice = 12.5 * 1024 * 1024
+
 // advice is one flag in the suggestion and the observation that put it there.
 type advice struct {
 	flag string
@@ -141,6 +155,29 @@ func recommend(r *scoutReport, o *options) plan {
 			round(r.cold), round(r.rtt)))
 	}
 
+	// -max-streams, from how many requests one connection is about to carry.
+	//
+	// HTTP/2 puts every request on one connection with a stream id one higher
+	// than the last, and the id is on the wire. A browser tab's connection to a
+	// busy site might reach a few hundred over an afternoon; a run at this rate
+	// reaches that in seconds and keeps going, and a monotonic sequence in the
+	// tens of thousands is a passive signal no fingerprint work covers — nothing
+	// about the ClientHello or the header order says anything about it.
+	//
+	// The cost of cycling is one handshake per connection retired, which at these
+	// rates is a rounding error, and it is what a browser does anyway.
+	if r.rtt > 0 && !strings.HasPrefix(r.proto, "HTTP/1") {
+		perSecond := float64(concurrency) / r.rtt.Seconds()
+		total := perSecond * scoutDurationSeconds
+		streams := int(total / float64(max(sessions, 1)))
+		if streams > scoutStreamCeiling*2 {
+			post = append(post, "-max-streams", strconv.Itoa(scoutStreamCeiling))
+			add(fmt.Sprintf("-max-streams %d", scoutStreamCeiling), fmt.Sprintf(
+				"about %s requests in %s over %d connection(s) is ~%s streams on each, and the id of every one is on the wire in order. A browser tab rarely passes a few hundred; this retires a connection before the sequence itself becomes the tell",
+				thousands(int(total)), scoutDuration, sessions, thousands(streams)))
+		}
+	}
+
 	// -lang, when the target's answer depends on it. Which value is right is a
 	// question about where the exits are, so it is only carried through when it
 	// has already been answered.
@@ -165,11 +202,38 @@ func recommend(r *scoutReport, o *options) plan {
 	if strings.HasPrefix(r.proto, "HTTP/1") {
 		warn("the target negotiated %s rather than h2, so the HTTP/2 fingerprint is not in play and every request in flight needs its own connection", r.proto)
 	}
+
+	// A widget on a page that was served is not a wall in front of it. Said out
+	// loud because a Cloudflare-fronted site with a visible puzzle on it is
+	// exactly where someone would expect -solve to be suggested, and silence
+	// would read as the scout having missed it.
+	if r.turnstile {
+		warn("the page carries a Turnstile widget, and it is not why -solve is absent: the document came back, so nothing needs solving to fetch it. A form behind that widget is a different request from this one")
+	}
+
 	// The assets belong to whatever came back, and what came back was a wall.
 	if r.assets > 0 && r.challenge == challengeNone {
 		warn("the page pulls in %d subresources across %d host(s), and a document with nothing following it is not what a page load looks like — -assets fetches them, on the single-request form (drop the duration)",
 			r.assets, r.assetHosts)
 	}
+
+	// Not every target is a page, and the page-shaped advice does not transfer.
+	if r.contentType != "" && !strings.Contains(r.contentType, "html") && r.challenge == challengeNone {
+		warn("this answers %s rather than a document, so the asset and page-load notes do not apply to it — and if the endpoint wants a method or a body, -X and -d are yours to add",
+			r.contentType)
+	}
+
+	// What the run costs on this side of the wire, which is the constraint people
+	// discover by watching a run fail and blaming the target for it.
+	if r.rtt > 0 && r.bodySize > 0 {
+		perSecond := float64(concurrency) / r.rtt.Seconds()
+		bytesPerSecond := perSecond * float64(r.bodySize)
+		if bytesPerSecond > scoutBandwidthNotice {
+			warn("at that rate a %s body is about %s/s of ingress on this box, before assets — a link that cannot carry it looks exactly like a target that throttles",
+				humanBytes(int64(r.bodySize)), humanBytes(int64(bytesPerSecond)))
+		}
+	}
+
 	for _, note := range r.notes {
 		warn("%s", note)
 	}
@@ -195,6 +259,20 @@ func recommend(r *scoutReport, o *options) plan {
 // run, so an unmeasurable target lands on the documented behaviour rather than
 // on a number invented here.
 const scoutFallbackConcurrency = 50
+
+// thousands renders a count the way it would be said out loud: 6750 as "6.7k",
+// because the exact figure is arithmetic on an estimate and printing all four
+// digits claims a precision it does not have.
+func thousands(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return strconv.FormatFloat(float64(n)/1e6, 'f', 1, 64) + "M"
+	case n >= 1000:
+		return strconv.FormatFloat(float64(n)/1e3, 'f', 1, 64) + "k"
+	default:
+		return strconv.Itoa(n)
+	}
+}
 
 // trimFloat prints a rate without a decimal point it has no precision for.
 func trimFloat(v float64) string {
@@ -324,8 +402,11 @@ func scoutFields(r *scoutReport) []struct{ name, value string } {
 // have length in the string, so %-14s would count them and pull every value out
 // of line.
 const (
-	scoutFieldWidth  = 14
-	scoutReasonWidth = 16
+	scoutFieldWidth = 14
+	// Wide enough for the longest flag the plan produces, which is
+	// "-max-streams 1000" at seventeen. A label that outgrows this still reads —
+	// its reason simply starts a column late — but the common ones line up.
+	scoutReasonWidth = 18
 )
 
 // field is one label-and-value line of the report.
