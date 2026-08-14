@@ -149,6 +149,9 @@ type options struct {
 	solveParallel int
 	exitCheck     string
 	solveIsolate  bool
+	// solveAllCookies seeds everything the solve captured, including Cloudflare's
+	// per-session bookkeeping. Off by default — see splitSolvedCookies.
+	solveAllCookies bool
 
 	// solveSeeds is what -solve earned, one entry per exit, filled in before the
 	// session pool is built. Empty when the run solves nothing or has a single
@@ -340,6 +343,7 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.IntVar(&o.solveParallel, "solve-parallel", 2, "")
 	fs.StringVar(&o.exitCheck, "solve-ip-check", defaultExitCheck, "")
 	fs.BoolVar(&o.solveIsolate, "solve-isolate", false, "")
+	fs.BoolVar(&o.solveAllCookies, "solve-all-cookies", false, "")
 
 	// Proxy
 	fs.StringVar(&o.proxy, "proxy", "", "")

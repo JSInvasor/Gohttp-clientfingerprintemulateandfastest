@@ -289,12 +289,16 @@ func TestRedactProxy(t *testing.T) {
 	}
 }
 
+// The clearance is seeded; Cloudflare's per-session bookkeeping beside it is
+// not. __cf_bm is minted for the browser session that earned it and read back by
+// the edge on the next request, so replaying it from this client hands the edge
+// a token describing a session this connection is not.
 func TestSolveAndSeedSeedsCookiesAndUA(t *testing.T) {
 	o := solveOptions(stubSolverDir(t, printJS(okSolve)))
 	if err := solveAndSeed(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAndSeed: %v", err)
 	}
-	want := []string{"cf_clearance=abc", "__cf_bm=xyz"}
+	want := []string{"cf_clearance=abc"}
 	if len(o.cookies) != len(want) {
 		t.Fatalf("cookies = %v, want %v", o.cookies, want)
 	}
@@ -586,6 +590,86 @@ func TestLanguageTags(t *testing.T) {
 		if got := languageTags(tc.header); !slices.Equal(got, tc.want) {
 			t.Errorf("languageTags(%q) = %v, want %v", tc.header, got, tc.want)
 		}
+	}
+}
+
+// What the solve captures and what the client may replay are not the same set.
+// Measured on a live UAM zone: seeding the clearance alone replayed as 200,
+// seeding it beside the browser's __cf_bm replayed as a managed challenge.
+func TestSplitSolvedCookies(t *testing.T) {
+	jar := func(names ...string) []solvedCookie {
+		out := make([]solvedCookie, 0, len(names))
+		for _, n := range names {
+			out = append(out, solvedCookie{Name: n, Value: "v"})
+		}
+		return out
+	}
+	names := func(cookies []solvedCookie) []string {
+		var out []string
+		for _, c := range cookies {
+			out = append(out, c.Name)
+		}
+		return out
+	}
+
+	t.Run("the clearance and the site's own cookies travel", func(t *testing.T) {
+		kept, dropped := splitSolvedCookies(
+			jar("cf_clearance", "__cf_bm", "session_id", "cf_chl_rc_m", "__cf_chl_tk", "__cflb"), false)
+		if want := []string{"cf_clearance", "session_id"}; !slices.Equal(names(kept), want) {
+			t.Errorf("kept %v, want %v", names(kept), want)
+		}
+		if want := []string{"__cf_bm", "cf_chl_rc_m", "__cf_chl_tk", "__cflb"}; !slices.Equal(names(dropped), want) {
+			t.Errorf("dropped %v, want %v", names(dropped), want)
+		}
+	})
+
+	// cf_clearance shares its prefix with the challenge cookies being excluded,
+	// so the order of the checks decides whether the whole feature works.
+	t.Run("cf_clearance is not caught by the cf_chl prefix", func(t *testing.T) {
+		kept, _ := splitSolvedCookies(jar("cf_clearance"), false)
+		if len(kept) != 1 {
+			t.Fatalf("the clearance itself was held back: %v", names(kept))
+		}
+	})
+
+	// Bot Fight Mode issues no clearance, and there __cf_bm is not bookkeeping
+	// beside a credential — it is the only thing the solve earned. Holding it
+	// back would leave the run with nothing and no way to tell.
+	t.Run("without a clearance there is nothing to hold it back for", func(t *testing.T) {
+		kept, dropped := splitSolvedCookies(jar("__cf_bm", "session_id"), false)
+		if want := []string{"__cf_bm", "session_id"}; !slices.Equal(names(kept), want) {
+			t.Errorf("kept %v, want %v", names(kept), want)
+		}
+		if len(dropped) != 0 {
+			t.Errorf("held back %v with no clearance to hold it back for", names(dropped))
+		}
+	})
+
+	t.Run("-solve-all-cookies sends everything", func(t *testing.T) {
+		kept, dropped := splitSolvedCookies(jar("cf_clearance", "__cf_bm"), true)
+		if len(kept) != 2 || len(dropped) != 0 {
+			t.Errorf("kept %v, dropped %v", names(kept), names(dropped))
+		}
+	})
+}
+
+// The report names the cookies and never their values: it goes to stderr, and
+// stderr ends up in log files and pasted issue reports.
+func TestCookieNamesCarryNoValues(t *testing.T) {
+	got := cookieNames([]solvedCookie{
+		{Name: "cf_clearance", Value: "secret-value"},
+		{Name: "__cf_bm", Value: "another-secret"},
+	})
+	if want := "cf_clearance, __cf_bm"; got != want {
+		t.Errorf("cookieNames = %q, want %q", got, want)
+	}
+	for _, secret := range []string{"secret-value", "another-secret"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("the report leaked a cookie value: %q", got)
+		}
+	}
+	if got := cookieNames(nil); got != "no cookies" {
+		t.Errorf("an empty jar rendered as %q", got)
 	}
 }
 

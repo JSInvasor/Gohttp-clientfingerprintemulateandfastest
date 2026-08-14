@@ -208,7 +208,8 @@ func printUsage(w io.Writer) {
 	// Named rather than dropped, because a flag nothing mentions is a flag
 	// nobody finds — and the tests require every one of them to appear here.
 	fmt.Fprint(w, p.section("also accepted", `-ua  -accept  -referer  -asset-limit  -asset-parallel  -solve-cache
--solve-max-age  -solve-isolate  -proxy-cooldown  -proxy-fails  -max-body
+-solve-max-age  -solve-isolate  -solve-all-cookies  -proxy-cooldown  -proxy-fails
+-max-body
 -handshake-timeout  -dial-timeout  -header-timeout  -write-timeout  -dns-ttl
 -max-redirects  -no-keepalive  -idle-conns  -idle-per-host  -conns-per-host
 -sockbuf  -tfo`))

@@ -128,18 +128,22 @@ func storeSolveCache(path, target, proxy string, res *solveResult) {
 
 // seedFromCache turns a cached entry into the seed a fresh solve through this
 // exit would have produced, so the caller cannot tell the two apart.
-func seedFromCache(proxy string, e *solveCacheEntry) *solveSeed {
+func seedFromCache(proxy string, e *solveCacheEntry, keepAll bool) *solveSeed {
 	age := time.Since(e.SolvedAt).Truncate(time.Second)
 	left := "unknown"
 	if !e.ExpiresAt.IsZero() {
 		left = time.Until(e.ExpiresAt).Truncate(time.Second).String()
 	}
-	logSolve(proxy, "reusing the solve from %s ago (%d cookie(s), expires in %s) — "+
-		"pass -solve-refresh to earn a new one", age, len(e.Cookies), left)
+	// Filtered on the way out rather than on the way in: the entry keeps
+	// everything the browser had, so flipping -solve-all-cookies re-reads it
+	// instead of needing a fresh two-minute solve to change its mind.
+	kept, _ := splitSolvedCookies(e.Cookies, keepAll)
+	logSolve(proxy, "reusing the solve from %s ago (expires in %s) — "+
+		"pass -solve-refresh to earn a new one\nseeding %s", age, left, cookieNames(kept))
 
 	seed := &solveSeed{proxy: proxy, userAgent: e.UserAgent, chromiumMajor: e.ChromiumMajor,
 		expiresAt: e.ExpiresAt}
-	for _, c := range e.Cookies {
+	for _, c := range kept {
 		seed.cookies = append(seed.cookies, c.Name+"="+c.Value)
 	}
 	return seed

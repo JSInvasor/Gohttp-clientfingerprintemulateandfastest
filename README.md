@@ -585,9 +585,32 @@ go run ./cmd/send -solve https://site.com 1m 100 8 -proxy-file proxies.txt
 
 ```
 solving https://site.com with the browser in solver/ (direct, up to 1m15s)
-solved in 9.4s, 1 attempt(s), 4 cookie(s), chromium Chrome/151.0.7204.50
+solved in 9.4s, 1 attempt(s), chromium Chrome/151.0.7204.50
+seeding cf_clearance, session_id
+held back __cf_bm — bound to the browser session that earned them, not to the
+client replaying it (-solve-all-cookies to send them anyway)
 cf_clearance issued for .site.com
 ```
+
+Not everything the browser collected is a credential this client can carry, and
+the report names both halves rather than printing a count. `cf_clearance` is the
+one that travels; the target's own cookies travel because they are the target's.
+Cloudflare's per-session tokens do not: `__cf_bm` is minted for one browser
+session and read back by the edge on the next request, and `cf_chl_*` tracks a
+challenge that is in progress. Replaying those hands the edge a token describing
+a session this connection is not.
+
+Measured on a live UAM zone, same target, same address, within the hour: a solve
+seeding `cf_clearance` alone replayed as 200 across 113 requests; one that also
+seeded the `__cf_bm` the browser had collected replayed as a managed challenge.
+One pair of runs is not a controlled experiment, which is why
+`-solve-all-cookies` restores the old behaviour — but the default is the one that
+was observed to work.
+
+The exception is a zone with no UAM at all. Bot Fight Mode never issues a
+clearance, and there `__cf_bm` is not bookkeeping beside a credential, it is the
+only thing the solve earned — so when there is no `cf_clearance`, everything is
+seeded.
 
 Cloudflare binds `cf_clearance` to three things, and all three have to survive
 the handover from the browser that earned it to the client that replays it:

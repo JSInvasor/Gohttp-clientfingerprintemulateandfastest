@@ -42,12 +42,17 @@ func TestSolveCacheRoundTrip(t *testing.T) {
 		t.Fatalf("entry = %+v", e)
 	}
 
-	seed := seedFromCache("", e)
+	seed := seedFromCache("", e, false)
 	if seed.userAgent != "UA-151" {
 		t.Errorf("userAgent = %q, want the solved one", seed.userAgent)
 	}
-	if len(seed.cookies) != 2 || seed.cookies[0] != "cf_clearance=abc" {
-		t.Errorf("cookies = %v", seed.cookies)
+	// The entry keeps everything the browser had; the seed takes only what
+	// travels, so -solve-all-cookies can change its mind without a fresh solve.
+	if len(seed.cookies) != 1 || seed.cookies[0] != "cf_clearance=abc" {
+		t.Errorf("cookies = %v, want the clearance alone", seed.cookies)
+	}
+	if all := seedFromCache("", e, true); len(all.cookies) != 2 {
+		t.Errorf("-solve-all-cookies gave %v, want both", all.cookies)
 	}
 }
 

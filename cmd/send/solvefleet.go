@@ -138,7 +138,7 @@ func solveFleet(ctx context.Context, o *options, target string, exits []exit) ([
 	for i, e := range exits {
 		if !o.solveRefresh {
 			if hit := loadSolveCache(o.solveCache, target, e.identity(), o.solveMaxAge); hit != nil {
-				seeds[i] = seedFromCache(e.proxy, hit)
+				seeds[i] = seedFromCache(e.proxy, hit, o.solveAllCookies)
 				continue
 			}
 		}

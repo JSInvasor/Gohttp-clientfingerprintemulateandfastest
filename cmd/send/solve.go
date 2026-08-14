@@ -165,6 +165,94 @@ func redactProxy(raw string) string {
 	return raw
 }
 
+// splitSolvedCookies divides what the solve captured into the cookies worth
+// replaying and the ones that belong to the browser session that earned them.
+//
+// Not everything in the jar is a credential this client can carry. Three kinds
+// come back from a solve and only two of them travel:
+//
+//   - cf_clearance is the point of the exercise. It is bound to the address, the
+//     User-Agent and the TLS fingerprint, all three of which -solve exists to
+//     reproduce, and it is meant to be presented on later requests.
+//   - the target's own cookies — a session, a consent flag — are the site's, and
+//     dropping them would break whatever the run is actually doing.
+//   - Cloudflare's session bookkeeping is neither. __cf_bm is minted for one
+//     browser session and read back by the edge on the next request; cf_chl_*
+//     and __cf_chl_* track a challenge that is in progress. Replaying those from
+//     a different client does not carry anything forward — it presents the edge
+//     with a token whose contents describe a session this connection is not, and
+//     invites exactly the interstitial the clearance was earned to avoid.
+//
+// Measured, on a live UAM zone: a solve that seeded cf_clearance alone replayed
+// as 200 across 113 requests; a solve of the same target that also seeded the
+// second cookie the browser had by then collected replayed as a managed
+// challenge. That is one pair of runs and not a controlled experiment, which is
+// why -solve-all-cookies exists — but the default is the one that was observed
+// to work, and the held-back names are printed rather than dropped in silence.
+//
+// A browser that is *not* handed a __cf_bm simply gets a fresh one on its first
+// response, which is what any newly-opened browser does. There is nothing to
+// lose by withholding it — as long as there is a clearance to withhold it in
+// favour of. Which is the one case this must not apply to: a zone running Bot
+// Fight Mode alone never issues cf_clearance, and there __cf_bm is not
+// bookkeeping beside the credential, it is the only thing the solve earned.
+// Holding it back would leave the run with an empty jar and no way to tell.
+func splitSolvedCookies(cookies []solvedCookie, keepAll bool) (kept, dropped []solvedCookie) {
+	if !keepAll && !hasClearance(cookies) {
+		keepAll = true
+	}
+	for _, c := range cookies {
+		switch {
+		case keepAll, !sessionBoundCookie(c.Name):
+			kept = append(kept, c)
+		default:
+			dropped = append(dropped, c)
+		}
+	}
+	return kept, dropped
+}
+
+// hasClearance reports whether this jar carries the cookie the rest of the
+// filtering is in service of.
+func hasClearance(cookies []solvedCookie) bool {
+	return slices.ContainsFunc(cookies, func(c solvedCookie) bool {
+		return c.Name == "cf_clearance"
+	})
+}
+
+// sessionBoundCookie reports whether a name is one of Cloudflare's per-session
+// tokens, as opposed to cf_clearance or a cookie belonging to the site.
+//
+// Matched by prefix because the challenge cookies carry a ray id or a variant
+// suffix — cf_chl_rc_m, __cf_chl_tk — and an exact list would go stale the next
+// time Cloudflare adds one. cf_clearance is checked first: it shares the "cf_"
+// start with the very cookies being excluded, so name order here is load
+// bearing.
+func sessionBoundCookie(name string) bool {
+	if name == "cf_clearance" {
+		return false
+	}
+	for _, prefix := range []string{"__cf_bm", "cf_chl_", "__cf_chl_", "cf_chl", "__cflb"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// cookieNames renders a cookie list for the report — names only. The values are
+// credentials and this goes to stderr, which ends up in logs and pasted issues.
+func cookieNames(cookies []solvedCookie) string {
+	if len(cookies) == 0 {
+		return "no cookies"
+	}
+	names := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		names = append(names, c.Name)
+	}
+	return strings.Join(names, ", ")
+}
+
 // clearance returns the cf_clearance cookie, if the solve produced one.
 func (r *solveResult) clearance() (solvedCookie, bool) {
 	for _, c := range r.CookieList {
@@ -328,7 +416,7 @@ func solveOne(ctx context.Context, o *options, target string, e exit) (*solveSee
 	// reason they share a solve.
 	if !o.solveRefresh {
 		if hit := loadSolveCache(o.solveCache, target, e.identity(), o.solveMaxAge); hit != nil {
-			return seedFromCache(proxy, hit), nil
+			return seedFromCache(proxy, hit, o.solveAllCookies), nil
 		}
 	}
 
@@ -361,9 +449,19 @@ func seedFromResult(o *options, target string, e exit, res *solveResult) *solveS
 	// in parallel, and a report built from four Fprintf calls arrives
 	// interleaved with three other exits' — which is how a warning ends up
 	// under the wrong proxy.
-	report := fmt.Sprintf("solved in %s, %d attempt(s), %d cookie(s), chromium %s",
+	// Named rather than counted. "2 cookie(s)" and "1 cookie(s)" was the entire
+	// visible difference between a solve that replayed as 200 and one that
+	// replayed as 403, and neither line said which cookies — so the one thing
+	// worth knowing was the one thing not printed.
+	kept, dropped := splitSolvedCookies(res.CookieList, o.solveAllCookies)
+	report := fmt.Sprintf("solved in %s, %d attempt(s), chromium %s\nseeding %s",
 		round(time.Duration(res.DurationMS)*time.Millisecond), res.Attempts,
-		len(res.CookieList), res.Chromium)
+		res.Chromium, cookieNames(kept))
+	if len(dropped) > 0 {
+		report += fmt.Sprintf("\nheld back %s — bound to the browser session that earned them, "+
+			"not to the client replaying it (-solve-all-cookies to send them anyway)",
+			cookieNames(dropped))
+	}
 
 	// The budget is what the browser startup does not eat. A challenge with a
 	// Turnstile widget needs 15-30s of it, and a launch on a small VPS takes
@@ -400,7 +498,7 @@ func seedFromResult(o *options, target string, e exit, res *solveResult) *solveS
 	if gotClearance && cf.Expires > 0 {
 		seed.expiresAt = time.Unix(int64(cf.Expires), 0)
 	}
-	for _, c := range res.CookieList {
+	for _, c := range kept {
 		seed.cookies = append(seed.cookies, c.Name+"="+c.Value)
 	}
 	if gotClearance {
