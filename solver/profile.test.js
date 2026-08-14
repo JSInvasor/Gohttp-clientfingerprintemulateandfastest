@@ -9,7 +9,7 @@ import {
   preferenceList,
   primaryLanguage,
 } from "./profile.js";
-import { CHALLENGE_TITLE_RE, isChallengeTitle } from "./challenge.js";
+import { CHALLENGE_TITLE_RE, detectChallengeInPage, isChallengeTitle } from "./challenge.js";
 
 test("languageList drops quality values and keeps the order", () => {
   assert.deepEqual(languageList("en-US,en;q=0.9"), ["en-US", "en"]);
@@ -107,16 +107,98 @@ test("the challenge title check is not English-only", () => {
   assert.ok(!CHALLENGE_TITLE_RE.global);
 });
 
-test("preferenceList gives --accept-lang the list it takes, not a header", () => {
+// detectChallengeInPage runs in the browser, so it is exercised here against a
+// stand-in document rather than a real one: it only ever calls
+// document.querySelector and reads window._cf_chl_opt, and both are supplied.
+//
+// The case that matters is the negative one. Cloudflare puts its JS-detection
+// script on ordinary 200 responses, so a selector matching the whole of
+// /cdn-cgi/challenge-platform/ reads a cleared page as a challenged one — and
+// the caller's response to "still challenged" is to wait until its deadline and
+// then retry the whole solve.
+test("the challenge markers do not fire on a cleared Cloudflare page", () => {
+  const doc = (present) => ({
+    querySelector(selector) {
+      return present.some((s) => matches(s, selector)) ? {} : null;
+    },
+  });
+
+  // Enough of a matcher for the selectors this file uses: an id, or a
+  // tag[attr*="needle"] with an optional :not([attr*="needle"]).
+  const matches = (element, selector) => {
+    if (selector.startsWith("#")) return element === selector;
+    const tag = selector.match(/^[a-z]+/)[0];
+    const want = [...selector.matchAll(/\[src\*="([^"]+)"\]/g)].map((m) => m[1]);
+    const not = selector.includes(":not(") ? want.pop() : null;
+    if (!element.startsWith(tag + ":")) return false;
+    const src = element.slice(tag.length + 1);
+    if (!want.every((w) => src.includes(w))) return false;
+    return !(not && src.includes(not));
+  };
+
+  const withDoc = (present, chlOpt) => {
+    const priorDoc = globalThis.document;
+    const priorOpt = globalThis.window;
+    globalThis.document = doc(present);
+    globalThis.window = chlOpt ? { _cf_chl_opt: chlOpt } : {};
+    try {
+      return detectChallengeInPage();
+    } finally {
+      globalThis.document = priorDoc;
+      globalThis.window = priorOpt;
+    }
+  };
+
+  // A page that cleared. The jsd script is what Cloudflare injects into ordinary
+  // responses on a zone with bot management on — it is in the body of the last
+  // successful solve recorded in this repo.
+  assert.equal(
+    withDoc(["script:/cdn-cgi/challenge-platform/scripts/jsd/main.js"], null),
+    false,
+    "the JS-detection script on a cleared page was read as a challenge"
+  );
+
+  // A page that did not.
+  assert.equal(withDoc(["#challenge-form"], null), true);
+  assert.equal(withDoc(["#challenge-stage"], null), true);
+  assert.equal(withDoc(["iframe:https://challenges.cloudflare.com/turnstile/v0"], null), true);
+  assert.equal(
+    withDoc(["script:/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=1"], null),
+    true
+  );
+  // The bootstrap object, which is there before any of the markup is.
+  assert.equal(withDoc([], { cType: "managed" }), true);
+
+  // Nothing at all.
+  assert.equal(withDoc([], null), false);
+});
+
+test("preferenceList gives the preference list it takes, not a header", () => {
   // The bug this exists for: handed a finished header, Chrome 151 treated the
   // quality values as part of the language codes and emitted
   // "en-US,en;q=0.9,en;q=0.9;q=0.8" on the request that earns cf_clearance.
-  assert.equal(preferenceList("en-US,en;q=0.9"), "en-US");
-  assert.equal(preferenceList("tr-TR,tr;q=0.9"), "tr-TR");
-  assert.equal(preferenceList("en-GB,en-US;q=0.9,en;q=0.8"), "en-GB,en-US");
+  assert.equal(preferenceList("en-US,en;q=0.9"), "en-US,en");
+  assert.equal(preferenceList("tr-TR,tr;q=0.9"), "tr-TR,tr");
+  assert.equal(preferenceList("en-GB,en-US;q=0.9,en;q=0.8"), "en-GB,en-US,en");
 
-  // A genuine second language is not implied by the first, so it stays: this is
-  // a real two-language preference rather than a base being restated.
+  // The base tag stays. It used to be dropped, on the reasoning that Chromium
+  // re-adds it when it builds the header — which it does, so the header looked
+  // right and navigator.languages did not. Measured on 141 through
+  // Emulation.setUserAgentOverride, the two inputs are not interchangeable:
+  //
+  //   en-US      -> header en-US,en;q=0.9   navigator.languages ["en-US"]
+  //   en-US,en   -> header en-US,en;q=0.9   navigator.languages ["en-US","en"]
+  //
+  // and only the second is a client whose page object agrees with its own
+  // header. Dropping it is what put the contradiction back on the wire.
+  assert.equal(preferenceList("en-US,en"), "en-US,en");
+  assert.equal(preferenceList("de-DE,de;q=0.9"), "de-DE,de");
+
+  // A duplicate is still a duplicate: the list is what the browser reports back
+  // as navigator.languages, and no browser lists a tag twice.
+  assert.equal(preferenceList("en-US,en,en;q=0.8"), "en-US,en");
+
+  // A genuine second language is not implied by the first, and keeps its place.
   assert.equal(preferenceList("en-US,fr;q=0.9"), "en-US,fr");
   assert.equal(preferenceList("en-US,fr;q=0.9,de;q=0.8"), "en-US,fr,de");
 
@@ -124,14 +206,27 @@ test("preferenceList gives --accept-lang the list it takes, not a header", () =>
   assert.equal(preferenceList("en"), "en");
   assert.equal(preferenceList(""), "");
 
-  // No quality value survives into the flag, whatever went in — that is the
-  // single property the whole function is for.
+  // No quality value survives, whatever went in — that is the single property
+  // the whole function is for. A q-value reaching the flag mangles the header;
+  // one reaching setUserAgentOverride lands inside a language tag, and
+  // navigator.languages reports ["en-US", "en;q=0.9"].
   for (const input of [
     "en-US,en;q=0.9",
     "tr-TR,tr;q=0.9,en;q=0.8",
     "en-GB,en-US;q=0.9,en;q=0.8",
     "de-DE,de;q=0.9",
   ]) {
-    assert.ok(!preferenceList(input).includes(";"), `${input} leaked a q-value into --accept-lang`);
+    assert.ok(!preferenceList(input).includes(";"), `${input} leaked a q-value into the pref list`);
   }
+});
+
+// The header the run replays with and the page object the challenge reads have
+// to name the same languages. This is the invariant the two halves of that share
+// — the list the browser is given is exactly the tags of TARGET_LANG, in order.
+test("the pinned language survives the trip through the preference list", () => {
+  assert.deepEqual(preferenceList(TARGET_LANG).split(","), languageList(TARGET_LANG));
+
+  // The default is the one that matters, since almost every run uses it: a
+  // Chrome asking for en-US,en;q=0.9 reports ["en-US", "en"].
+  assert.equal(preferenceList("en-US,en;q=0.9"), "en-US,en");
 });

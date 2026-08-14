@@ -108,38 +108,40 @@ export function primaryLanguage(header) {
   return languageList(header)[0] || "";
 }
 
-// preferenceList turns an Accept-Language header into what --accept-lang wants,
-// which is not an Accept-Language header.
+// preferenceList turns an Accept-Language header into what --accept-lang and
+// CDP's Emulation.setUserAgentOverride both want, which is not an
+// Accept-Language header: the language *preference list*, the codes in order
+// with no quality values. Chromium generates the header from it, and
+// navigator.languages reports it back almost verbatim.
 //
-// The flag takes the browser's language *preference list* — the codes, in order,
-// with no quality values — and Chrome generates the header from it by appending
-// each tag's base language with a descending q. Handing it a finished header
-// instead makes it treat the q-values as part of the language codes. Measured
-// against Chrome 151.0.7922.108 with --accept-lang=en-US,en;q=0.9:
+// Handing it a finished header instead makes it read the q-values as part of the
+// codes. Measured against Chrome 151.0.7922.108 with
+// --accept-lang=en-US,en;q=0.9:
 //
 //   accept-language: en-US,en;q=0.9,en;q=0.9;q=0.8
 //
-// A duplicated tag and a doubled quality parameter, on the request that earns
-// cf_clearance, in a header no browser has ever emitted. Chromium 141 collapsed
-// the same input to a clean en-US,en;q=0.9, which is why this survived: the
-// behaviour differs between builds, and the one it was measured on was not the
-// one being shipped.
+// and against Chromium 141 through setUserAgentOverride with the same string,
+// where it is navigator.languages that takes the damage:
 //
-// So: codes only, and a tag that is already implied by an earlier one is
-// dropped. "en-US,en;q=0.9" is the pref list ["en-US"] — Chrome re-adds the
-// "en" itself, with the q it chooses. "en-US,fr;q=0.9" keeps both, because
-// neither implies the other, and that is a genuine two-language preference.
+//   accept-language: en-US,en;q=0.9;q=0.9
+//   navigator.languages: ["en-US", "en;q=0.9"]
+//
+// So: codes only. What is emphatically *not* dropped is a tag implied by an
+// earlier one — "en" after "en-US". This used to remove it, on the reasoning
+// that Chrome re-adds the base language when it builds the header. It does, and
+// that is why the bug was invisible on the wire and expensive off it. Measured,
+// Chromium 141, one value per row:
+//
+//   preference list   header sent      navigator.languages
+//   en-US             en-US,en;q=0.9   ["en-US"]
+//   en-US,en          en-US,en;q=0.9   ["en-US", "en"]
+//
+// Identical headers, different page objects — and ["en-US"] beside a header
+// advertising "en" is a contradiction no ordinary Chrome shows, on the one
+// request that earns cf_clearance. The list is passed through whole so the two
+// halves agree.
 export function preferenceList(header) {
-  const out = [];
-  for (const tag of languageList(header)) {
-    const base = tag.split("-")[0];
-    // Implied by a tag already in the list: "en" after "en-US" is what Chrome
-    // appends on its own, and asking for it again is what produced the
-    // duplicate above.
-    if (tag === base && out.some((t) => t.split("-")[0] === base)) continue;
-    out.push(tag);
-  }
-  return out.join(",");
+  return languageList(header).join(",");
 }
 
 // LAUNCH_ARGS and CONNECT_OPTIONS are shared so the fingerprint probe measures
@@ -174,11 +176,17 @@ export const LAUNCH_ARGS = [
   // The language, from one value, in the form each flag actually takes.
   //
   // --accept-lang is the preference list, not the header: see preferenceList
-  // for what handing it a finished header does to Chrome 151. --lang is the UI
-  // locale, and it takes one tag. Measured, --accept-lang is what drives both
-  // the header and navigator.languages; --lang alone moves neither. It is still
-  // set, so the UI locale and the language being asked for do not disagree —
-  // Intl and the date formats follow it.
+  // for what handing it a finished header does. --lang is the UI locale, and it
+  // takes one tag; Intl and the date formats follow it, so it is set too rather
+  // than leaving the UI disagreeing with the language being asked for.
+  //
+  // These pin the header, and only the header. Measured on Chromium 141, a
+  // fresh profile reports navigator.languages ["en-US"] whatever these say —
+  // en-US, en-US,en and no flag at all are indistinguishable in the page. The
+  // page object is set where it does move, in preparePage's
+  // Emulation.setUserAgentOverride, which is also where it can be set without
+  // leaving an own property on navigator. These stay because the flags apply
+  // from process start, which is earlier than any override can reach.
   `--accept-lang=${preferenceList(TARGET_LANG)}`,
   `--lang=${primaryLanguage(TARGET_LANG) || "en-US"}`,
 ];

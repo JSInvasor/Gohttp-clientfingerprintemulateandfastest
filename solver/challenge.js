@@ -13,10 +13,14 @@
 // two minutes of budget to solve. The failure looks identical to a site that
 // simply has no UAM, which is why it would never be noticed.
 //
-// The markers below are structural instead: the challenge platform's script
-// path, the form and stage elements it builds, the Turnstile iframe, and the
+// The markers below are structural instead: the challenge platform's orchestrate
+// script, the form and stage elements it builds, the Turnstile iframe, and the
 // _cf_chl_opt object its bootstrap defines. None of them are prose, so none of
 // them move with the page's language.
+//
+// Structural is not the same as unambiguous, and the script path is where that
+// bites — see the selector list for the one Cloudflare serves on pages it has
+// not challenged at all.
 //
 // The title check stays as a second opinion — it costs one CDP round trip and
 // catches an interstitial whose markup changed but whose wording did not.
@@ -45,7 +49,19 @@ export function detectChallengeInPage() {
     "#challenge-stage",
     "#cf-challenge-running",
     "#turnstile-wrapper",
-    'script[src*="/cdn-cgi/challenge-platform/"]',
+    // The orchestrate path, which only a challenge loads.
+    //
+    // Not the whole of /cdn-cgi/challenge-platform/, which was the first cut of
+    // this and is wrong in the direction that costs the most. Cloudflare injects
+    // its JS-detection script — /cdn-cgi/challenge-platform/scripts/jsd/main.js
+    // — into ordinary 200 responses on zones with bot management on, challenge
+    // or no challenge; it is in the body of the last successful solve in this
+    // repo's own notes. Matching it makes a cleared page read as a challenged
+    // one for as long as the caller is willing to wait, and the caller waits
+    // until its deadline: a site that never challenges would burn the whole
+    // budget, twice, and report no_clearance. A false negative here only costs
+    // the title check below.
+    'script[src*="/cdn-cgi/challenge-platform/"]:not([src*="/scripts/jsd/"])',
     'iframe[src*="challenges.cloudflare.com"]',
   ];
   for (const selector of selectors) {

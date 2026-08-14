@@ -64,6 +64,7 @@ import {
   TARGET_UA,
   connectOptions,
   parseProxyURL,
+  preferenceList,
   userAgentMetadata,
   chromiumMajor as parseChromiumMajor,
 } from "./profile.js";
@@ -283,10 +284,19 @@ async function preparePage(page, chromiumVersion) {
   // high-entropy hints can carry this browser's real build. UA_METADATA was
   // still worth building up front: it fails on a bad pin before a browser is
   // launched, which is the expensive way to find out.
-  await page.setUserAgent(
-    TARGET_UA,
-    userAgentMetadata(undefined, undefined, undefined, undefined, chromiumVersion)
+  const metadata = userAgentMetadata(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    chromiumVersion
   );
+  await page.setUserAgent(TARGET_UA, metadata);
+
+  // And the language, in the same override, because puppeteer's setUserAgent
+  // does not carry it. See pinLanguage: this is the half that moves
+  // navigator.languages.
+  await pinLanguage(page, metadata);
 
   // No stealth shims at all, and each one was removed for the same reason: it
   // asserted something no real Chrome reports, through a mechanism a page can
@@ -310,41 +320,115 @@ async function preparePage(page, chromiumVersion) {
   // override replaced a genuine PluginArray of five Plugin objects with a plain
   // Array of three plain objects.
   //
-  // languages was the last one, and it survived longer because its premise
-  // sounded right: the browser sends Accept-Language: en-US,en;q=0.9 while
-  // navigator.languages reports ["en-US"], and a header listing a language the
-  // page object does not looked like exactly the contradiction this repo exists
-  // to remove. Measured, it is not a contradiction — it is what Chrome does.
+  // languages was the last one, and removing it was half right — right about the
+  // mechanism, wrong about the value, and the wrong half was the expensive one.
   //
-  // navigator.languages comes from the language *preference list*; the header is
-  // generated from that same list by appending each tag's base language with a
-  // q-value. One configured language therefore always gives a header with two
-  // tags and a navigator.languages with one. Every value tried here behaved that
-  // way, in both directions:
-  //
-  //   --accept-lang=            header sent            navigator.languages
-  //   en-US,en;q=0.9            en-US,en;q=0.9         ["en-US"]
-  //   de-DE,de;q=0.9            de-DE,de;q=0.9         ["de-DE"]
-  //   tr-TR,tr;q=0.9,en;q=0.8   tr-TR,tr;q=0.9         ["tr-TR"]
-  //   en-GB,en-US;q=0.9,en;q=0.8  en-GB,en;q=0.9       ["en-GB"]
-  //   en                        en                     ["en"]
-  //
-  // So the shim was not restoring a missing entry, it was adding one Chrome does
-  // not report for that header — and it did so by defining an own property on
-  // the navigator instance, whose getter stringified as "() => languages" where
-  // every native accessor reads "function get languages() { [native code] }".
-  // Two tells, bought to fix nothing:
+  // Right about the mechanism. Object.defineProperty(navigator, "languages")
+  // leaves an own property on the instance where Navigator.prototype is the only
+  // place one belongs, and an accessor that stringifies as an arrow function
+  // where every native one reads [native code]:
   //
   //                              shimmed              untouched
-  //   navigator.languages        ["en-US","en"]       ["en-US"]
   //   own property on navigator  true                 false
   //   getter toString            () => languages      [native code]
   //
-  // The language still has to match what gofire replays with. That is handled
-  // where it cannot be detected at all: --accept-lang sets it at launch, and
-  // harvest reports back what the browser actually put on the wire so the replay
-  // uses that rather than what was asked for. See acceptLanguageOf.
+  // Both are one probe away on the request that earns cf_clearance, and no value
+  // is worth asserting that way.
+  //
+  // Wrong about the value. The claim that replaced the shim was that ["en-US"]
+  // beside a header of en-US,en;q=0.9 is "what Chrome does". It is what a
+  // *bare-profile Chromium* does. Measured here on 141, one row per launch, a
+  // local server reading the header and the page reporting its own object:
+  //
+  //   --accept-lang=      header sent      navigator.languages
+  //   (unset)             en-US,en;q=0.9   ["en-US"]
+  //   en-US               en-US,en;q=0.9   ["en-US"]
+  //   en-US,en            en-US,en;q=0.9   ["en-US"]
+  //
+  // Three configurations, one page object, and in every one of them the header
+  // advertises an "en" that navigator.languages does not list. An ordinary
+  // Chrome install carries the pref "en-US,en" and reports ["en-US", "en"];
+  // this is a fresh --user-data-dir with no locale state, and it collapses. So
+  // the contradiction was real, the shim had been covering it, and removing the
+  // shim without replacing it put it back on the wire.
+  //
+  // Replaced where it is not a shim at all. Emulation.setUserAgentOverride takes
+  // an acceptLanguage, and Chromium applies it to the header and to the page
+  // object together — from inside, so there is nothing on navigator to find.
+  // Same probe, same browser, through pinLanguage:
+  //
+  //   navigator.languages        ["en-US", "en"]
+  //   own property on navigator  false
+  //   getter toString            function get languages() { [native code] }
+  //
+  // See pinLanguage for why the value handed to it must be the preference list
+  // and not a finished header.
   watchAcceptLanguage(page);
+}
+
+// pinLanguage puts the run's language on the header and on navigator.languages
+// in one call, natively.
+//
+// puppeteer's setUserAgent sends Emulation.setUserAgentOverride but exposes only
+// userAgent and userAgentMetadata; the protocol's third field, acceptLanguage,
+// is the one that moves the page object. So this re-sends the same override with
+// all three, which is why it takes the metadata: the call replaces its
+// predecessor wholesale rather than merging, and leaving the Client Hints out
+// here would clear the ones setUserAgent had just set.
+//
+// The value is the preference list — "en-US,en" — not the header. Handing it
+// TARGET_LANG verbatim is measured to corrupt both halves at once:
+//
+//   acceptLanguage       header sent           navigator.languages
+//   en-US,en             en-US,en;q=0.9        ["en-US", "en"]
+//   en-US,en;q=0.9       en-US,en;q=0.9;q=0.9  ["en-US", "en;q=0.9"]
+//
+// A doubled quality parameter and a q-value inside a language tag, neither of
+// which any browser emits.
+//
+// Best effort, deliberately. A CDP session is the one part of preparePage that
+// can fail for reasons that have nothing to do with the identity — a puppeteer
+// build without page.createCDPSession, a target that went away mid-launch — and
+// the fallback is the behaviour of the previous release rather than a dead
+// solve. The UA and the hints are already pinned by the caller either way.
+async function pinLanguage(page, metadata) {
+  const acceptLanguage = preferenceList(TARGET_LANG);
+  if (!acceptLanguage) return;
+  try {
+    // Kept for the life of the page: an emulation override belongs to the
+    // session that set it, and detaching would hand the language back to the
+    // browser default at the first navigation. The page outlives nothing here —
+    // attempt() closes it — so there is no session to leak.
+    const client = await cdpSession(page);
+    await client.send("Emulation.setUserAgentOverride", {
+      userAgent: TARGET_UA,
+      acceptLanguage,
+      userAgentMetadata: metadata,
+    });
+    cdpSessions.set(page, client);
+  } catch (err) {
+    // Worth a line: the run continues with the header pinned by --accept-lang
+    // and navigator.languages left where the browser had it, which is the
+    // mismatch described above rather than a broken solve.
+    process.stderr.write(
+      `solver: could not pin navigator.languages (${errorMessage(err)}); ` +
+        `continuing with the launch flag only\n`
+    );
+  }
+}
+
+// The CDP sessions pinLanguage opened, held so the override outlives the call
+// and dropped when the page is collected.
+const cdpSessions = new WeakMap();
+
+// cdpSession opens a raw protocol session on a page across the two spellings
+// puppeteer has had for it. page.createCDPSession is the current one;
+// page.target().createCDPSession is what everything before it exposed, and
+// puppeteer-real-browser pins its own fork rather than a version this file can
+// assume.
+function cdpSession(page) {
+  if (typeof page.createCDPSession === "function") return page.createCDPSession();
+  return page.target().createCDPSession();
 }
 
 // What the browser actually sent, per page.

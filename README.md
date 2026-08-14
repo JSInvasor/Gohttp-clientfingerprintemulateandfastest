@@ -617,12 +617,29 @@ rather than printed and discarded. `fpcheck -via-chromium` still measures how fa
 apart the two really are.
 
 The language travels with them. `send` hands the solver whatever the run will
-replay with — `-lang`, or the library default — as `SOLVER_LANG`, and the solver
-pins it with `--accept-lang` and `--lang`. Left to itself the browser used the
-box's locale, so a localised image solved in one language and replayed in
-another; worse, the `navigator.languages` shim asserted `["en-US", "en"]`
-regardless, contradicting the browser's own header on any box that was not
-already en-US.
+replay with — `-lang`, or the library default — as `SOLVER_LANG`. Left to itself
+the browser used the box's locale, so a localised image solved in one language
+and replayed in another.
+
+Pinning it takes two mechanisms, because the header and the page object are set
+in different places. `--accept-lang` and `--lang` fix the header from process
+start. They do not move `navigator.languages` at all — measured on Chromium 141,
+a fresh profile reports `["en-US"]` whether the flag says `en-US`, `en-US,en` or
+nothing — so the page object is set through
+`Emulation.setUserAgentOverride`'s `acceptLanguage`, in the same call that
+carries the User-Agent and the Client Hints. That is the one mechanism that moves
+both halves together, and it does it from inside the browser: no own property on
+`navigator`, and the getter still reads `[native code]`.
+
+Both take the *preference list* (`en-US,en`), never a finished header. Handed
+`en-US,en;q=0.9`, the flag emits `en-US,en;q=0.9,en;q=0.9;q=0.8` on Chrome 151
+and the override reports `navigator.languages == ["en-US", "en;q=0.9"]` — a
+q-value inside a language tag. `preferenceList` in `solver/profile.js` is the
+one place that conversion happens.
+
+Getting this wrong is quiet and it is not cosmetic: a browser advertising
+`en-US,en;q=0.9` while its page object lists only `en-US` is a client no
+ordinary Chrome install produces, on the exact request that earns `cf_clearance`.
 
 The solver claims the OS it is actually running, which for most deployments is
 Linux — `Chrome151LinuxUserAgent`, the same Chrome 151 identity with the Linux
@@ -856,10 +873,25 @@ been confirmed on hardware other than the one they were taken on:
   It needs real network egress, so it cannot run from a sandbox. Re-run it on
   your own box before relying on any of this.
 
-What that does *not* cover, and what nothing here should be taken to claim: no
-part of this has been measured against a live Cloudflare challenge end to end.
-`-solve` earning a `cf_clearance` and a load run replaying it successfully is
-a separate test, and it is the one left.
+The end-to-end test that used to be listed here as the one left — `-solve`
+earning a `cf_clearance` and a load run replaying it — has since been run, on a
+live zone in Under Attack mode, from a VPS address:
+
+```
+solved in 1m23.44s, 1 attempt(s), 1 cookie(s), chromium Chrome/151.0.7922.108
+cf_clearance issued for .2t1.online
+HTTP/2.0 200 OK  headers 374.5ms  body 1.6ms  8278 bytes
+...
+113 requests in 2.25s
+ok 113   failed 0   tls connections 5
+status
+  200 OK                       113
+```
+
+So the handover works: a clearance a real Chromium earned, replayed by this
+client, over five connections and a hundred-odd requests, without a challenge.
+What that run does not settle is how much of it is the client and how much is
+the address — see the note on scoring under Known gaps.
 
 ## Known gaps
 
@@ -890,11 +922,11 @@ no amount of work inside this package closes them:
 - **The HTTP/2 transport pings an idle connection every 15s.** That keeps dead
   connections out of the pool, but browsers have no such fixed heartbeat. It only
   shows up on connections held open between requests, not on a single fetch.
-- **A `cf_clearance` does not always travel, and `-solve` depends on it doing
-  so.** Measured against two independent zones in Under Attack mode, from a
-  datacenter address. The solver earned a clearance in a real Chromium; the same
-  cookie presented from a *fresh context of that same browser* — same address,
-  same User-Agent, same TLS — was challenged again. On both.
+- **A `cf_clearance` does not always travel.** Measured against two independent
+  zones in Under Attack mode, from a datacenter address. The solver earned a
+  clearance in a real Chromium; the same cookie presented from a *fresh context
+  of that same browser* — same address, same User-Agent, same TLS — was
+  challenged again. On both.
 
   The cookie was verified to be on the wire, not merely in a jar:
   `Network.requestWillBeSentExtraInfo` reported it on the navigation request.
@@ -904,21 +936,32 @@ no amount of work inside this package closes them:
   including ones a local server confirmed receiving. A measurement is only as
   good as its instrument, and this one was wrong once before it was right.
 
-  Presenting `cf_clearance` alone, without the `cf_chl_*` bookkeeping the solve
-  also captures, made no difference. Solving inside a context and continuing in
-  it returned 200; carrying the result out of that context did not.
+  **This entry used to end "`-solve` has nothing to offer the run", and that was
+  wrong.** The run quoted under Verification replayed a solved clearance through
+  this client for 113 requests without a single challenge, on a live UAM zone,
+  from a VPS address. A clearance travels. What the measurement above actually
+  shows is narrower: it does not travel *unconditionally*, and it did not travel
+  on the day it was taken.
 
-  Nothing on the client side fixes that, and `solver/replay.js` is there to tell
-  you which case you are in before you spend a day assuming otherwise. When the
-  clearance does not travel, `-solve` has nothing to offer the run.
+  The generalisation was worth more than the observation because of what else
+  was true that day. The solve was advertising `Accept-Language: en-US,en;q=0.9`
+  while reporting `navigator.languages == ["en-US"]` — a contradiction no
+  ordinary Chrome shows, on the request that earns the cookie. That is fixed
+  (`pinLanguage` in `solver/index.js`), and it is exactly the sort of thing a
+  "nothing on the client side fixes this" conclusion stops anyone from looking
+  for. A negative result from one address on one afternoon is a data point, not
+  a property of the protocol.
+
+  `solver/replay.js` is there to tell you which case you are in before you spend
+  a day assuming otherwise — in both directions.
 
   Worth separating from the fingerprint question, because they get conflated: the
-  fingerprint was verified correct on the same box, in the same hour, by the
-  fpcheck run above. The aim is not to replay a clearance — it is to not be
-  challenged, which is a question about the exit address at least as much as
-  about the client. A datacenter range is scored badly whatever it presents, and
-  repeated failed challenges from one address make the next one harder, so
-  measuring this costs the address something each time.
+  aim is not to replay a clearance — it is to not be challenged, which is a
+  question about the exit address at least as much as about the client. A
+  datacenter range is scored badly whatever it presents, and repeated failed
+  challenges from one address make the next one harder, so measuring this costs
+  the address something each time. If a solve that used to pass stops passing,
+  suspect the address's recent history before the code.
 
 ## Performance claims
 
