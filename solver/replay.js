@@ -56,12 +56,27 @@ const url = process.argv[2];
 if (!url) fail("usage: node solver/replay.js <url> [cache_dir]");
 
 // The same directory defaultSolveCachePath() in cmd/send/solvecache.go writes
-// to: os.UserCacheDir()/gofire/solve-cache, which on Linux honours XDG_CACHE_HOME
-// and falls back to ~/.cache.
+// to: os.UserCacheDir()/gofire/solve-cache.
+//
+// Which is a different place on each platform, and reproducing only the Linux
+// one meant this looked in ~/.cache on Windows while send wrote to
+// %LocalAppData% — a "no cached solve" error pointing at a directory that was
+// never going to have one, on the platform least likely to guess why.
+function userCacheDir() {
+  switch (process.platform) {
+    case "win32":
+      return process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    case "darwin":
+      return path.join(os.homedir(), "Library", "Caches");
+    default:
+      return process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
+  }
+}
+
 const cacheDir =
   process.argv[3] ||
   process.env.SEND_SOLVE_CACHE ||
-  path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "gofire", "solve-cache");
+  path.join(userCacheDir(), "gofire", "solve-cache");
 
 // The cache is keyed by a hash this file does not compute, so rather than
 // reproduce that keying, every entry is read and the one for this host is
