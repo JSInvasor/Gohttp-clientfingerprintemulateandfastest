@@ -68,6 +68,7 @@ import {
   TARGET_UA,
   connectOptions,
   parseProxyURL,
+  userAgentMetadata,
   chromiumMajor as parseChromiumMajor,
 } from "./profile.js";
 import {

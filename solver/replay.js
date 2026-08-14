@@ -36,6 +36,7 @@ import os from "node:os";
 import { connect } from "puppeteer-real-browser";
 import { connectOptions } from "./profile.js";
 import { preparePage } from "./identity.js";
+import { explain, verdict } from "./verdict.js";
 import {
   cleanup,
   errorMessage,
