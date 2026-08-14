@@ -125,6 +125,22 @@ async function attempt(browser, cookies, label) {
   const context = await browser.createBrowserContext();
   const page = await context.newPage();
 
+  // What actually went out, rather than what was asked for.
+  //
+  // This is the assumption the whole file rests on and it was going unchecked:
+  // "the cookie was presented and refused" and "the cookie was never sent" look
+  // identical from the response, and setCookie failing quietly — a domain that
+  // does not match, a Secure flag on the wrong scheme — produces the second
+  // while reading as the first. The header on the navigation request settles it.
+  let cookieSent = null;
+  page.on("request", (request) => {
+    try {
+      if (cookieSent !== null) return; // the first navigation, not the redirects
+      if (!request.isNavigationRequest() || request.frame() !== page.mainFrame()) return;
+      cookieSent = request.headers()["cookie"] || "";
+    } catch {}
+  });
+
   if (cookies.length > 0) {
     await context.setCookie(
       ...cookies.map((c) => ({
@@ -145,8 +161,18 @@ async function attempt(browser, cookies, label) {
     .evaluate(() => typeof window._cf_chl_opt === "object" && window._cf_chl_opt !== null)
     .catch(() => true);
 
+  const wanted = cookies.map((c) => c.name);
+  const sentNames = String(cookieSent || "")
+    .split(";")
+    .map((p) => p.split("=")[0].trim())
+    .filter(Boolean);
+
   const out = {
-    presented: cookies.map((c) => c.name),
+    presented: wanted,
+    // The names that were actually on the wire, and what is missing from them.
+    // A non-empty `not_sent` invalidates the attempt rather than answering it.
+    sent: sentNames,
+    not_sent: wanted.filter((n) => !sentNames.includes(n)),
     http_status: response ? response.status() : 0,
     challenged,
     title: await page.title().catch(() => ""),
@@ -163,50 +189,27 @@ async function main() {
     browser = result.browser;
     trackBrowser(browser);
 
-    const context = await browser.createBrowserContext();
-    const page = await context.newPage();
+    // The carried-in cookie, in a context of its own. attempt() reports what
+    // went out on the wire as well as what came back, so a cookie that was
+    // never sent cannot be read as one that was refused.
+    const carried = await attempt(browser, entry.cookies, "carried in");
 
-    const origin = new URL(url).origin;
-    await context.setCookie(
-      ...entry.cookies.map((c) => ({
-        name: c.name,
-        value: c.value,
-        domain: c.domain || new URL(url).hostname,
-        path: "/",
-        secure: true,
-      }))
-    );
-
-    const response = await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: 45_000,
-    });
-
-    // Give the page a moment: a challenge that is going to appear appears
-    // immediately, and one that resolves itself does so in well under this.
-    await new Promise((r) => setTimeout(r, 3_000));
-
-    const httpStatus = response ? response.status() : 0;
-    const title = await page.title().catch(() => "");
-    const challenged = await page
-      .evaluate(() => typeof window._cf_chl_opt === "object" && window._cf_chl_opt !== null)
-      .catch(() => false);
-
-    const after = await context.cookies(origin).catch(() => []);
-    const clearance = after.find((c) => c.name === "cf_clearance");
-
-    // The second question, and only worth asking once the first has answered
-    // no: is the clearance unusable, or is the zone challenging everything?
+    // Only worth asking once that has answered no: is the clearance unusable,
+    // or is the zone challenging everything?
     //
-    // Let the challenge run to completion in this context — a browser solves it
-    // and proceeds, which is the whole difference between it and a client — then
-    // navigate again with whatever that left behind. If that second navigation
-    // passes, a clearance does work here, just not one carried in from another
-    // session. If it is challenged too, the zone re-challenges every request and
-    // there is nothing for -solve to earn that would ever be reusable.
+    // Let a challenge run to completion in a context of its own — a browser
+    // solves it and proceeds, which is the whole difference between it and a
+    // client — then navigate again with whatever that left behind. If that
+    // passes, a clearance does work here and simply does not travel. If it is
+    // challenged too, the zone re-challenges every request and there is nothing
+    // for -solve to earn that would ever be reusable.
     let inSession = null;
-    if (challenged) {
-      const deadline = Date.now() + 60_000;
+    if (carried.challenged) {
+      const context = await browser.createBrowserContext();
+      const page = await context.newPage();
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => null);
+
+      const deadline = Date.now() + 90_000;
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 2_000));
         const stillOn = await page
@@ -214,7 +217,8 @@ async function main() {
           .catch(() => true);
         if (!stillOn) break;
       }
-      const second = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 })
+      const second = await page
+        .goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 })
         .catch(() => null);
       await new Promise((r) => setTimeout(r, 2_000));
       inSession = {
@@ -224,13 +228,14 @@ async function main() {
           .catch(() => true),
         title: await page.title().catch(() => ""),
       };
+      await context.close().catch(() => {});
     }
 
     // The solver captures every cookie the origin set, challenge bookkeeping
     // included. If presenting that bookkeeping is what breaks the replay, the
-    // same cookies minus it will pass — and the fix is in this repo.
+    // same cookies without it will pass — and the fix is in this repo.
     let clearanceOnly = null;
-    if (challenged) {
+    if (carried.challenged) {
       const kept = entry.cookies.filter((c) => !isChallengeState(c.name));
       if (kept.length !== entry.cookies.length) {
         clearanceOnly = await attempt(browser, kept, "clearance only");
@@ -239,25 +244,12 @@ async function main() {
 
     out({
       status: "ok",
-      url: page.url(),
-      http_status: httpStatus,
-      title,
-      challenged,
-      // null when the first navigation already passed, so there was nothing to
+      ...carried,
+      // null when the carried cookie already passed, so there was nothing to
       // distinguish. Otherwise: does a clearance earned *here* work here?
       same_session_after_solving: inSession,
-      // null when nothing was dropped, or when the first attempt passed. A pass
-      // here against a fail above means the challenge's own bookkeeping is what
-      // the edge objected to, not the clearance.
+      // null when nothing was dropped, or when the carried attempt passed.
       without_challenge_state: clearanceOnly,
-      // A clearance that came back different is the edge replacing the one that
-      // was presented, which is its way of saying the presented one was not
-      // accepted.
-      clearance_replaced:
-        !!clearance &&
-        !!entry.cookies.find((c) => c.name === "cf_clearance") &&
-        clearance.value !== entry.cookies.find((c) => c.name === "cf_clearance").value,
-      cookies_presented: entry.cookies.map((c) => c.name),
       solved_at: entry.solved_at,
       chromium_version: await browser.version().catch(() => ""),
     });
