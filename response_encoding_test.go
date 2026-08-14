@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/andybalholm/brotli"
 )
@@ -225,5 +226,56 @@ func TestHostProtoKey(t *testing.T) {
 	}
 	if hostProtoKey("example.com:8443", "443") == hostProtoKey("example.com", "443") {
 		t.Error("a non-standard port collides with the default-port origin")
+	}
+}
+
+// A response may not name an unbounded decoder chain.
+//
+// Every coding costs a decoder before a byte of body is read, and zstd's costs
+// goroutines: zstd.NewReader validates nothing up front, so it allocates and
+// spawns workers and returns successfully however many times it is nested.
+// Measured before the bound: ten nested readers cost fourteen goroutines and
+// fifty hung the process outright — bought with about three hundred bytes of
+// response header, from the one party in this exchange that is not trusted.
+func TestContentEncodingChainIsBounded(t *testing.T) {
+	long := make([]string, maxContentCodings+1)
+	for i := range long {
+		long[i] = "zstd"
+	}
+
+	resp := newResponse(nil, long...)
+	done := make(chan error, 1)
+	go func() {
+		_, err := resp.Bytes()
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a chain past the bound was accepted")
+		}
+		if !strings.Contains(err.Error(), "content codings") {
+			t.Errorf("error %q does not say what was refused", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("decoding a long coding chain hung — the bound is not being applied")
+	}
+}
+
+// The bound must not reject the chains that are legal and do occur: RFC 9110
+// §8.4 lists codings in the order they were applied, so this is undone
+// last-first.
+func TestContentEncodingShortChainStillWorks(t *testing.T) {
+	const want = "chained"
+	// Applied gzip first, then brotli, so the header reads "gzip, br".
+	body := brotliBytes(t, gzipBytes(t, []byte(want)))
+
+	got, err := newResponse(body, "gzip", "br").Bytes()
+	if err != nil {
+		t.Fatalf("a two-coding chain failed: %v", err)
+	}
+	if string(got) != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }

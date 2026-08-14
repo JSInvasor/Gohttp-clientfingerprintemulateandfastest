@@ -112,10 +112,31 @@ func contentCodings(header http.Header) []string {
 // decodeBody wraps body in the decoder chain named by Content-Encoding.
 // RFC 9110 §8.4 lists codings in the order they were applied, so a body sent as
 // "gzip, br" is brotli on the outside and has to be undone last-first.
+// maxContentCodings bounds how long a decoder chain a response may ask for.
+//
+// Every entry costs a decoder before a single byte of body is read, and the
+// cost is not uniform: gzip.NewReader reads its header immediately and fails on
+// anything that is not gzip, so a chain of those collapses on the second entry.
+// zstd.NewReader validates nothing up front — it allocates and spawns decode
+// goroutines and returns successfully. Measured here: ten nested zstd readers
+// cost fourteen goroutines, and fifty hung the process outright. The attacker's
+// side of that is about three hundred bytes of response header.
+//
+// Which is a bargain worth refusing, because the server is the untrusted party
+// in this client: it is pointed at hosts that would rather it stopped working.
+// Real responses carry one coding. RFC 9110 §8.4 allows a list and Chrome will
+// undo a short one, so four leaves room for anything legitimate and none for
+// this.
+const maxContentCodings = 4
+
 func decodeBody(body io.Reader, header http.Header) (io.Reader, []io.Closer, error) {
 	codings := contentCodings(header)
 	if len(codings) == 0 {
 		return body, nil, nil
+	}
+	if len(codings) > maxContentCodings {
+		return nil, nil, fmt.Errorf("response declares %d content codings, at most %d are decoded",
+			len(codings), maxContentCodings)
 	}
 
 	var closers []io.Closer
