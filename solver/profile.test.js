@@ -6,6 +6,7 @@ import {
   TARGET_LANG,
   languageList,
   parseProxyURL,
+  preferenceList,
   primaryLanguage,
 } from "./profile.js";
 import { CHALLENGE_TITLE_RE, isChallengeTitle } from "./challenge.js";
@@ -31,16 +32,29 @@ test("primaryLanguage is what --lang takes", () => {
   assert.equal(primaryLanguage(""), "");
 });
 
-// The header, the UI locale and navigator.languages all have to come from one
-// value, or the browser asks for one language and reports another.
-test("the launch flags carry the pinned language", () => {
+// The header and the UI locale both have to come from one value, in the form
+// each flag actually takes.
+//
+// This used to assert --accept-lang=${TARGET_LANG} — the finished header, passed
+// straight through — and that is the bug it was pinning in place. The flag takes
+// a preference list, and Chrome 151 handed a header instead emitted
+// "en-US,en;q=0.9,en;q=0.9;q=0.8" on the request that earns cf_clearance.
+test("the launch flags carry the pinned language in the form each takes", () => {
   assert.ok(
-    LAUNCH_ARGS.includes(`--accept-lang=${TARGET_LANG}`),
+    LAUNCH_ARGS.includes(`--accept-lang=${preferenceList(TARGET_LANG)}`),
     `--accept-lang missing from ${LAUNCH_ARGS.join(" ")}`
   );
   assert.ok(
     LAUNCH_ARGS.includes(`--lang=${primaryLanguage(TARGET_LANG)}`),
     `--lang missing from ${LAUNCH_ARGS.join(" ")}`
+  );
+
+  // The property that matters more than either exact value: no quality value
+  // ever reaches --accept-lang, whatever TARGET_LANG is set to.
+  const acceptLang = LAUNCH_ARGS.find((a) => a.startsWith("--accept-lang="));
+  assert.ok(
+    !acceptLang.includes(";"),
+    `${acceptLang} passes a quality value to a flag that takes a preference list`
   );
 });
 
@@ -91,4 +105,33 @@ test("the challenge title check is not English-only", () => {
   }
   // Global flags carry lastIndex between calls; this regex must not.
   assert.ok(!CHALLENGE_TITLE_RE.global);
+});
+
+test("preferenceList gives --accept-lang the list it takes, not a header", () => {
+  // The bug this exists for: handed a finished header, Chrome 151 treated the
+  // quality values as part of the language codes and emitted
+  // "en-US,en;q=0.9,en;q=0.9;q=0.8" on the request that earns cf_clearance.
+  assert.equal(preferenceList("en-US,en;q=0.9"), "en-US");
+  assert.equal(preferenceList("tr-TR,tr;q=0.9"), "tr-TR");
+  assert.equal(preferenceList("en-GB,en-US;q=0.9,en;q=0.8"), "en-GB,en-US");
+
+  // A genuine second language is not implied by the first, so it stays: this is
+  // a real two-language preference rather than a base being restated.
+  assert.equal(preferenceList("en-US,fr;q=0.9"), "en-US,fr");
+  assert.equal(preferenceList("en-US,fr;q=0.9,de;q=0.8"), "en-US,fr,de");
+
+  // Nothing to strip.
+  assert.equal(preferenceList("en"), "en");
+  assert.equal(preferenceList(""), "");
+
+  // No quality value survives into the flag, whatever went in — that is the
+  // single property the whole function is for.
+  for (const input of [
+    "en-US,en;q=0.9",
+    "tr-TR,tr;q=0.9,en;q=0.8",
+    "en-GB,en-US;q=0.9,en;q=0.8",
+    "de-DE,de;q=0.9",
+  ]) {
+    assert.ok(!preferenceList(input).includes(";"), `${input} leaked a q-value into --accept-lang`);
+  }
 });

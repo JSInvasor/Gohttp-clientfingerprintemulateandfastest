@@ -411,18 +411,66 @@ func reportSolveDrift(seed *solveSeed, o *options) {
 // reportLanguageDrift says so when the browser did not send the language it was
 // asked for.
 //
-// It is not an error and nothing is broken by it — the sessions replay what was
-// actually sent, so the two halves of the handover match either way. It is worth
-// a line because the run is then advertising something other than what -lang
-// says, and a flag that silently means something else is worse than one that
-// does not work.
+// Drift alone is not an error and nothing is broken by it — the sessions replay
+// what was actually sent, so the two halves of the handover match either way. It
+// is worth a line because the run is then advertising something other than what
+// -lang says, and a flag that silently means something else is worse than one
+// that does not work.
+//
+// A malformed header is a different matter, and is checked first. Chrome 151
+// answered --accept-lang=en-US,en;q=0.9 with
+//
+//	en-US,en;q=0.9,en;q=0.9;q=0.8
+//
+// on the request that earns cf_clearance, because the flag takes a preference
+// list and was being handed a finished header. Chromium 141 collapsed the same
+// input cleanly, which is exactly why it needs checking rather than reasoning
+// about: the transform belongs to the build, and the next one is free to change
+// it again.
 func reportLanguageDrift(sent, asked string) {
-	if sent == "" || asked == "" || sent == asked {
+	if sent == "" {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "note: -lang asked for %q but the browser sent %q — Chromium regenerates "+
-		"Accept-Language from the first tag. The run replays what was sent, so the cookie still "+
-		"matches; pass the collapsed form to -lang if you want the flag to read true.\n", asked, sent)
+	if bad := malformedLanguage(sent); bad != "" {
+		fmt.Fprintf(os.Stderr, "warning: the solve advertised Accept-Language %q, which is malformed "+
+			"(%s). No browser emits that, and it was on the request that earned the cookie. "+
+			"Please report the Chromium version — solver/profile.js builds this flag from a "+
+			"measurement that this build evidently does not share.\n", sent, bad)
+		return
+	}
+	if asked == "" || sent == asked {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "note: -lang asked for %q but the browser sent %q — Chromium builds the "+
+		"header from its own preference list. The run replays what was sent, so the cookie still "+
+		"matches; pass that form to -lang if you want the flag to read true.\n", asked, sent)
+}
+
+// malformedLanguage names what is wrong with an Accept-Language header, or
+// returns "" when it is well formed.
+//
+// Only the two shapes a mis-built --accept-lang produces are looked for, rather
+// than a full RFC 9110 §12.5.4 parse: a tag repeated, and a tag carrying more
+// than one quality parameter. Both are things a server can trivially notice and
+// no browser ever sends.
+func malformedLanguage(header string) string {
+	seen := map[string]bool{}
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		fields := strings.Split(part, ";")
+		tag := strings.TrimSpace(fields[0])
+		if qs := len(fields) - 1; qs > 1 {
+			return fmt.Sprintf("%q carries %d quality parameters", part, qs)
+		}
+		if seen[tag] {
+			return fmt.Sprintf("the tag %q appears more than once", tag)
+		}
+		seen[tag] = true
+	}
+	return ""
 }
 
 // reportChromiumDrift warns when the browser that earned the cookie is not the

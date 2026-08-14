@@ -438,3 +438,30 @@ func TestSolveDefaultsToChromeProfile(t *testing.T) {
 		t.Errorf("profile = %q, want the explicit safari to survive so run() can reject it", o.profile)
 	}
 }
+
+// The exact header Chrome 151 produced when --accept-lang was handed a finished
+// Accept-Language instead of the preference list it takes. It went out on the
+// request that earns cf_clearance, and nothing noticed.
+func TestMalformedLanguageIsCaught(t *testing.T) {
+	tests := []struct {
+		name, header string
+		wantBad      bool
+	}{
+		{"what chrome 151 sent", "en-US,en;q=0.9,en;q=0.9;q=0.8", true},
+		{"a doubled quality parameter", "en-US,en;q=0.9;q=0.8", true},
+		{"a repeated tag", "tr-TR,tr;q=0.9,tr;q=0.8", true},
+		{"chrome's own default", "en-US,en;q=0.9", false},
+		{"a single tag", "en", false},
+		{"three real languages", "en-US,fr;q=0.9,de;q=0.8", false},
+		{"spaces after the commas", "en-US, en;q=0.9", false},
+		{"empty", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := malformedLanguage(tc.header)
+			if (bad != "") != tc.wantBad {
+				t.Errorf("malformedLanguage(%q) = %q, want malformed=%v", tc.header, bad, tc.wantBad)
+			}
+		})
+	}
+}
