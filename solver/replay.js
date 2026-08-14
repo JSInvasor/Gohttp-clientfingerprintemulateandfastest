@@ -47,6 +47,7 @@ function out(o) {
   console.log(JSON.stringify(o));
 }
 
+
 function fail(message) {
   out({ status: "error", error: message });
   process.exit(1);
@@ -287,7 +288,13 @@ async function main() {
       without_challenge_state: clearanceOnly,
       solved_at: entry.solved_at,
       chromium_version: await browser.version().catch(() => ""),
+      verdict: verdict(carried, inSession, clearanceOnly),
     });
+    // The same thing in words, on stderr so it cannot get into anything parsing
+    // the line above. This tool exists to say which case you are in, and until
+    // now it made you work that out from four nested objects — which is exactly
+    // the kind of reading that produces a confident wrong answer.
+    process.stderr.write(explain(verdict(carried, inSession, clearanceOnly)) + "\n");
   } finally {
     if (browser) {
       try {

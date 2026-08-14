@@ -600,12 +600,11 @@ session and read back by the edge on the next request, and `cf_chl_*` tracks a
 challenge that is in progress. Replaying those hands the edge a token describing
 a session this connection is not.
 
-Measured on a live UAM zone, same target, same address, within the hour: a solve
-seeding `cf_clearance` alone replayed as 200 across 113 requests; one that also
-seeded the `__cf_bm` the browser had collected replayed as a managed challenge.
-One pair of runs is not a controlled experiment, which is why
-`-solve-all-cookies` restores the old behaviour — but the default is the one that
-was observed to work.
+This is reasoning about what each cookie is for, not a measured effect on any
+challenge — a distinction worth keeping, since two runs that differed in both
+their cookie set and their outcome briefly looked like evidence for it and were
+not (see Known gaps). `-solve-all-cookies` sends everything, for when you want to
+check that for yourself.
 
 The exception is a zone with no UAM at all. Bot Fight Mode never issues a
 clearance, and there `__cf_bm` is not bookkeeping beside a credential, it is the
@@ -959,32 +958,43 @@ no amount of work inside this package closes them:
   including ones a local server confirmed receiving. A measurement is only as
   good as its instrument, and this one was wrong once before it was right.
 
-  **This entry used to end "`-solve` has nothing to offer the run", and that was
-  wrong.** The run quoted under Verification replayed a solved clearance through
-  this client for 113 requests without a single challenge, on a live UAM zone,
-  from a VPS address. A clearance travels. What the measurement above actually
-  shows is narrower: it does not travel *unconditionally*, and it did not travel
-  on the day it was taken.
+  **It is a property of the address and the hour, not of the protocol.** Three
+  measurements against the same target from the same VPS, in that order:
 
-  The generalisation was worth more than the observation because of what else
-  was true that day. The solve was advertising `Accept-Language: en-US,en;q=0.9`
-  while reporting `navigator.languages == ["en-US"]` — a contradiction no
-  ordinary Chrome shows, on the request that earns the cookie. That is fixed
-  (`pinLanguage` in `solver/index.js`), and it is exactly the sort of thing a
-  "nothing on the client side fixes this" conclusion stops anyone from looking
-  for. A negative result from one address on one afternoon is a data point, not
-  a property of the protocol.
+  | | result |
+  |---|---|
+  | `send -solve`, clearance replayed by this client | **200**, 113/113 requests |
+  | `send -solve`, some hours and many failed challenges later | 403, managed challenge |
+  | `replay.js` immediately after: clearance carried into a fresh context | 403, challenged |
+  | ...clearance presented *alone*, no `cf_chl_*` | 403, challenged |
+  | ...challenge solved in a fresh context and continued **in that same context** | 403, challenged |
 
-  `solver/replay.js` is there to tell you which case you are in before you spend
-  a day assuming otherwise — in both directions.
+  The last row is the one that settles it. A real Chromium solved the challenge
+  itself and was challenged again on its very next navigation, in the context
+  that had just passed. Not a carried cookie, not this client, not a
+  fingerprint — a browser could not hold a session there either. When
+  `replay.js` reports `"verdict": "zone_challenges"`, nothing in this repo is
+  going to change the outcome and the answer is a different exit.
 
-  Worth separating from the fingerprint question, because they get conflated: the
-  aim is not to replay a clearance — it is to not be challenged, which is a
+  Both of the confident readings this entry has carried were wrong, in opposite
+  directions, and for the same reason — one run generalised into a rule:
+
+  - "a clearance does not travel, `-solve` has nothing to offer" was written
+    from the 403. The 200 above refutes it.
+  - "a clearance travels" was then written from the 200. The in-context 403
+    refutes that too.
+
+  What is true is narrower and less satisfying: it travels from some addresses,
+  at some times, and each failed challenge from an address makes the next one
+  harder — so the act of measuring this repeatedly is itself what stops it
+  working. If a target that passed this morning stops passing, suspect the
+  address's recent history before the code, and leave it alone rather than
+  solving against it in a loop.
+
+  Worth separating from the fingerprint question, because they get conflated:
+  the aim is not to replay a clearance — it is to not be challenged, which is a
   question about the exit address at least as much as about the client. A
-  datacenter range is scored badly whatever it presents, and repeated failed
-  challenges from one address make the next one harder, so measuring this costs
-  the address something each time. If a solve that used to pass stops passing,
-  suspect the address's recent history before the code.
+  datacenter range is scored badly whatever it presents.
 
 ## Performance claims
 

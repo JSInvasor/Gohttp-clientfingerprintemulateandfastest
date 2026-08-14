@@ -594,8 +594,10 @@ func TestLanguageTags(t *testing.T) {
 }
 
 // What the solve captures and what the client may replay are not the same set.
-// Measured on a live UAM zone: seeding the clearance alone replayed as 200,
-// seeding it beside the browser's __cf_bm replayed as a managed challenge.
+// The rule is about what each cookie is for — a token minted for one browser
+// session is not a credential another client can present — and not about any
+// measured effect on a challenge; see splitSolvedCookies for why that
+// distinction is drawn so firmly.
 func TestSplitSolvedCookies(t *testing.T) {
 	jar := func(names ...string) []solvedCookie {
 		out := make([]solvedCookie, 0, len(names))

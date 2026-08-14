@@ -183,12 +183,20 @@ func redactProxy(raw string) string {
 //     with a token whose contents describe a session this connection is not, and
 //     invites exactly the interstitial the clearance was earned to avoid.
 //
-// Measured, on a live UAM zone: a solve that seeded cf_clearance alone replayed
-// as 200 across 113 requests; a solve of the same target that also seeded the
-// second cookie the browser had by then collected replayed as a managed
-// challenge. That is one pair of runs and not a controlled experiment, which is
-// why -solve-all-cookies exists — but the default is the one that was observed
-// to work, and the held-back names are printed rather than dropped in silence.
+// This is reasoning about what the cookies are for, and not a measurement — a
+// distinction worth stating here because it was briefly claimed as one. Two runs
+// against a live zone differed in both their cookie set and their outcome: one
+// cookie and a 200, two cookies and a challenge. That looked like evidence.
+// replay.js then asked the question directly and answered no: on that address,
+// at that hour, cf_clearance presented *alone* from a real Chromium was
+// challenged too — as was a clearance the same browser had just earned, in the
+// very context it earned it in. The address had changed state between the two
+// runs, so the cookie set was never the variable. See Known gaps.
+//
+// The filtering stands on its own terms — a token minted for another session is
+// not a credential, and withholding one costs nothing — but it should not be
+// expected to rescue a run. -solve-all-cookies flips it back, and the held-back
+// names are printed rather than dropped in silence.
 //
 // A browser that is *not* handed a __cf_bm simply gets a fresh one on its first
 // response, which is what any newly-opened browser does. There is nothing to

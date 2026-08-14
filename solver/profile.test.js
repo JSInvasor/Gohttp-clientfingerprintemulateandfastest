@@ -10,6 +10,7 @@ import {
   primaryLanguage,
 } from "./profile.js";
 import { CHALLENGE_TITLE_RE, detectChallengeInPage, isChallengeTitle } from "./challenge.js";
+import { explain, verdict } from "./verdict.js";
 
 test("languageList drops quality values and keeps the order", () => {
   assert.deepEqual(languageList("en-US,en;q=0.9"), ["en-US", "en"]);
@@ -229,4 +230,31 @@ test("the pinned language survives the trip through the preference list", () => 
   // The default is the one that matters, since almost every run uses it: a
   // Chrome asking for en-US,en;q=0.9 reports ["en-US", "en"].
   assert.equal(preferenceList("en-US,en;q=0.9"), "en-US,en");
+});
+
+// The verdict is the answer replay.js exists to produce, and getting it
+// backwards would send someone to rewrite a fingerprint that was never the
+// problem. The zone_challenges row is a real run, recorded verbatim: the
+// carried cookie challenged, the clearance alone challenged, and a clearance
+// the browser earned itself — in the context it earned it in — challenged too.
+test("the replay verdict names the case the three attempts describe", () => {
+  const challenged = { challenged: true };
+  const passed = { challenged: false };
+
+  assert.equal(verdict(passed, null, null), "travels");
+  assert.equal(verdict(challenged, challenged, challenged), "zone_challenges");
+  assert.equal(verdict(challenged, challenged, null), "zone_challenges");
+  assert.equal(verdict(challenged, passed, null), "does_not_travel");
+  // The bookkeeping being replayed alongside it is the one case that is fixable
+  // in this repo, so it is checked before the two that are not.
+  assert.equal(verdict(challenged, challenged, passed), "challenge_state");
+  assert.equal(verdict(challenged, null, null), "inconclusive");
+
+  // Every verdict says something, and the one that means "stop working on the
+  // client" says so in those terms.
+  for (const v of ["travels", "zone_challenges", "does_not_travel", "challenge_state", "inconclusive"]) {
+    assert.ok(explain(v).length > 40, `${v} explains nothing`);
+  }
+  assert.match(explain("zone_challenges"), /different exit|-proxy/);
+  assert.match(explain("challenge_state"), /solve-all-cookies/);
 });
