@@ -80,6 +80,7 @@ import {
 } from "./cleanup.js";
 import { cookiesForUrl } from "./cookies.js";
 import { simulateHumanBehavior } from "./behavior.js";
+import { rand, sleep } from "./timing.js";
 import { acceptLanguageOf, preparePage } from "./identity.js";
 import { detectChallengeInPage, isChallengeTitle } from "./challenge.js";
 import { withDeadline } from "./deadline.js";
@@ -231,12 +232,6 @@ function finish(result, code = 0) {
   }, 2000).unref();
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-function rand(a, b) {
-  return Math.floor(Math.random() * (b - a + 1)) + a;
-}
 
 // Launch a fresh real-browser session with stealth shims layered on top of
 // puppeteer-real-browser's existing rebrowser-puppeteer-core patches.

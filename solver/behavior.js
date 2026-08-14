@@ -8,6 +8,8 @@
 // to avoid. A "the zone challenges everything" verdict taken that way could just
 // be a cookie read too early.
 
+import { rand, sleep } from "./timing.js";
+
 // Real-user behavior between challenge solve and cookie capture. CF samples
 // mouse/scroll/dwell events for the first few seconds after issuance and
 // uses them to score the cookie. A cookie captured cold dies under load

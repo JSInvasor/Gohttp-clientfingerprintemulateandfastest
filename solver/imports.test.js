@@ -72,10 +72,57 @@ function declaredIn(text) {
   for (const m of text.matchAll(/import\s+([A-Za-z_$][\w$]*)\s+from/g)) {
     names.add(m[1]);
   }
+  // Parameters. A callback passed in is called by name and declared nowhere
+  // else — onFatal, onLate, newSession, the reject of a Promise executor.
+  const params = [
+    ...text.matchAll(/function\s*[A-Za-z_$][\w$]*\s*\(([^)]*)\)/g),
+    ...text.matchAll(/\(([^)]*)\)\s*=>/g),
+    ...text.matchAll(/(?:^|[^\w$])([A-Za-z_$][\w$]*)\s*=>/g),
+  ];
+  for (const m of params) {
+    for (const part of (m[1] || "").split(",")) {
+      const name = part.replace(/[{}[\]]/g, "").split(/[:=]/)[0].trim();
+      if (/^[A-Za-z_$][\w$]*$/.test(name)) names.add(name);
+    }
+  }
   return names;
 }
 
-test("every module imports the names it calls", () => {
+// Everything a call can legitimately resolve to that this package did not
+// declare: language builtins, the Node globals these files use, and the browser
+// ones, because several of these functions are serialised and run inside the
+// page.
+const AMBIENT = new Set([
+  "Array", "Boolean", "Date", "Error", "JSON", "Map", "Math", "Number", "Object",
+  "Promise", "RegExp", "Set", "String", "Symbol", "TypeError", "URL", "WeakMap",
+  "BigInt", "Infinity", "NaN", "isNaN", "parseInt", "parseFloat", "encodeURIComponent",
+  "decodeURIComponent", "structuredClone", "queueMicrotask", "fetch", "WebSocket",
+  "setTimeout", "clearTimeout", "setInterval", "clearInterval", "require",
+  "process", "console", "globalThis", "Buffer", "__dirname", "import",
+  // In-page: these run inside evaluate()/evaluateOnNewDocument().
+  "document", "window", "navigator", "location", "getComputedStyle",
+  // Control flow and operators the call regex cannot tell from a call.
+  "if", "for", "while", "switch", "catch", "return", "typeof", "function",
+  "await", "new", "do", "else", "try", "throw", "yield", "of", "in", "delete", "void",
+  "async", "Int32Array", "SharedArrayBuffer", "Atomics", "Event", "CustomEvent",
+  "Uint8Array", "ArrayBuffer", "Proxy", "Reflect", "Intl", "AbortController",
+]);
+
+// The check this file exists for, in the form that would have caught both bugs
+// it was written after.
+//
+// The first version only looked at names some sibling module exports. That
+// caught replay.js calling verdict() without importing it, and missed the very
+// next one of the same shape: simulateHumanBehavior moved to behavior.js and
+// took calls to sleep() and rand() with it — helpers that live in index.js and
+// are exported by nobody, so there was no owner to look up. It failed at the
+// first solve, after the browser had already launched, as
+// `solver: sleep is not defined`.
+//
+// So the rule is now the general one: a call has to resolve to something the
+// file declares, something it imports, or a language or host global. Anything
+// else is a name that does not exist at runtime.
+test("every module resolves the names it calls", () => {
   const owner = exportedNames();
   const problems = [];
 
@@ -86,15 +133,20 @@ test("every module imports the names it calls", () => {
     const code = text
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .replace(/^\s*\/\/.*$/gm, "")
-      .replace(/([^:])\/\/.*$/gm, "$1");
-    const have = declaredIn(text);
+      .replace(/([^:])\/\/.*$/gm, "$1")
+      // String and template literals hold things that look like calls and are
+      // not — a CSS selector `a:not([src])`, a message mentioning a function.
+      .replace(/`(?:\\.|[^`\\])*`/g, '""')
+      .replace(/'(?:\\.|[^'\\\n])*'/g, '""')
+      .replace(/"(?:\\.|[^"\\\n])*"/g, '""');
+    const have = declaredIn(code);
 
-    for (const m of code.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)) {
-      const name = m[1];
-      if (!owner.has(name)) continue; // not one of ours
-      if (owner.get(name) === file) continue; // its own
-      if (have.has(name)) continue; // imported, or shadowed by a local
-      problems.push(`${file} calls ${name}() — exported by ${owner.get(name)} — without importing it`);
+    for (const m of code.matchAll(/(^|[^.\w$])([A-Za-z_$][\w$]*)\s*\(/gm)) {
+      const name = m[2];
+      if (AMBIENT.has(name)) continue;
+      if (have.has(name)) continue; // declared here, or imported
+      const from = owner.has(name) ? ` — exported by ${owner.get(name)}` : "";
+      problems.push(`${file} calls ${name}()${from}, but neither declares nor imports it`);
     }
   }
 
