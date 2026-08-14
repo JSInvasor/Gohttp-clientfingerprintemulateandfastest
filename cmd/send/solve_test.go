@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -520,6 +521,71 @@ func TestRejectedClearanceIsQuietWhenNothingWasRejected(t *testing.T) {
 				t.Errorf("said something about a clearance nothing rejected:\n%s", stderr)
 			}
 		})
+	}
+}
+
+// The header the server reads and the page object the challenge's own script
+// reads have to name the same languages. This repo has shipped both halves of
+// that wrong — a shim asserting a list the browser was not asking for, and then
+// its removal leaving the browser reporting one tag while the header advertised
+// two — and neither time did anything say so.
+func TestLanguageSplitIsReported(t *testing.T) {
+	t.Run("silent when they agree", func(t *testing.T) {
+		for _, tc := range []struct {
+			header string
+			page   []string
+		}{
+			{"en-US,en;q=0.9", []string{"en-US", "en"}},
+			{"tr-TR,tr;q=0.9", []string{"tr-TR", "tr"}},
+			{"en", []string{"en"}},
+			// Nothing to compare against is not a disagreement.
+			{"en-US,en;q=0.9", nil},
+			{"", []string{"en-US", "en"}},
+		} {
+			stderr := captureStderr(t, func() { reportLanguageSplit(tc.header, tc.page) })
+			if stderr != "" {
+				t.Errorf("%q vs %v was reported as a split:\n%s", tc.header, tc.page, stderr)
+			}
+		}
+	})
+
+	t.Run("names both sides when they do not", func(t *testing.T) {
+		// The exact shape of the regression: the header offers "en", the page
+		// object does not list it.
+		stderr := captureStderr(t, func() {
+			reportLanguageSplit("en-US,en;q=0.9", []string{"en-US"})
+		})
+		for _, want := range []string{"en-US,en;q=0.9", "[en-US en]", "[en-US]", "setUserAgentOverride"} {
+			if !strings.Contains(stderr, want) {
+				t.Errorf("the note does not mention %q:\n%s", want, stderr)
+			}
+		}
+	})
+
+	t.Run("order is part of the comparison", func(t *testing.T) {
+		stderr := captureStderr(t, func() {
+			reportLanguageSplit("en-US,en;q=0.9", []string{"en", "en-US"})
+		})
+		if stderr == "" {
+			t.Error("the same tags in a different order were accepted as agreement")
+		}
+	})
+}
+
+func TestLanguageTags(t *testing.T) {
+	for _, tc := range []struct {
+		header string
+		want   []string
+	}{
+		{"en-US,en;q=0.9", []string{"en-US", "en"}},
+		{"tr-TR,tr;q=0.9,en;q=0.8", []string{"tr-TR", "tr", "en"}},
+		{" en-US , en ; q=0.9 ", []string{"en-US", "en"}},
+		{"en", []string{"en"}},
+		{"", nil},
+	} {
+		if got := languageTags(tc.header); !slices.Equal(got, tc.want) {
+			t.Errorf("languageTags(%q) = %v, want %v", tc.header, got, tc.want)
+		}
 	}
 }
 

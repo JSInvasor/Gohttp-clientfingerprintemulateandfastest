@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,16 +61,21 @@ type solveResult struct {
 	// AcceptLanguage is what the browser actually put on the wire, which is not
 	// always what it was asked for: Chromium regenerates the header from the
 	// first tag of --accept-lang and drops the rest.
-	AcceptLanguage string         `json:"accept_language"`
-	Cookies        string         `json:"cookies"`
-	CookieList     []solvedCookie `json:"cookie_list"`
-	DurationMS     int64          `json:"duration_ms"`
-	Attempts       int            `json:"attempts"`
-	Exit           string         `json:"exit"` // batch only: the id this line answers for
-	Chromium       string         `json:"chromium_version"`
-	ChromiumMajor  int            `json:"chromium_major"`
-	Proxy          string         `json:"proxy"`
-	LaunchMS       int64          `json:"launch_ms"`
+	AcceptLanguage string `json:"accept_language"`
+	// PageLanguages is navigator.languages as the solved page reported it. It
+	// exists to be compared against AcceptLanguage: the header is what the
+	// server sees, this is what the challenge's JavaScript sees, and a solve
+	// where they disagree is a browser no ordinary Chrome install produces.
+	PageLanguages []string       `json:"page_languages"`
+	Cookies       string         `json:"cookies"`
+	CookieList    []solvedCookie `json:"cookie_list"`
+	DurationMS    int64          `json:"duration_ms"`
+	Attempts      int            `json:"attempts"`
+	Exit          string         `json:"exit"` // batch only: the id this line answers for
+	Chromium      string         `json:"chromium_version"`
+	ChromiumMajor int            `json:"chromium_major"`
+	Proxy         string         `json:"proxy"`
+	LaunchMS      int64          `json:"launch_ms"`
 }
 
 type solvedCookie struct {
@@ -95,8 +101,13 @@ type solveSeed struct {
 	// "tr-TR,tr;q=0.9". Replaying the asked-for value would advertise a language
 	// the session that earned the cookie never did.
 	acceptLanguage string
-	cookies        []string
-	chromiumMajor  int
+	// pageLanguages is navigator.languages as the solved page reported it, kept
+	// beside the header so reportLanguageSplit can compare the two. Not replayed
+	// — nothing on this side can set a page object — but a disagreement is worth
+	// naming, since it is the shape of two separate bugs this repo has shipped.
+	pageLanguages []string
+	cookies       []string
+	chromiumMajor int
 	// expiresAt is when the cf_clearance stops being worth anything, zero when
 	// the solve produced none. A fleet solve can outlast it — see
 	// warnOnExpiredSeeds.
@@ -383,6 +394,7 @@ func seedFromResult(o *options, target string, e exit, res *solveResult) *solveS
 		proxy:          proxy,
 		userAgent:      res.UserAgent,
 		acceptLanguage: res.AcceptLanguage,
+		pageLanguages:  res.PageLanguages,
 		chromiumMajor:  res.ChromiumMajor,
 	}
 	if gotClearance && cf.Expires > 0 {
@@ -407,6 +419,52 @@ func reportSolveDrift(seed *solveSeed, o *options) {
 	reportUADrift(seed.userAgent)
 	reportChromiumDrift(seed.chromiumMajor)
 	reportLanguageDrift(seed.acceptLanguage, acceptLanguage(o))
+	reportLanguageSplit(seed.acceptLanguage, seed.pageLanguages)
+}
+
+// reportLanguageSplit says so when the browser's Accept-Language header and its
+// own navigator.languages name different languages.
+//
+// This has been wrong in this repo twice, in both directions, and neither time
+// did anything notice — which is the whole reason it is checked here rather than
+// reasoned about. A page-level shim once asserted ["en-US","en"] on a box whose
+// browser was asking for something else; removing the shim then left the browser
+// reporting ["en-US"] while its header advertised en-US,en;q=0.9. Both are a
+// client that says one thing to the server and another to the script the server
+// sent, on the request that earns cf_clearance.
+//
+// Compared as tag sets in order, quality values dropped, because that is the
+// only part the two forms share: "en-US,en;q=0.9" and ["en-US","en"] agree.
+//
+// A note rather than an error. The solve may well still have worked, and a run
+// that refuses to continue over a fingerprint nuance is worse than one that says
+// what it noticed.
+func reportLanguageSplit(header string, pageLanguages []string) {
+	if header == "" || len(pageLanguages) == 0 {
+		return
+	}
+	sent := languageTags(header)
+	if slices.Equal(sent, pageLanguages) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "note: the solve's Accept-Language and navigator.languages disagree —\n"+
+		"  header %q -> %v\n  navigator.languages %v\n"+
+		"  A real Chrome reports the same list in both. Check that solver/index.js is pinning the\n"+
+		"  language through Emulation.setUserAgentOverride and not the launch flag alone.\n",
+		header, sent, pageLanguages)
+}
+
+// languageTags reduces an Accept-Language header to its tags, in order, with
+// quality values dropped — the form navigator.languages reports.
+func languageTags(header string) []string {
+	var out []string
+	for _, part := range strings.Split(header, ",") {
+		tag := strings.TrimSpace(strings.Split(part, ";")[0])
+		if tag != "" {
+			out = append(out, tag)
+		}
+	}
+	return out
 }
 
 // reportLanguageDrift says so when the browser did not send the language it was

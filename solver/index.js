@@ -17,8 +17,10 @@
 //   SOLVER_LANG    the Accept-Language to solve with, e.g. "en-US,en;q=0.9".
 //                  `send` passes whatever the run will replay with. Left unset
 //                  the browser used the box's locale, which on a localised image
-//                  is a language the replay never asks for — and which the
-//                  navigator.languages shim below then contradicted.
+//                  is a language the replay never asks for. It reaches the
+//                  header through --accept-lang and navigator.languages through
+//                  preparePage's pinLanguage; both are needed, and only the
+//                  second one is detectable from inside the page.
 //   SOLVER_UA, SOLVER_SEC_CH_UA, SOLVER_PLATFORM
 //                  re-pin the identity when solving from a box whose OS or
 //                  Chrome major differs; see profile.js.
@@ -29,6 +31,8 @@
 //     "url": "<final url>",
 //     "user_agent": "<navigator.userAgent>",
 //     "accept_language": "<what the browser actually sent, not what was asked>",
+//     "page_languages": ["en-US", "en"],       // navigator.languages, to check
+//                                              // against accept_language
 //     "cookies": "name=val; name=val; ...",   // header-ready
 //     "cookie_list": [{name, value, domain, expires}, ...],
 //     "duration_ms": <int>,
@@ -552,7 +556,22 @@ async function simulateHumanBehavior(page) {
 // in the jar is context.
 async function harvest(jar, page) {
   const cookies = await cookiesForUrl(jar, page, url);
-  const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => TARGET_UA);
+
+  // The UA and the languages come back in one round trip, from the page rather
+  // than from what was asked for.
+  //
+  // navigator.languages is here because it is the half of the language that the
+  // wire cannot show. The header is observed by watchAcceptLanguage; this is the
+  // page object beside it, and a solve where the two disagree is the bug this
+  // pair was added to make impossible to ship again — a browser advertising
+  // "en" it does not list is not a browser any ordinary Chrome install
+  // produces. send compares them and says so.
+  const identity = await page
+    .evaluate(() => ({ userAgent: navigator.userAgent, languages: navigator.languages }))
+    .catch(() => null);
+  const userAgent = (identity && identity.userAgent) || TARGET_UA;
+  const pageLanguages = (identity && identity.languages) || [];
+
   const finalUrl = (() => {
     try {
       return page.url();
@@ -566,6 +585,7 @@ async function harvest(jar, page) {
     url: finalUrl,
     user_agent: userAgent,
     accept_language: acceptLanguageOf(page),
+    page_languages: pageLanguages,
     cookies: cookies.map((c) => `${c.name}=${c.value}`).join("; "),
     cookie_list: cookies.map((c) => ({
       name: c.name,
@@ -824,6 +844,7 @@ async function solveExit(newSession, budgetMs, proxyLabel) {
         url: r.url,
         user_agent: r.user_agent,
         accept_language: r.accept_language || TARGET_LANG,
+        page_languages: r.page_languages || [],
         cookies: r.cookies,
         cookie_list: r.cookie_list,
         duration_ms: Date.now() - startTs,
@@ -858,6 +879,7 @@ async function solveExit(newSession, budgetMs, proxyLabel) {
       url: lastResult.url || url,
       user_agent: lastResult.user_agent || TARGET_UA,
       accept_language: lastResult.accept_language || TARGET_LANG,
+      page_languages: lastResult.page_languages || [],
       cookies: lastResult.cookies || "",
       cookie_list: lastResult.cookie_list || [],
       ...base,
