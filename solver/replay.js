@@ -36,6 +36,7 @@ import os from "node:os";
 import { connect } from "puppeteer-real-browser";
 import { connectOptions } from "./profile.js";
 import { preparePage } from "./identity.js";
+import { simulateHumanBehavior } from "./behavior.js";
 import { explain, verdict } from "./verdict.js";
 import {
   cleanup,
@@ -276,6 +277,13 @@ async function main() {
       const solvedHere = (await context.cookies().catch(() => [])).some(
         (c) => c.name === "cf_clearance"
       );
+
+      // The same few seconds the solver spends before it reads a cookie, for
+      // the same reason — see behavior.js. Re-navigating the instant the
+      // interstitial clears tests a clearance captured cold, which index.js
+      // documents as the one that "dies under load". A zone_challenges verdict
+      // taken that way would be measuring this file's impatience.
+      if (solvedHere) await simulateHumanBehavior(page).catch(() => {});
 
       const second = await page
         .goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 })
