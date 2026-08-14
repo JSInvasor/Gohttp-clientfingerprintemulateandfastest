@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
 )
@@ -174,4 +179,59 @@ func lastUserAgent(opts []gofire.Option) string {
 		return ua
 	}
 	return ""
+}
+
+// The jar is not the wire.
+//
+// Every test above checks that a solved cookie reached the session's cookie jar,
+// which is a different claim from the one that matters: that it goes out on the
+// request. A cf_clearance that sits in a jar and is never sent produces exactly
+// what a rejected one produces — a fresh challenge — and nothing distinguishes
+// them from the outside.
+func TestSeededCookiesReachTheWire(t *testing.T) {
+	var got struct {
+		cookie string
+		ua     string
+		hits   int
+	}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.cookie = r.Header.Get("Cookie")
+		got.ua = r.Header.Get("User-Agent")
+		got.hits++
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	// Exactly the shape -solve leaves behind on the single-exit path: the
+	// cookies and the UA folded into the options the pool is built from.
+	o := &options{
+		mode: modeClient, sessions: 1, concurrency: 1, count: 1,
+		insecure: true, timeout: 10 * time.Second, maxBody: -1,
+		cookies:   cookieList{"cf_clearance=solved-value", "__cf_bm=bm-value"},
+		userAgent: "Mozilla/5.0 (X11; Linux x86_64) Chrome/151.0.0.0",
+	}
+	pool, err := newSessionPool(o, gofire.Chrome151, srv.URL)
+	if err != nil {
+		t.Fatalf("newSessionPool: %v", err)
+	}
+	defer pool.Close()
+
+	resp, err := pool.sessions[0].client.DoWithContext(
+		context.Background(), http.MethodGet, srv.URL, nil, nil)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Close()
+
+	if got.hits != 1 {
+		t.Fatalf("server saw %d requests", got.hits)
+	}
+	for _, want := range []string{"cf_clearance=solved-value", "__cf_bm=bm-value"} {
+		if !strings.Contains(got.cookie, want) {
+			t.Errorf("Cookie header %q does not carry %s", got.cookie, want)
+		}
+	}
+	if got.ua != o.userAgent {
+		t.Errorf("User-Agent = %q, want the solved one %q", got.ua, o.userAgent)
+	}
 }
