@@ -85,6 +85,18 @@ var SafariReference = TLSReference{
 // extension permutation and the next connection produces a different one.
 // Pinning it would fail every correct run. JA4R and PeetPrint are safe to pin
 // because both sort the extension list before rendering.
+//
+// Confirmed against a second device on 2026-08-14: Chrome 151.0.7922.108 on
+// Linux x86_64, captured through tls.peet.ws, reproduced JA4, JA4R and
+// PeetPrintHash byte for byte — and the Akamai HTTP/2 fingerprint in
+// fingerprint.go with it.
+//
+// Which is worth recording for what it says about the Device line above. These
+// values were taken from Windows, and a different OS reproducing them exactly is
+// the measurement behind the claim in solver/profile.js that the OS token is the
+// only thing a platform choice moves: BoringSSL sends the same ClientHello
+// either way, so pinning a Linux UA against a Windows-captured JA4 is sound
+// rather than merely convenient.
 var ChromeReference = TLSReference{
 	Device:         "Chrome 151, Windows 10 x64",
 	JA4:            "t13d1516h2_8daaf6152771_806a8c22fdea",

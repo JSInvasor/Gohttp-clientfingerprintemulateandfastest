@@ -824,6 +824,27 @@ browser-shaped rather than "close the socket and return an error":
   `TLSHandshakeTimeout` on the code path a custom TLS dialer replaces. A
   deadline on the request context still wins when it is sooner.
 
+## What has actually been checked
+
+The reference values in this repo are measurements, and two of them have now
+been confirmed on hardware other than the one they were taken on:
+
+- **The pinned Chrome fingerprints reproduce on a second device.** JA4, JA4_r,
+  peetprint and the Akamai HTTP/2 fingerprint were captured from Chrome
+  151.0.7922.108 on Linux x86_64 through `tls.peet.ws` and matched
+  `internal/ctls/reference.go` byte for byte — despite those values having been
+  taken from Chrome 151 on Windows. The OS token is the only thing a platform
+  choice moves.
+- **`fpcheck` passes for both profiles** against a live `tls.peet.ws` from a
+  networked host, which is the check that the Go client emits what the reference
+  says it should. It cannot run from a sandboxed environment, so it is worth
+  re-running on your own box before relying on any of this.
+
+What that does *not* cover, and what nothing here should be taken to claim: no
+part of this has been measured against a live Cloudflare challenge end to end.
+`-solve` earning a `cf_clearance` and a load run replaying it successfully is
+a separate test, and it is the one left.
+
 ## Known gaps
 
 The TLS, HTTP/2 and header layers match the reference devices. These do not, and
