@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from "node:fs";
+import path from "node:path";
 
 import {
   LAUNCH_ARGS,
@@ -33,30 +35,41 @@ test("primaryLanguage is what --lang takes", () => {
   assert.equal(primaryLanguage(""), "");
 });
 
-// The header and the UI locale both have to come from one value, in the form
-// each flag actually takes.
+// The launch list must stay exactly what the working solver launches with.
 //
-// This used to assert --accept-lang=${TARGET_LANG} — the finished header, passed
-// straight through — and that is the bug it was pinning in place. The flag takes
-// a preference list, and Chrome 151 handed a header instead emitted
-// "en-US,en;q=0.9,en;q=0.9;q=0.8" on the request that earns cf_clearance.
-test("the launch flags carry the pinned language in the form each takes", () => {
-  assert.ok(
-    LAUNCH_ARGS.includes(`--accept-lang=${preferenceList(TARGET_LANG)}`),
-    `--accept-lang missing from ${LAUNCH_ARGS.join(" ")}`
+// Two language flags lived here and are gone. They were a no-op on the default
+// configuration — measured on Chromium 141, navigator.languages reports
+// ["en-US"] whether --accept-lang says en-US, en-US,en, or is absent — and the
+// version of this solver that passes a live Under Attack zone does not set them.
+// After three wrong theories about which difference was harmless, "changes
+// nothing measurable and the working version does not have it" is enough to
+// remove something.
+//
+// Pinned against workingBrowsers/profile.js, which is that version, so this
+// fails if either side drifts rather than only when someone remembers to look.
+test("the launch flags match the solver that passes a live zone", () => {
+  const reference = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "workingBrowsers", "profile.js"),
+    "utf8"
   );
-  assert.ok(
-    LAUNCH_ARGS.includes(`--lang=${primaryLanguage(TARGET_LANG)}`),
-    `--lang missing from ${LAUNCH_ARGS.join(" ")}`
-  );
+  const theirs = [...reference.matchAll(/^\s*"(--[^"]+)",?\s*$/gm)].map((m) => m[1]);
 
-  // The property that matters more than either exact value: no quality value
-  // ever reaches --accept-lang, whatever TARGET_LANG is set to.
-  const acceptLang = LAUNCH_ARGS.find((a) => a.startsWith("--accept-lang="));
-  assert.ok(
-    !acceptLang.includes(";"),
-    `${acceptLang} passes a quality value to a flag that takes a preference list`
-  );
+  assert.ok(theirs.length > 0, "no launch flags found in workingBrowsers/profile.js");
+  assert.deepEqual(LAUNCH_ARGS, theirs);
+
+  // Named explicitly, because the whole point is that these two are absent.
+  for (const flag of ["--accept-lang", "--lang"]) {
+    assert.ok(
+      !LAUNCH_ARGS.some((a) => a.startsWith(flag + "=")),
+      `${flag} is back in the launch list; the version that passes does not set it`
+    );
+  }
+});
+
+// The language still has to reach the page, now that no flag carries it. It goes
+// through the shim in identity.js, and this is the value it hands over.
+test("the pinned language reaches the page as the list navigator.languages takes", () => {
+  assert.deepEqual(languageList(TARGET_LANG), ["en-US", "en"]);
 });
 
 test("parseProxyURL keeps a scheme Chrome would otherwise assume away", () => {

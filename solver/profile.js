@@ -173,22 +173,27 @@ export const LAUNCH_ARGS = [
   // to an explicit software renderer and only invites the two to disagree.
   "--use-gl=angle",
   "--use-angle=swiftshader",
-  // The language, from one value, in the form each flag actually takes.
+  // No --accept-lang and no --lang, which is the one thing about this list worth
+  // explaining, because both were here and both were removed again.
   //
-  // --accept-lang is the preference list, not the header: see preferenceList
-  // for what handing it a finished header does. --lang is the UI locale, and it
-  // takes one tag; Intl and the date formats follow it, so it is set too rather
-  // than leaving the UI disagreeing with the language being asked for.
+  // They were added to stop the solve advertising the box's locale while gofire
+  // replayed with its own default — a real problem on a localised image, and
+  // nothing at all on an en-US one. Measured on Chromium 141 they move the
+  // header and nothing else: a fresh profile reports navigator.languages
+  // ["en-US"] whether the flag says en-US, en-US,en, or is absent.
   //
-  // These pin the header, and only the header. Measured on Chromium 141, a
-  // fresh profile reports navigator.languages ["en-US"] whatever these say —
-  // en-US, en-US,en and no flag at all are indistinguishable in the page. The
-  // page object is set where it does move, in preparePage's
-  // Emulation.setUserAgentOverride, which is also where it can be set without
-  // leaving an own property on navigator. These stay because the flags apply
-  // from process start, which is earlier than any override can reach.
-  `--accept-lang=${preferenceList(TARGET_LANG)}`,
-  `--lang=${primaryLanguage(TARGET_LANG) || "en-US"}`,
+  // So on the default they are a no-op, which is exactly what makes them worth
+  // removing rather than keeping. The version of this solver that passes a live
+  // Under Attack zone from a datacenter address does not set them, this one did,
+  // and after three wrong theories about which of the differences was harmless
+  // the remaining ones are not being defended on argument. A launch flag that
+  // demonstrably changes nothing on the configuration people actually run is the
+  // cheapest of them to give up.
+  //
+  // SOLVER_LANG still reaches the page through preparePage's shim, and reaches
+  // gofire through the seed, so the two halves of the handover still agree.
+  // Someone solving from a tr_TR box should set the locale, or set SOLVER_LANG
+  // and put these back knowing what they cost.
 ];
 
 export const CONNECT_OPTIONS = {

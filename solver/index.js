@@ -285,15 +285,35 @@ async function waitForClearance(jar, page, deadline) {
     const cf = cookies.find((c) => c.name === "cf_clearance");
     if (cf) return { cleared: true, cookie: cf };
 
-    // Structure first, wording second. The markers are language-independent, so
-    // a localised or reworded interstitial keeps its budget instead of being
-    // read as "this site never challenged us" — see challenge.js. A probe that
-    // cannot run (an execution context torn down mid-navigation) answers null
-    // and leaves the decision to the title exactly as before.
-    const challenged = await page.evaluate(detectChallengeInPage).catch(() => null);
-    if (challenged !== true) {
-      const title = await page.title().catch(() => "");
-      if (title && !isChallengeTitle(title)) {
+    // Wording first, structure only as the tie-breaker — which is the opposite
+    // of how this was written, and the order is the point.
+    //
+    // The structural probe exists because Cloudflare localises the interstitial:
+    // it follows Accept-Language, so a solve routed through a non-English exit
+    // sees "Bir dakika…" or "Un momento…", the title regex misses, and the
+    // solver concludes it was never challenged and gives up in under a second
+    // with two minutes of budget left. That is a real bug and the probe is the
+    // right fix for it.
+    //
+    // What was wrong was running the probe on every pass. It is a page.evaluate
+    // into the document, twice a second, for the whole time the challenge is
+    // running — and the version of this solver that actually passes a live zone
+    // does exactly one page.title() per pass and nothing else. Whether the edge
+    // can see the difference is not something this file can answer from a
+    // sandbox, and every "it cannot possibly matter" on this branch has been
+    // wrong so far.
+    //
+    // So the common case is now byte-for-byte the working version's: the title
+    // says "Just a moment…", it matches, and nothing else runs. The probe is
+    // reached only when the title says the challenge is over — the one moment
+    // its answer changes anything, and a moment that happens at most once per
+    // attempt.
+    const title = await page.title().catch(() => "");
+    if (title && !isChallengeTitle(title)) {
+      // A probe that cannot run (an execution context torn down mid-navigation)
+      // answers null, which leaves the decision to the title exactly as before.
+      const challenged = await page.evaluate(detectChallengeInPage).catch(() => null);
+      if (challenged !== true) {
         // Page is past the challenge gate even without an explicit clearance
         // cookie (some sites use Bot Fight Mode without UAM).
         return { cleared: false, challenged: false };
