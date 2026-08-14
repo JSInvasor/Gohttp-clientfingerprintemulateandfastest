@@ -433,6 +433,7 @@ and the ordinary `Client` methods, so what it reports is what a program using
 the library gets, not what a bespoke harness arranged to happen.
 
 ```bash
+go run ./cmd/send -scout https://site.com             # look first, then say what to run
 go run ./cmd/send https://site.com                    # one request, prints the response
 go run ./cmd/send -p chrome -i https://site.com       # Chrome profile, with headers
 go run ./cmd/send https://site.com 30s 100            # 30s, 100 threads
@@ -443,6 +444,52 @@ go run ./cmd/send -fingerprint -p chrome              # the profile's reference 
 ```
 
 Running `send` with no arguments prints the usage, examples included.
+
+### Asking the target what to run against it
+
+Every flag below is a question about the target — does it challenge, does it
+speak h2, does it set cookies, how far away is it — and the answers are all
+observable. `-scout` goes and looks, then prints the command, with the
+measurement behind each flag:
+
+```bash
+go run ./cmd/send -scout https://site.com
+```
+
+```
+    seen from     this machine — no proxy, so this is what your own address sees
+    answered      200 OK over HTTP/2.0
+    edge          Cloudflare — cf-ray, cf-cache-status, server: cloudflare
+    challenge     none from this address
+    redirects     none
+    cookies       __cf_bm
+    page          142.3 KiB, gzip, 23 assets across 2 host(s)
+    language      asking in ja-JP landed on https://site.com/?locale=ja
+    round trip    44.4ms (median of 4), 319.6ms cold with the handshake
+
+  suggested
+
+    > send https://site.com -t 30s -c 9 -s 2 -warmup 1
+
+    -mode client    the default: the target sets __cf_bm, and -mode fast has no
+                    jar to keep it in
+    -c 9            a thread carries ~23 req/s at 44.4ms, so 9 of them is about
+                    200 req/s — and -c is the rate dial here, not -rps
+    ...
+```
+
+It is a look rather than a run: a document fetch, a redirect walk, one request
+in another language and four to time the link, most of them concurrent, so it
+costs a handful of round trips whatever the target is.
+
+What it deliberately does **not** do is find the rate limit. That is the one
+answer you can only get by pushing someone's server until it pushes back, so
+`-c` comes from the measured round trip and a rate you choose — arithmetic
+rather than an experiment on a stranger. The reason line prints the working, so
+any other rate reads straight off it.
+
+It also reads `-proxy-file` and `-lang` when they are given, so it looks from an
+exit rather than from here and plans for the run you actually meant.
 
 A load run has four dials, and each has a positional form taken in this order
 after the URL:

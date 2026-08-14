@@ -32,6 +32,16 @@
 //	send -n 50000 -c 300 -mode pipeline https://site.com
 //	send -X POST -H 'Content-Type: application/json' -d '{"a":1}' https://site.com/api
 //
+// Which dials to use is itself a question about the target, and -scout answers
+// it by going and looking — who is in front, whether it challenges, what it
+// sets, how far away it is — and then printing the command with the measurement
+// behind every flag in it. It does not look for the rate ceiling: -c is the
+// measured round trip times a rate you pick, not something discovered by
+// pushing until the target pushes back.
+//
+//	send -scout https://site.com
+//	send -scout https://site.com -proxy-file proxies.txt
+//
 // A target behind a Cloudflare challenge needs the cookie before the run: -solve
 // earns one with the real browser in solver/ and seeds it into every session.
 //
@@ -184,6 +194,7 @@ type options struct {
 	silent      bool
 	asJSON      bool
 	fingerprint bool
+	scout       bool
 }
 
 func main() {
@@ -227,6 +238,19 @@ func run() error {
 	// challenge can be interrupted too.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// -scout answers the questions the other flags ask, and then goes no
+	// further: it is a handful of requests and a command to paste, not a run.
+	// Nothing below it happens, because a solve or a session pool built on
+	// settings the scout was about to argue with is the opposite of the point.
+	if o.scout {
+		report, err := scout(ctx, o, profile, target)
+		if err != nil {
+			return err
+		}
+		renderScout(os.Stdout, report, recommend(report, o))
+		return nil
+	}
 
 	// Solve before the sessions are built: the cookies and the UA it returns go
 	// in through the same options -cookie and -ua use, so every session is
@@ -352,6 +376,7 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.BoolVar(&o.silent, "silent", false, "")
 	fs.BoolVar(&o.asJSON, "json", false, "")
 	fs.BoolVar(&o.fingerprint, "fingerprint", false, "")
+	fs.BoolVar(&o.scout, "scout", false, "")
 
 	return fs
 }

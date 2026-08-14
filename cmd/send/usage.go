@@ -115,6 +115,11 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "%s%sA single request prints the response. Adding a duration — or -n — makes it\n"+
 		"%sa load run and prints a summary instead.%s\n", indent, p.dim, indent, p.reset)
 
+	fmt.Fprint(w, p.heading("start here"))
+	fmt.Fprint(w, p.example("send -scout https://site.com", "look first, then say what to run"))
+	fmt.Fprint(w, p.note("a few seconds of probing: who is in front, whether it challenges, how far"))
+	fmt.Fprint(w, p.note("away it is — and a command with a reason beside every flag in it"))
+
 	fmt.Fprint(w, p.heading("one request"))
 	fmt.Fprint(w, p.example("send https://site.com", "prints the response"))
 	fmt.Fprint(w, p.example("send -i -p chrome https://site.com", "Chrome profile, with headers"))
@@ -191,7 +196,10 @@ func printUsage(w io.Writer) {
                       browser does. Off by default: the PSK moves JA4 to
                       t13d1517h2, so connections after the first differ`))
 
-	fmt.Fprint(w, p.section("output", `-i              print response headers (single request only)
+	fmt.Fprint(w, p.section("output", `-scout          probe the target and print the command to run against it,
+                with the measurement behind every flag. Reads -proxy-file
+                and -lang if given, so it plans for the run you meant
+-i              print response headers (single request only)
 -o path         write the response body to a file
 -silent         suppress the response body
 -json           print the run summary as JSON`))
