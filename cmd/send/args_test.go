@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"strings"
 	"testing"
 	"time"
@@ -152,12 +153,45 @@ func TestUsageDocumentsTheDials(t *testing.T) {
 
 	for _, want := range []string{
 		"URL [duration] [threads] [clients] [rate]",
-		"examples",
-		"send https://site.com 30s 100 8 500",
+		"send https://site.com 1m 200 8 500", // all four dials in one example
 		"-solve",
+		"-mode fast",
+		"made by Arsene",
 	} {
 		if !strings.Contains(usage, want) {
 			t.Errorf("usage does not mention %q", want)
 		}
+	}
+}
+
+// Every flag the tool accepts needs a line in the help, or it may as well not
+// exist: this text is the only reference there is.
+func TestUsageDocumentsEveryFlag(t *testing.T) {
+	var sb strings.Builder
+	printUsage(&sb)
+	usage := sb.String()
+
+	// The two aliases are documented under the name they share with another
+	// flag, so they have no line of their own.
+	alias := map[string]bool{"profile": true, "rate": true}
+
+	newFlagSet(&options{}).VisitAll(func(f *flag.Flag) {
+		if alias[f.Name] {
+			return
+		}
+		if !strings.Contains(usage, "-"+f.Name) {
+			t.Errorf("-%s has no line in the usage text", f.Name)
+		}
+	})
+}
+
+// The help is colour only on a terminal. Redirected to a file, piped to a pager
+// or captured by a test, escape codes are noise — and this is the writer every
+// one of those looks like.
+func TestUsageIsPlainWhenNotATerminal(t *testing.T) {
+	var sb strings.Builder
+	printUsage(&sb)
+	if strings.Contains(sb.String(), "\033[") || strings.ContainsRune(sb.String(), 0x1b) {
+		t.Error("the usage carried ANSI escape codes into a non-terminal writer")
 	}
 }
