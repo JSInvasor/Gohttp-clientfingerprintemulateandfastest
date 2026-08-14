@@ -242,12 +242,18 @@ test("the replay verdict names the case the three attempts describe", () => {
   const passed = { challenged: false };
 
   assert.equal(verdict(passed, null, null), "travels");
-  assert.equal(verdict(challenged, challenged, challenged), "zone_challenges");
-  assert.equal(verdict(challenged, challenged, null), "zone_challenges");
-  assert.equal(verdict(challenged, passed, null), "does_not_travel");
+  const solved = (o) => ({ ...o, solved_here: true });
+  assert.equal(verdict(challenged, solved(challenged), challenged), "zone_challenges");
+  assert.equal(verdict(challenged, solved(challenged), null), "zone_challenges");
+  assert.equal(verdict(challenged, solved(passed), null), "does_not_travel");
+
+  // A follow-up that never earned a clearance of its own proves nothing about
+  // the zone — the challenge may simply not have finished. Reporting it as
+  // zone_challenges is how a timeout becomes a finding about Cloudflare.
+  assert.equal(verdict(challenged, { challenged: true, solved_here: false }, null), "inconclusive");
   // The bookkeeping being replayed alongside it is the one case that is fixable
   // in this repo, so it is checked before the two that are not.
-  assert.equal(verdict(challenged, challenged, passed), "challenge_state");
+  assert.equal(verdict(challenged, solved(challenged), passed), "challenge_state");
   assert.equal(verdict(challenged, null, null), "inconclusive");
 
   // Every verdict says something, and the one that means "stop working on the

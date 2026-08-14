@@ -25,6 +25,11 @@
 export function verdict(carried, inSession, clearanceOnly) {
   if (!carried.challenged) return "travels";
   if (clearanceOnly && !clearanceOnly.challenged) return "challenge_state";
+  // "the browser solved it and was challenged again" and "the browser never
+  // solved it" are the same JSON unless solved_here is checked, and they mean
+  // opposite things — the first is a property of the zone, the second is a
+  // timeout on this box. Only the first is worth calling zone_challenges.
+  if (inSession && !inSession.solved_here) return "inconclusive";
   if (inSession && inSession.challenged) return "zone_challenges";
   if (inSession && !inSession.challenged) return "does_not_travel";
   return "inconclusive";
@@ -72,8 +77,15 @@ export function explain(v) {
       );
     default:
       return (
-        "inconclusive: the carried cookie was challenged and the follow-up did not\n" +
-        "complete. Re-run when the target is reachable, or read the JSON above."
+        "inconclusive.\n\n" +
+        "The carried cookie was challenged, and the follow-up could not say why: the\n" +
+        "context that was meant to solve the challenge itself never earned a clearance\n" +
+        "either (solved_here: false), so there is no way to tell a zone that re-challenges\n" +
+        "everything from a challenge that simply did not finish in the time allowed.\n\n" +
+        "Both are worth ruling out before concluding anything:\n\n" +
+        "  - re-run when the box is not busy; a solve here takes over a minute\n" +
+        "  - check `send -solve` still earns a cf_clearance at all\n\n" +
+        "Do not read this as evidence about the address. It is the absence of evidence."
       );
   }
 }

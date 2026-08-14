@@ -944,57 +944,49 @@ no amount of work inside this package closes them:
 - **The HTTP/2 transport pings an idle connection every 15s.** That keeps dead
   connections out of the pool, but browsers have no such fixed heartbeat. It only
   shows up on connections held open between requests, not on a single fetch.
-- **A `cf_clearance` does not always travel.** Measured against two independent
-  zones in Under Attack mode, from a datacenter address. The solver earned a
-  clearance in a real Chromium; the same cookie presented from a *fresh context
-  of that same browser* — same address, same User-Agent, same TLS — was
-  challenged again. On both.
+- **`-solve` has not been shown to work or to fail, and the tool that was
+  supposed to decide it was broken.** This entry has twice carried a confident
+  conclusion drawn from `solver/replay.js`, and both are withdrawn.
 
-  The cookie was verified to be on the wire, not merely in a jar:
-  `Network.requestWillBeSentExtraInfo` reported it on the navigation request.
-  That check is worth naming because the first version of it read
-  `request.headers()`, which omits `Cookie` — Chrome's network stack attaches it
-  after the interception point — and so reported every cookie as unsent,
-  including ones a local server confirmed receiving. A measurement is only as
-  good as its instrument, and this one was wrong once before it was right.
+  `replay.js` presents a solved `cf_clearance` in a fresh context of the same
+  browser and reports whether the edge accepts it. It never pinned the identity
+  on those contexts. `cf_clearance` is bound to the User-Agent it was issued to,
+  the solve pins Chrome's frozen build — `Chrome/151.0.0.0` — and an unpinned
+  page reports the browser's real one, `Chrome/151.0.7922.108`. Same browser,
+  different string, refused cookie. Every "the clearance was challenged" it
+  printed was guaranteed by its own method before the request went out.
 
-  **It is a property of the address and the hour, not of the protocol.** Three
-  measurements against the same target from the same VPS, in that order:
+  Its follow-up — solve the challenge in a fresh context, navigate again in that
+  same context — had a second hole: it did not report whether that context ever
+  earned a clearance, so a challenge that simply did not finish inside the
+  90-second wait was indistinguishable from a zone that re-challenges
+  everything. A solve on the reference box takes over 80 seconds.
+
+  Both are fixed: the identity now comes from `solver/identity.js`, which
+  `index.js` and `replay.js` share so there is no second place to forget it; the
+  follow-up reports `solved_here`; the wait is 180s; and the verdict refuses to
+  say `zone_challenges` unless the browser demonstrably solved one itself.
+
+  What is actually known, with the instrument out of it:
 
   | | result |
   |---|---|
-  | `send -solve`, clearance replayed by this client | **200**, 113/113 requests |
-  | `send -solve`, some hours and many failed challenges later | 403, managed challenge |
-  | `replay.js` immediately after: clearance carried into a fresh context | 403, challenged |
-  | ...clearance presented *alone*, no `cf_chl_*` | 403, challenged |
-  | ...challenge solved in a fresh context and continued **in that same context** | 403, challenged |
+  | `send -solve` on the branch before the solver was rewritten, live UAM zone, VPS address | **200**, 113/113 requests |
+  | `send -solve` on the rewritten branch, same target and address | 403, managed challenge |
 
-  The last row is the one that settles it. A real Chromium solved the challenge
-  itself and was challenged again on its very next navigation, in the context
-  that had just passed. Not a carried cookie, not this client, not a
-  fingerprint — a browser could not hold a session there either. When
-  `replay.js` reports `"verdict": "zone_challenges"`, nothing in this repo is
-  going to change the outcome and the answer is a different exit.
-
-  Both of the confident readings this entry has carried were wrong, in opposite
-  directions, and for the same reason — one run generalised into a rule:
-
-  - "a clearance does not travel, `-solve` has nothing to offer" was written
-    from the 403. The 200 above refutes it.
-  - "a clearance travels" was then written from the 200. The in-context 403
-    refutes that too.
-
-  What is true is narrower and less satisfying: it travels from some addresses,
-  at some times, and each failed challenge from an address makes the next one
-  harder — so the act of measuring this repeatedly is itself what stops it
-  working. If a target that passed this morning stops passing, suspect the
-  address's recent history before the code, and leave it alone rather than
-  solving against it in a loop.
+  A real difference, and still unexplained. Three regressions found while
+  looking for it are fixed — a `navigator.languages` contradiction, a challenge
+  detector that read cleared pages as challenged, and session-bound cookies
+  being replayed — and none of them accounts for it.
 
   Worth separating from the fingerprint question, because they get conflated:
-  the aim is not to replay a clearance — it is to not be challenged, which is a
+  the aim is not to replay a clearance, it is to not be challenged, which is a
   question about the exit address at least as much as about the client. A
-  datacenter range is scored badly whatever it presents.
+  datacenter range is scored badly whatever it presents, and each failed
+  challenge from an address makes the next one harder — so measuring this
+  repeatedly is itself capable of changing the answer. That is a reason to be
+  careful about attributing a 403 to either side, which is the mistake this
+  entry has now made in both directions.
 
 ## Performance claims
 

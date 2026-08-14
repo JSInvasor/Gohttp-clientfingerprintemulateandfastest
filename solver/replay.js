@@ -35,6 +35,7 @@ import path from "node:path";
 import os from "node:os";
 import { connect } from "puppeteer-real-browser";
 import { connectOptions } from "./profile.js";
+import { preparePage } from "./identity.js";
 import {
   cleanup,
   errorMessage,
@@ -141,6 +142,16 @@ async function attempt(browser, cookies, label) {
   const context = await browser.createBrowserContext();
   const page = await context.newPage();
 
+  // The identity the cookie was issued to, before anything navigates.
+  //
+  // Without this the whole file measures nothing. cf_clearance is bound to the
+  // User-Agent, the solve pins Chrome's frozen build — "Chrome/151.0.0.0" — and
+  // an unpinned page reports the browser's real one, "Chrome/151.0.7922.108".
+  // Same browser, different string, and the edge refuses the cookie on that
+  // alone. Every "the clearance was challenged" this tool has ever printed was
+  // guaranteed by its own method rather than measured.
+  await preparePage(page, await browser.version().catch(() => ""));
+
   // What actually went out, rather than what was asked for.
   //
   // This is the assumption the whole file rests on: "the cookie was presented
@@ -243,9 +254,10 @@ async function main() {
     if (carried.challenged) {
       const context = await browser.createBrowserContext();
       const page = await context.newPage();
+      await preparePage(page, await browser.version().catch(() => ""));
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => null);
 
-      const deadline = Date.now() + 90_000;
+      const deadline = Date.now() + 180_000;
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 2_000));
         const stillOn = await page
@@ -253,11 +265,23 @@ async function main() {
           .catch(() => true);
         if (!stillOn) break;
       }
+      // Did this context actually earn a clearance, or did the wait simply run
+      // out? Without this the two are the same JSON, and they mean opposite
+      // things: "the browser solved it and was challenged again" says the zone
+      // re-challenges everything and no client can help, while "the browser
+      // never solved it" says only that 90 seconds was not enough — a solve on
+      // this box takes 80 of them. Reporting the second as the first is how a
+      // timeout gets written up as a property of Cloudflare.
+      const solvedHere = (await context.cookies().catch(() => [])).some(
+        (c) => c.name === "cf_clearance"
+      );
+
       const second = await page
         .goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 })
         .catch(() => null);
       await new Promise((r) => setTimeout(r, 2_000));
       inSession = {
+        solved_here: solvedHere,
         http_status: second ? second.status() : 0,
         challenged: await page
           .evaluate(() => typeof window._cf_chl_opt === "object" && window._cf_chl_opt !== null)
