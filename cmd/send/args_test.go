@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -179,8 +180,11 @@ func TestUsageDocumentsEveryFlag(t *testing.T) {
 		if alias[f.Name] {
 			return
 		}
-		if !strings.Contains(usage, "-"+f.Name) {
-			t.Errorf("-%s has no line in the usage text", f.Name)
+		// Anchored on a word boundary rather than a substring: plain
+		// strings.Contains would find "-i" inside "-insecure" and call every
+		// short flag documented whether it was or not.
+		if !regexp.MustCompile(`-` + regexp.QuoteMeta(f.Name) + `\b`).MatchString(usage) {
+			t.Errorf("-%s appears nowhere in the usage text", f.Name)
 		}
 	})
 }

@@ -136,81 +136,74 @@ func printUsage(w io.Writer) {
 	fmt.Fprint(w, p.example(`send -X POST -H 'Content-Type: application/json' \`, ""))
 	fmt.Fprint(w, p.example(`     -d '{"a":1}' https://site.com/api`, ""))
 
-	fmt.Fprint(w, p.section("getting the rate up", `  -mode fast    the shortest path: no jar, no redirects, no retries
-  -s 2          one session is one HTTP/2 connection behind one write lock,
-                and a second measured ~28% over the first
-  -c            about rate × round-trip time. More than that queues rather
-                than flies, and costs throughput`))
+	fmt.Fprint(w, p.section("getting the rate up", `-mode fast    the shortest path: no jar, no redirects, no retries
+-s 2          one session is one HTTP/2 connection behind one write lock,
+              and a second measured ~28% over the first
+-c            about rate × round-trip time. More than that queues rather
+              than flies, and costs throughput`))
 
-	fmt.Fprint(w, p.section("load shape", `  -n int          number of requests (default 1)
-  -t duration     [1st] run for this long instead, e.g. 30s, 5m
-  -c int          [2nd] threads: concurrent requests in flight
-  -s int          [3rd] clients: independent sessions, each its own cookie jar,
-                  connection pool and pinned proxy
-  -rps int        [4th] hold the whole run at this many requests per second
-  -mode string    client | fast | pipeline (default client)
-  -warmup int     pre-open this many TLS connections per session first`))
+	fmt.Fprint(w, p.section("load shape", `-n int          number of requests (default 1)
+-t duration     [1st] run for this long instead, e.g. 30s, 5m
+-c int          [2nd] threads: concurrent requests in flight
+-s int          [3rd] clients: independent sessions, each with its own cookie
+                jar, connection pool and pinned proxy
+-rps int        [4th] hold the whole run at this many requests per second
+-mode string    client | fast | pipeline (default client)
+-warmup int     pre-open this many TLS connections per session first, so the
+                numbers measure throughput rather than handshakes`))
 
-	fmt.Fprint(w, p.section("identity", `  -p string       browser profile: safari | chrome (default safari)
-  -ua string      override the profile's User-Agent
-  -lang string    Accept-Language; match it to where your exit IPs are
-  -accept string  override the Accept header
-  -referer string Referer header to send
-  -cookie k=v     seed a cookie into every session (repeatable)
-  -assets         after each document, fetch the stylesheets, scripts, images
-                  and preloaded fonts it references
-  -asset-limit int      most assets to take from one document (default 25)
-  -asset-parallel int   how many to fetch at once (default 6)
-  -fingerprint    print the profile's reference fingerprint and continue`))
+	fmt.Fprint(w, p.section("identity", `-p string       browser profile: safari | chrome (default safari)
+-lang string    Accept-Language. Worth setting: it is scored against where
+                your exit IPs are, and the default is en-US
+-cookie k=v     seed a cookie into every session (repeatable)
+-assets         after each document, fetch the stylesheets, scripts, images
+                and fonts it references — a document alone is not a page load
+-fingerprint    print the profile's reference fingerprint and continue`))
 
-	fmt.Fprint(w, p.section("cloudflare", `  -solve                earn a cf_clearance with the real browser in solver/.
-                        Implies -p chrome. Needs npm install in solver/
-  -solver-dir path      where index.js and node_modules live (default solver)
-  -solve-cache path     reuse a still-valid solve; empty disables it
-  -solve-refresh        ignore the cache and solve fresh
-  -solve-max-age dur    how old a cached solve may be (default 30m)
-  -solve-timeout dur    how long one solve may take (default 150s)
-  -solve-parallel int   how many exits to solve at once (default 2)
-  -solve-ip-check url   measure where each proxy leaves from and solve once per
-                        address, dropping the dead and rotating ones. Empty off
-  -solve-isolate        a browser per exit instead of a context in a shared one`))
+	fmt.Fprint(w, p.section("cloudflare", `-solve                earn a cf_clearance with the real browser in solver/.
+                      Implies -p chrome. Needs npm install in solver/
+-solver-dir path      where index.js and node_modules live (default solver)
+-solve-refresh        ignore the cached solve and earn a new one
+-solve-timeout dur    how long one solve may take (default 150s). Browser
+                      startup comes out of this, so a small VPS needs more
+-solve-parallel int   how many exits to solve at once (default 2)
+-solve-ip-check url   measure where each proxy leaves from and solve once per
+                      address, dropping the dead and the rotating ones. This
+                      is what makes a hundred-proxy list affordable`))
 
-	fmt.Fprint(w, p.section("request", `  -X string       HTTP method (default GET)
-  -H 'K: v'       extra header (repeatable)
-  -d string       request body; @path reads it from a file`))
+	fmt.Fprint(w, p.section("request", `-X string       HTTP method (default GET)
+-H 'K: v'       extra header (repeatable)
+-d string       request body; @path reads it from a file`))
 
-	fmt.Fprint(w, p.section("proxy", `  -proxy url            single proxy, http:// or socks5://
-  -proxy-file path      file of proxies to rotate, one per line
-  -proxy-cooldown dur   how long a failing proxy sits out
-  -proxy-fails int      consecutive failures before a proxy is benched
-  -proxy-stats          print per-proxy usage after the run`))
+	fmt.Fprint(w, p.section("proxy", `-proxy url            single proxy, http:// or socks5://
+-proxy-file path      file of proxies to rotate, one per line
+-proxy-stats          per-proxy usage after the run — which exits carried the
+                      run and which were benched`))
 
-	fmt.Fprint(w, p.section("network", `  -timeout dur          total per-request timeout (default 30s)
-  -handshake-timeout    TLS handshake timeout per attempt (default 10s)
-  -dial-timeout dur     TCP dial timeout
-  -header-timeout dur   response header timeout
-  -write-timeout dur    HTTP/2 frame write timeout
-  -dns-ttl dur          DNS cache TTL
-  -http1                force HTTP/1.1 instead of negotiating h2
-  -insecure             skip TLS certificate verification
-  -no-redirect          do not follow redirects
-  -max-redirects int    redirect limit
-  -retry int            retry on network errors and 429/502/503/504
-  -no-keepalive         close connections after each request
-  -max-streams int      HTTP/2 streams per connection before it is cycled
-  -idle-conns int       total idle connection pool size
-  -idle-per-host int    idle connections kept per host
-  -conns-per-host int   hard cap on connections per host
-  -sockbuf bytes        SO_RCVBUF / SO_SNDBUF size (Linux)
-  -tfo                  TCP Fast Open (Linux; no browser does this)
-  -tls-resume           offer a cached TLS 1.3 ticket on repeat connections.
-                        Off by default: the PSK moves JA4 to t13d1517h2
-  -max-body bytes       response body ceiling, 0 for unlimited`))
+	fmt.Fprint(w, p.section("network", `-timeout dur          total per-request timeout (default 30s)
+-retry int            retry on network errors and 429/502/503/504
+-insecure             skip TLS certificate verification
+-http1                force HTTP/1.1 instead of negotiating h2
+-no-redirect          do not follow redirects
+-max-streams int      HTTP/2 streams per connection before it is cycled. A long
+                      monotonic stream-id sequence is its own passive signal
+-tls-resume           offer a cached TLS 1.3 ticket on repeat connections, as a
+                      browser does. Off by default: the PSK moves JA4 to
+                      t13d1517h2, so connections after the first differ`))
 
-	fmt.Fprint(w, p.section("output", `  -i              print response headers (single request only)
-  -o path         write the response body to a file
-  -silent         suppress the response body
-  -json           print the run summary as JSON`))
+	fmt.Fprint(w, p.section("output", `-i              print response headers (single request only)
+-o path         write the response body to a file
+-silent         suppress the response body
+-json           print the run summary as JSON`))
+
+	// The rest still work; they are just not what anyone reaches for first.
+	// Named rather than dropped, because a flag nothing mentions is a flag
+	// nobody finds — and the tests require every one of them to appear here.
+	fmt.Fprint(w, p.section("also accepted", `-ua  -accept  -referer  -asset-limit  -asset-parallel  -solve-cache
+-solve-max-age  -solve-isolate  -proxy-cooldown  -proxy-fails  -max-body
+-handshake-timeout  -dial-timeout  -header-timeout  -write-timeout  -dns-ttl
+-max-redirects  -no-keepalive  -idle-conns  -idle-per-host  -conns-per-host
+-sockbuf  -tfo`))
 
 	fmt.Fprintln(w)
 }
