@@ -218,6 +218,18 @@ func clientOptions(o *options, seed *solveSeed) []gofire.Option {
 		opts = append(opts, gofire.WithUserAgent(seed.userAgent))
 	}
 
+	// The language is the same handover as the UA, and it overrides -lang rather
+	// than deferring to it — which is the opposite of the rule above, for a
+	// reason. -ua is a value the user typed and the run is theirs to break; the
+	// solve's Accept-Language is not something anyone typed, it is what the
+	// browser did with what they typed. Chromium regenerates the header from the
+	// first tag and drops the rest, so honouring -lang here would replay a
+	// language the session that earned the cookie never advertised — while
+	// looking, in the flags, as though the two agreed.
+	if seed != nil && seed.acceptLanguage != "" {
+		opts = append(opts, gofire.WithAcceptLanguage(seed.acceptLanguage))
+	}
+
 	return opts
 }
 

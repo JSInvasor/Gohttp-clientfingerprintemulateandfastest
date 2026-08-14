@@ -52,19 +52,23 @@ const defaultSolveTimeout = 150 * time.Second
 
 // solveResult is what solver/index.js prints.
 type solveResult struct {
-	Status        string         `json:"status"`
-	Error         string         `json:"error"`
-	URL           string         `json:"url"`
-	UserAgent     string         `json:"user_agent"`
-	Cookies       string         `json:"cookies"`
-	CookieList    []solvedCookie `json:"cookie_list"`
-	DurationMS    int64          `json:"duration_ms"`
-	Attempts      int            `json:"attempts"`
-	Exit          string         `json:"exit"` // batch only: the id this line answers for
-	Chromium      string         `json:"chromium_version"`
-	ChromiumMajor int            `json:"chromium_major"`
-	Proxy         string         `json:"proxy"`
-	LaunchMS      int64          `json:"launch_ms"`
+	Status    string `json:"status"`
+	Error     string `json:"error"`
+	URL       string `json:"url"`
+	UserAgent string `json:"user_agent"`
+	// AcceptLanguage is what the browser actually put on the wire, which is not
+	// always what it was asked for: Chromium regenerates the header from the
+	// first tag of --accept-lang and drops the rest.
+	AcceptLanguage string         `json:"accept_language"`
+	Cookies        string         `json:"cookies"`
+	CookieList     []solvedCookie `json:"cookie_list"`
+	DurationMS     int64          `json:"duration_ms"`
+	Attempts       int            `json:"attempts"`
+	Exit           string         `json:"exit"` // batch only: the id this line answers for
+	Chromium       string         `json:"chromium_version"`
+	ChromiumMajor  int            `json:"chromium_major"`
+	Proxy          string         `json:"proxy"`
+	LaunchMS       int64          `json:"launch_ms"`
 }
 
 type solvedCookie struct {
@@ -82,10 +86,16 @@ type solvedCookie struct {
 // the source IP is part of what the cookie is bound to, so the pairing has to
 // hold all the way into the session pool.
 type solveSeed struct {
-	proxy         string
-	userAgent     string
-	cookies       []string
-	chromiumMajor int
+	proxy     string
+	userAgent string
+	// acceptLanguage is the header the solve actually sent, which is not always
+	// the one it was asked for — Chromium regenerates it from the first tag and
+	// drops the rest, so -lang "tr-TR,tr;q=0.9,en;q=0.8" solves under
+	// "tr-TR,tr;q=0.9". Replaying the asked-for value would advertise a language
+	// the session that earned the cookie never did.
+	acceptLanguage string
+	cookies        []string
+	chromiumMajor  int
 	// expiresAt is when the cf_clearance stops being worth anything, zero when
 	// the solve produced none. A fleet solve can outlast it — see
 	// warnOnExpiredSeeds.
@@ -271,7 +281,7 @@ func solveAndSeed(ctx context.Context, o *options, profile gofire.BrowserProfile
 	if err != nil {
 		return err
 	}
-	reportSolveDrift(seed)
+	reportSolveDrift(seed, o)
 
 	// The UA the cookie was issued to wins over the profile's default, but not
 	// over an explicit -ua: an override the user typed is a deliberate choice,
@@ -368,7 +378,12 @@ func seedFromResult(o *options, target string, e exit, res *solveResult) *solveS
 	}
 	logSolve(proxy, "%s", report)
 
-	seed := &solveSeed{proxy: proxy, userAgent: res.UserAgent, chromiumMajor: res.ChromiumMajor}
+	seed := &solveSeed{
+		proxy:          proxy,
+		userAgent:      res.UserAgent,
+		acceptLanguage: res.AcceptLanguage,
+		chromiumMajor:  res.ChromiumMajor,
+	}
 	if gotClearance && cf.Expires > 0 {
 		seed.expiresAt = time.Unix(int64(cf.Expires), 0)
 	}
@@ -387,9 +402,27 @@ func seedFromResult(o *options, target string, e exit, res *solveResult) *solveS
 // A fleet solve calls this once rather than once per exit. Every exit drives the
 // same local Chromium, so drift is a property of this box, and repeating it per
 // proxy would bury the per-exit results under copies of one warning.
-func reportSolveDrift(seed *solveSeed) {
+func reportSolveDrift(seed *solveSeed, o *options) {
 	reportUADrift(seed.userAgent)
 	reportChromiumDrift(seed.chromiumMajor)
+	reportLanguageDrift(seed.acceptLanguage, acceptLanguage(o))
+}
+
+// reportLanguageDrift says so when the browser did not send the language it was
+// asked for.
+//
+// It is not an error and nothing is broken by it — the sessions replay what was
+// actually sent, so the two halves of the handover match either way. It is worth
+// a line because the run is then advertising something other than what -lang
+// says, and a flag that silently means something else is worse than one that
+// does not work.
+func reportLanguageDrift(sent, asked string) {
+	if sent == "" || asked == "" || sent == asked {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "note: -lang asked for %q but the browser sent %q — Chromium regenerates "+
+		"Accept-Language from the first tag. The run replays what was sent, so the cookie still "+
+		"matches; pass the collapsed form to -lang if you want the flag to read true.\n", asked, sent)
 }
 
 // reportChromiumDrift warns when the browser that earned the cookie is not the

@@ -28,6 +28,7 @@
 //   { "status": "ok"|"no_clearance"|"error",
 //     "url": "<final url>",
 //     "user_agent": "<navigator.userAgent>",
+//     "accept_language": "<what the browser actually sent, not what was asked>",
 //     "cookies": "name=val; name=val; ...",   // header-ready
 //     "cookie_list": [{name, value, domain, expires}, ...],
 //     "duration_ms": <int>,
@@ -62,7 +63,6 @@ import {
   TARGET_LANG,
   TARGET_UA,
   connectOptions,
-  languageList,
   parseProxyURL,
   userAgentMetadata,
   chromiumMajor as parseChromiumMajor,
@@ -288,11 +288,12 @@ async function preparePage(page, chromiumVersion) {
     userAgentMetadata(undefined, undefined, undefined, undefined, chromiumVersion)
   );
 
-  // Stealth shim, singular.
+  // No stealth shims at all, and each one was removed for the same reason: it
+  // asserted something no real Chrome reports, through a mechanism a page can
+  // see.
   //
-  // This used to also overwrite navigator.webdriver and navigator.plugins.
-  // Measured against this browser with the shims on and off, both were making
-  // the fingerprint worse than leaving it alone:
+  // webdriver and plugins went first. Measured against this browser with the
+  // shims on and off:
   //
   //                              shimmed              untouched
   //   navigator.webdriver        undefined            false
@@ -307,27 +308,76 @@ async function preparePage(page, chromiumVersion) {
   // false, it is a value no browser produces, and defining it on the instance
   // leaves an own property that Navigator.prototype never has. The plugins
   // override replaced a genuine PluginArray of five Plugin objects with a plain
-  // Array of three plain objects: three separate tells in one property, plus a
-  // plugins/mimeTypes pair (3 and 2) that no Chrome ever emits.
+  // Array of three plain objects.
   //
-  // languages is the one that earns its place. Chrome sends the full
-  // Accept-Language list — en-US,en;q=0.9 — while navigator.languages reports
-  // only the primary tag, and a header advertising a language the page object
-  // does not list is the kind of contradiction the rest of this repo exists to
-  // avoid. Restoring the remaining entries makes the two agree.
+  // languages was the last one, and it survived longer because its premise
+  // sounded right: the browser sends Accept-Language: en-US,en;q=0.9 while
+  // navigator.languages reports ["en-US"], and a header listing a language the
+  // page object does not looked like exactly the contradiction this repo exists
+  // to remove. Measured, it is not a contradiction — it is what Chrome does.
   //
-  // The list comes from TARGET_LANG rather than a literal. It used to be a
-  // hardcoded ["en-US", "en"], which was correct only for as long as the box's
-  // locale happened to be en-US: on any other image the shim asserted a language
-  // the browser was not asking for, manufacturing the very contradiction it was
-  // written to remove. Now --accept-lang, --lang and this all read one value.
-  await page.evaluateOnNewDocument((languages) => {
+  // navigator.languages comes from the language *preference list*; the header is
+  // generated from that same list by appending each tag's base language with a
+  // q-value. One configured language therefore always gives a header with two
+  // tags and a navigator.languages with one. Every value tried here behaved that
+  // way, in both directions:
+  //
+  //   --accept-lang=            header sent            navigator.languages
+  //   en-US,en;q=0.9            en-US,en;q=0.9         ["en-US"]
+  //   de-DE,de;q=0.9            de-DE,de;q=0.9         ["de-DE"]
+  //   tr-TR,tr;q=0.9,en;q=0.8   tr-TR,tr;q=0.9         ["tr-TR"]
+  //   en-GB,en-US;q=0.9,en;q=0.8  en-GB,en;q=0.9       ["en-GB"]
+  //   en                        en                     ["en"]
+  //
+  // So the shim was not restoring a missing entry, it was adding one Chrome does
+  // not report for that header — and it did so by defining an own property on
+  // the navigator instance, whose getter stringified as "() => languages" where
+  // every native accessor reads "function get languages() { [native code] }".
+  // Two tells, bought to fix nothing:
+  //
+  //                              shimmed              untouched
+  //   navigator.languages        ["en-US","en"]       ["en-US"]
+  //   own property on navigator  true                 false
+  //   getter toString            () => languages      [native code]
+  //
+  // The language still has to match what gofire replays with. That is handled
+  // where it cannot be detected at all: --accept-lang sets it at launch, and
+  // harvest reports back what the browser actually put on the wire so the replay
+  // uses that rather than what was asked for. See acceptLanguageOf.
+  watchAcceptLanguage(page);
+}
+
+// What the browser actually sent, per page.
+//
+// Asked for one thing, Chromium sends another: it regenerates the header from
+// the first tag of --accept-lang and drops the rest, so a run started with
+// -lang "tr-TR,tr;q=0.9,en;q=0.8" solves under "tr-TR,tr;q=0.9". Replaying with
+// the value that was asked for would advertise a language the session that
+// earned the cookie never did — the same class of handover mismatch as a stale
+// UA, and just as quiet.
+//
+// Reported rather than predicted. The transform above is what this Chromium
+// does; a different build is free to do something else, and a rule derived from
+// one measurement would then be wrong in the one place nobody looks.
+const observedAcceptLanguage = new WeakMap();
+
+function watchAcceptLanguage(page) {
+  page.on("request", (request) => {
     try {
-      Object.defineProperty(navigator, "languages", {
-        get: () => languages,
-      });
+      if (!request.isNavigationRequest()) return;
+      if (request.frame() !== page.mainFrame()) return;
+      const value = request.headers()["accept-language"];
+      if (value) observedAcceptLanguage.set(page, value);
     } catch {}
-  }, languageList(TARGET_LANG));
+  });
+}
+
+// acceptLanguageOf returns what was seen on this page's document request, or
+// the value that was asked for when nothing was observed — an empty string here
+// would read as "the solve sent no Accept-Language", which is a stronger claim
+// than "it was not watched".
+function acceptLanguageOf(page) {
+  return observedAcceptLanguage.get(page) || TARGET_LANG;
 }
 
 // Wait until cf_clearance appears for the target origin, or until the page
@@ -431,6 +481,7 @@ async function harvest(jar, page) {
     status: cookies.some((c) => c.name === "cf_clearance") ? "ok" : "no_clearance",
     url: finalUrl,
     user_agent: userAgent,
+    accept_language: acceptLanguageOf(page),
     cookies: cookies.map((c) => `${c.name}=${c.value}`).join("; "),
     cookie_list: cookies.map((c) => ({
       name: c.name,
@@ -688,6 +739,7 @@ async function solveExit(newSession, budgetMs, proxyLabel) {
         status: "ok",
         url: r.url,
         user_agent: r.user_agent,
+        accept_language: r.accept_language || TARGET_LANG,
         cookies: r.cookies,
         cookie_list: r.cookie_list,
         duration_ms: Date.now() - startTs,
@@ -721,6 +773,7 @@ async function solveExit(newSession, budgetMs, proxyLabel) {
       status: "no_clearance",
       url: lastResult.url || url,
       user_agent: lastResult.user_agent || TARGET_UA,
+      accept_language: lastResult.accept_language || TARGET_LANG,
       cookies: lastResult.cookies || "",
       cookie_list: lastResult.cookie_list || [],
       ...base,

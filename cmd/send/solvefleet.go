@@ -107,7 +107,7 @@ func solveAcrossProxies(ctx context.Context, o *options, profile gofire.BrowserP
 	// the same for all of them. Checked once, off the first seed, for the same
 	// reason it is checked at all: a cookie replayed by a browser it was not
 	// issued to is a silent 403.
-	reportSolveDrift(&keptSeeds[0])
+	reportSolveDrift(&keptSeeds[0], o)
 	warnOnMixedUA(keptSeeds)
 	warnOnExpiredSeeds(keptSeeds)
 
