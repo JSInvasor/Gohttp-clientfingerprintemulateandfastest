@@ -56,6 +56,14 @@ func sendOne(ctx context.Context, client *gofire.Client, o *options, target stri
 		return fmt.Errorf("read body: %w", bodyErr)
 	}
 
+	// A solve that earned a cookie and then got challenged anyway is the one
+	// outcome this tool must not report as a plain 403 and a wall of HTML. It is
+	// the exact symptom of two unrelated problems, and the difference decides
+	// whether there is anything to fix here at all.
+	if o.solve {
+		reportRejectedClearance(o, target, resp.StatusCode(), resp.Header, data)
+	}
+
 	// A document with nothing following it is not what a page load looks like.
 	// This runs after the timings above so the numbers still describe the
 	// document alone.

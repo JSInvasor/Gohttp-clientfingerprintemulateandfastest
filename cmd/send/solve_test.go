@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -464,4 +465,82 @@ func TestMalformedLanguageIsCaught(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A solve that earns a cookie and is then challenged anyway must not be
+// reported as a plain 403 and a wall of interstitial HTML. Measured on a live
+// zone, that outcome came from something no fingerprint work here could touch —
+// and someone reading a 403 has no way to know it.
+func TestRejectedClearanceIsExplained(t *testing.T) {
+	challenge := []byte(`<html><head><title>Just a moment...</title></head>` +
+		`<body><script>window._cf_chl_opt={cType:'managed'};</script></body></html>`)
+
+	stderr := captureStderr(t, func() {
+		reportRejectedClearance(
+			&options{solve: true, solverDir: "solver"},
+			"https://site.test",
+			http.StatusForbidden,
+			http.Header{"Cf-Mitigated": []string{"challenge"}},
+			challenge,
+		)
+	})
+
+	for _, want := range []string{
+		"earned a cf_clearance", // says the solve worked
+		"not a failed solve",    // and that this is not that
+		"replay.js",             // names the one command that decides
+		"https://site.test",     // with the target filled in
+		"-proxy",                // and the answer when it is the address
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the explanation does not mention %q:\n%s", want, stderr)
+		}
+	}
+}
+
+// An ordinary response after a solve says nothing: the note is for the one
+// outcome that is genuinely ambiguous, and printing it on a 200 would train
+// people to ignore it.
+func TestRejectedClearanceIsQuietWhenNothingWasRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"the page arrived", 200, "<html><body>the real page</body></html>"},
+		{"a plain refusal", 403, "<html><body>Forbidden</body></html>"},
+		{"an ordinary error", 500, "<html><body>oops</body></html>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stderr := captureStderr(t, func() {
+				reportRejectedClearance(&options{solve: true, solverDir: "solver"},
+					"https://site.test", tc.status, http.Header{}, []byte(tc.body))
+			})
+			if stderr != "" {
+				t.Errorf("said something about a clearance nothing rejected:\n%s", stderr)
+			}
+		})
+	}
+}
+
+// captureStderr collects what f writes to os.Stderr.
+func captureStderr(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	saved := os.Stderr
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		var sb strings.Builder
+		io.Copy(&sb, r) //nolint:errcheck
+		done <- sb.String()
+	}()
+
+	f()
+	w.Close()
+	os.Stderr = saved
+	return <-done
 }

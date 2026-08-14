@@ -145,12 +145,46 @@ async function main() {
     const after = await context.cookies(origin).catch(() => []);
     const clearance = after.find((c) => c.name === "cf_clearance");
 
+    // The second question, and only worth asking once the first has answered
+    // no: is the clearance unusable, or is the zone challenging everything?
+    //
+    // Let the challenge run to completion in this context — a browser solves it
+    // and proceeds, which is the whole difference between it and a client — then
+    // navigate again with whatever that left behind. If that second navigation
+    // passes, a clearance does work here, just not one carried in from another
+    // session. If it is challenged too, the zone re-challenges every request and
+    // there is nothing for -solve to earn that would ever be reusable.
+    let inSession = null;
+    if (challenged) {
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2_000));
+        const stillOn = await page
+          .evaluate(() => typeof window._cf_chl_opt === "object" && window._cf_chl_opt !== null)
+          .catch(() => true);
+        if (!stillOn) break;
+      }
+      const second = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 })
+        .catch(() => null);
+      await new Promise((r) => setTimeout(r, 2_000));
+      inSession = {
+        http_status: second ? second.status() : 0,
+        challenged: await page
+          .evaluate(() => typeof window._cf_chl_opt === "object" && window._cf_chl_opt !== null)
+          .catch(() => true),
+        title: await page.title().catch(() => ""),
+      };
+    }
+
     out({
       status: "ok",
       url: page.url(),
       http_status: httpStatus,
       title,
       challenged,
+      // null when the first navigation already passed, so there was nothing to
+      // distinguish. Otherwise: does a clearance earned *here* work here?
+      same_session_after_solving: inSession,
       // A clearance that came back different is the edge replacing the one that
       // was presented, which is its way of saying the presented one was not
       // accepted.

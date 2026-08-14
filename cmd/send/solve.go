@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -550,4 +551,43 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// reportRejectedClearance says so when a solved cookie was handed back a fresh
+// challenge on its first use.
+//
+// Without this the run prints "403 Forbidden" and five kilobytes of
+// interstitial, which reads as the solve having failed — it did not, the
+// clearance was earned and then refused. Those are different problems and only
+// one of them is this tool's.
+//
+// The message deliberately does not guess which. Measured on a live zone: a
+// clearance that the *browser that earned it* could not reuse from a fresh
+// context on the same address, same UA, same TLS. No fingerprint work in this
+// client would have changed that, and someone staring at a 403 has no way to
+// know it. solver/replay.js is the one-command answer, so it is named here
+// rather than described.
+func reportRejectedClearance(o *options, target string, status int, header http.Header, body []byte) {
+	kind, why := identifyChallenge(status, header, body)
+	if kind != challengeCloudflare {
+		return
+	}
+	fmt.Fprintf(os.Stderr, `
+the solve earned a cf_clearance and the target challenged it anyway (%s).
+
+That is not a failed solve, and it is usually not a fingerprint problem — a
+clearance is refused for reasons one response cannot distinguish:
+
+  - the zone re-scores every request, so no clearance is ever reusable
+  - the address is on a range the edge scores badly whatever it presents
+  - the clearance is bound to the session that earned it and does not travel
+
+To find out which, ask the browser that earned it:
+
+  node %s %s
+
+That replays the same cookie in a fresh context of the same browser, from this
+same address. If it is challenged too, nothing on this side would have helped
+and the answer is a different exit — try -proxy or -proxy-file.
+`, why, filepath.Join(o.solverDir, "replay.js"), target)
 }
