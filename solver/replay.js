@@ -127,19 +127,34 @@ async function attempt(browser, cookies, label) {
 
   // What actually went out, rather than what was asked for.
   //
-  // This is the assumption the whole file rests on and it was going unchecked:
-  // "the cookie was presented and refused" and "the cookie was never sent" look
-  // identical from the response, and setCookie failing quietly — a domain that
-  // does not match, a Secure flag on the wrong scheme — produces the second
-  // while reading as the first. The header on the navigation request settles it.
+  // This is the assumption the whole file rests on: "the cookie was presented
+  // and refused" and "the cookie was never sent" look identical from the
+  // response, and a setCookie that fails quietly produces the second while
+  // reading as the first.
+  //
+  // It has to come from Network.requestWillBeSentExtraInfo rather than from
+  // request.headers(). Puppeteer's headers are the ones Chrome has at the
+  // interception point, and the network stack adds Cookie after that — so
+  // request.headers() reports no Cookie on a request that carries one, which is
+  // a false "never sent" on every attempt. Measured against a local HTTPS
+  // server that recorded what it received:
+  //
+  //   server actually received : "cf_clearance=abc123"
+  //   request.headers().cookie : (absent)
+  //   extraInfo headers.Cookie : "cf_clearance=abc123"
   let cookieSent = null;
-  page.on("request", (request) => {
-    try {
-      if (cookieSent !== null) return; // the first navigation, not the redirects
-      if (!request.isNavigationRequest() || request.frame() !== page.mainFrame()) return;
-      cookieSent = request.headers()["cookie"] || "";
-    } catch {}
-  });
+  try {
+    const cdp = await page.createCDPSession();
+    await cdp.send("Network.enable");
+    cdp.on("Network.requestWillBeSentExtraInfo", (e) => {
+      if (cookieSent !== null) return; // the first request, not the redirects
+      const h = e.headers || {};
+      cookieSent = h.Cookie ?? h.cookie ?? "";
+    });
+  } catch {
+    // Without the event there is no honest answer, and "" would read as
+    // "nothing was sent". Left null, which reports as unknown below.
+  }
 
   if (cookies.length > 0) {
     await context.setCookie(
@@ -162,17 +177,22 @@ async function attempt(browser, cookies, label) {
     .catch(() => true);
 
   const wanted = cookies.map((c) => c.name);
-  const sentNames = String(cookieSent || "")
-    .split(";")
-    .map((p) => p.split("=")[0].trim())
-    .filter(Boolean);
+  const sentNames =
+    cookieSent === null
+      ? null
+      : cookieSent
+          .split(";")
+          .map((p) => p.split("=")[0].trim())
+          .filter(Boolean);
 
   const out = {
     presented: wanted,
     // The names that were actually on the wire, and what is missing from them.
-    // A non-empty `not_sent` invalidates the attempt rather than answering it.
+    // A non-empty `not_sent` invalidates the attempt rather than answering it;
+    // null means the wire could not be observed, which is not the same as
+    // nothing having been on it.
     sent: sentNames,
-    not_sent: wanted.filter((n) => !sentNames.includes(n)),
+    not_sent: sentNames === null ? null : wanted.filter((n) => !sentNames.includes(n)),
     http_status: response ? response.status() : 0,
     challenged,
     title: await page.title().catch(() => ""),
