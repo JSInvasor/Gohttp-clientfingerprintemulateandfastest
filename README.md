@@ -890,6 +890,26 @@ no amount of work inside this package closes them:
 - **The HTTP/2 transport pings an idle connection every 15s.** That keeps dead
   connections out of the pool, but browsers have no such fixed heartbeat. It only
   shows up on connections held open between requests, not on a single fetch.
+- **A `cf_clearance` does not always travel, and `-solve` depends on it doing
+  so.** Measured against a live zone in Under Attack mode, from a datacenter
+  address: the solver earned a clearance in a real Chromium, and the same cookie
+  presented from a *fresh context of that same browser* — same address, same
+  User-Agent, same TLS — was challenged again. Presenting `cf_clearance` alone,
+  without the `cf_chl_*` bookkeeping the solve also captured, made no difference.
+  Solving inside a context and continuing in it worked; carrying the result out
+  of that context did not.
+
+  Nothing on the client side fixes that, and `solver/replay.js` is there to tell
+  you which case you are in before you spend a day assuming otherwise. When the
+  clearance does not travel, `-solve` has nothing to offer the run.
+
+  Worth separating from the fingerprint question, because they get conflated: the
+  fingerprint was verified correct on the same box, in the same hour, by the
+  fpcheck run above. The aim is not to replay a clearance — it is to not be
+  challenged, which is a question about the exit address at least as much as
+  about the client. A datacenter range is scored badly whatever it presents, and
+  repeated failed challenges from one address make the next one harder, so
+  measuring this costs the address something each time.
 
 ## Performance claims
 
