@@ -555,8 +555,10 @@ func reportLanguageSplit(header string, pageLanguages []string) {
 	}
 	fmt.Fprintf(os.Stderr, "note: the solve's Accept-Language and navigator.languages disagree —\n"+
 		"  header %q -> %v\n  navigator.languages %v\n"+
-		"  A real Chrome reports the same list in both. Check that solver/index.js is pinning the\n"+
-		"  language through Emulation.setUserAgentOverride and not the launch flag alone.\n",
+		"  A real Chrome reports the same list in both. Both halves come from one value in\n"+
+		"  solver/profile.js (expectedAcceptLanguage): --accept-lang puts it on the wire and\n"+
+		"  preparePage's shim puts it on the page. A disagreement means one of the two did not\n"+
+		"  apply — most likely the shim, since evaluateOnNewDocument fails silently.\n",
 		header, sent, pageLanguages)
 }
 

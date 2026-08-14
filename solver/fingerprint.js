@@ -37,6 +37,7 @@ import {
   TARGET_UA,
   chromiumMajor,
   connectOptions,
+  pinProcessLocale,
 } from "./profile.js";
 import {
   cleanup,
@@ -55,6 +56,11 @@ const url = process.argv[2];
 if (!url) {
   fail("usage: node solver/fingerprint.js <url> [timeout_sec]");
 }
+
+// Same locale pin the solve runs under. This file's whole contract is that it
+// measures the browser index.js drives, and the locale reaches Intl and the
+// Accept-Language header — both of which a fingerprint endpoint reports.
+pinProcessLocale();
 
 // A NaN here would reach setTimeout, which coerces it to 1ms and fires the hard
 // stop immediately; a zero would reach page.goto, where it means "no timeout at

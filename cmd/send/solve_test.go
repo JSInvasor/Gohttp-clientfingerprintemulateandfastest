@@ -559,7 +559,15 @@ func TestLanguageSplitIsReported(t *testing.T) {
 		stderr := captureStderr(t, func() {
 			reportLanguageSplit("en-US,en;q=0.9", []string{"en-US"})
 		})
-		for _, want := range []string{"en-US,en;q=0.9", "[en-US en]", "[en-US]", "setUserAgentOverride"} {
+		// The note has to name both sides and where they are supposed to come
+		// from. It used to send the reader to Emulation.setUserAgentOverride,
+		// which the solver deliberately does not use — solver/parity.test.js
+		// fails if it comes back. Both halves are built from one value in
+		// profile.js now, so that is where the note points.
+		for _, want := range []string{
+			"en-US,en;q=0.9", "[en-US en]", "[en-US]",
+			"expectedAcceptLanguage", "--accept-lang",
+		} {
 			if !strings.Contains(stderr, want) {
 				t.Errorf("the note does not mention %q:\n%s", want, stderr)
 			}

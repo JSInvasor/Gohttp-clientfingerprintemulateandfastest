@@ -56,6 +56,59 @@ func TestSolveCacheRoundTrip(t *testing.T) {
 	}
 }
 
+// The language the cookie was earned under has to survive the cache, because
+// session.go pins the replay to the seed's value only when it has one.
+//
+// It did not, so the first run replayed the header the browser actually sent and
+// every run after it — the cached ones, which is most of them — fell through to
+// -lang's raw value instead. Against a cookie earned under "de-DE,de;q=0.9" that
+// is a replay advertising a bare "de-DE": the drift the fresh path exists to
+// prevent, reappearing on the path taken by default.
+func TestSolveCacheKeepsTheLanguageTheCookieWasEarnedUnder(t *testing.T) {
+	o := cacheOptions(t)
+	res := &solveResult{
+		UserAgent:      "UA-151",
+		AcceptLanguage: "de-DE,de;q=0.9",
+		CookieList:     []solvedCookie{clearance("abc", time.Now().Add(time.Hour))},
+	}
+	storeSolveCache(o.solveCache, "https://site.test/", "", res)
+
+	e := loadSolveCache(o.solveCache, "https://site.test/", "", o.solveMaxAge)
+	if e == nil {
+		t.Fatal("a fresh entry did not load back")
+	}
+	if e.AcceptLanguage != "de-DE,de;q=0.9" {
+		t.Errorf("entry AcceptLanguage = %q, want the header the solve sent", e.AcceptLanguage)
+	}
+	if seed := seedFromCache("", e, false); seed.acceptLanguage != "de-DE,de;q=0.9" {
+		t.Errorf("seed acceptLanguage = %q, want the header the solve sent", seed.acceptLanguage)
+	}
+}
+
+// An entry written before the language was recorded still has to load, and to
+// behave the way it always did rather than claiming a language it never saw.
+func TestSolveCacheEntryWithoutALanguageStillLoads(t *testing.T) {
+	o := cacheOptions(t)
+	raw := `{"host":"site.test","proxy":"","user_agent":"UA-151",` +
+		`"cookies":[{"name":"cf_clearance","value":"abc","domain":".site.test"}],` +
+		`"solved_at":"` + time.Now().Format(time.RFC3339) + `"}`
+	if err := os.MkdirAll(o.solveCache, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(o.solveCache, solveCacheKey("https://site.test/", "")+".json")
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	e := loadSolveCache(o.solveCache, "https://site.test/", "", o.solveMaxAge)
+	if e == nil {
+		t.Fatal("an entry without a language did not load")
+	}
+	if seed := seedFromCache("", e, false); seed.acceptLanguage != "" {
+		t.Errorf("acceptLanguage = %q, want empty so session.go falls back as before", seed.acceptLanguage)
+	}
+}
+
 // The cookie is only reusable by a run presenting the same identity, and the
 // key is what enforces that. A different host or exit must miss.
 func TestSolveCacheKeyedByHostAndProxy(t *testing.T) {

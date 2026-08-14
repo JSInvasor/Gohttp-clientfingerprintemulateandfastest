@@ -643,21 +643,55 @@ replay with — `-lang`, or the library default — as `SOLVER_LANG`. Left to it
 the browser used the box's locale, so a localised image solved in one language
 and replayed in another.
 
-Pinning it takes two mechanisms, because the header and the page object are set
-in different places. `--accept-lang` and `--lang` fix the header from process
-start. They do not move `navigator.languages` at all — measured on Chromium 141,
-a fresh profile reports `["en-US"]` whether the flag says `en-US`, `en-US,en` or
-nothing — so the page object is set through
-`Emulation.setUserAgentOverride`'s `acceptLanguage`, in the same call that
-carries the User-Agent and the Client Hints. That is the one mechanism that moves
-both halves together, and it does it from inside the browser: no own property on
-`navigator`, and the getter still reads `[native code]`.
+The language shows in four places, and all four have to say the same thing:
 
-Both take the *preference list* (`en-US,en`), never a finished header. Handed
-`en-US,en;q=0.9`, the flag emits `en-US,en;q=0.9,en;q=0.9;q=0.8` on Chrome 151
-and the override reports `navigator.languages == ["en-US", "en;q=0.9"]` — a
-q-value inside a language tag. `preferenceList` in `solver/profile.js` is the
-one place that conversion happens.
+| where | who reads it | set by |
+|---|---|---|
+| the `Accept-Language` header | the edge | `--accept-lang` |
+| `navigator.languages` | the challenge's own JavaScript | the shim in `solver/identity.js` |
+| `Intl`'s resolved locale | the same JavaScript | `LC_ALL`, via `pinProcessLocale` |
+| the seed the run replays with | the edge, on every later request | `acceptLanguageOf` |
+
+They are all derived from one value — `expectedAcceptLanguage` in
+`solver/profile.js` — because they were derived from three, and on any box that
+is not `en_US` the three disagreed. The header followed the machine's locale
+while the page object asserted `SOLVER_LANG`, so a `tr_TR` image sent
+`Accept-Language: tr-TR,tr;q=0.9` and told the challenge it was
+`["en-US", "en"]`. Both checks meant to catch that were fed the asked-for value
+rather than the sent one, so they compared it against itself and agreed every
+time.
+
+The flag carries the *primary tag only*, because everything after it is
+discarded. Measured on Chromium 141.0.7390.37, one run per row:
+
+| `--accept-lang` | header sent | `navigator.languages` |
+|---|---|---|
+| *(absent, `en_US` box)* | `en-US,en;q=0.9` | `["en-US"]` |
+| *(absent, `tr_TR` box)* | `tr-TR,tr;q=0.9` | `["tr-TR"]` |
+| `en-US` | `en-US,en;q=0.9` | `["en-US"]` |
+| `en-US,en,de` | `en-US,en;q=0.9` | `["en-US"]` |
+| `tr-TR,en-US,en` | `tr-TR,tr;q=0.9` | `["tr-TR"]` |
+| `pt-BR` | `pt-BR,pt;q=0.9` | `["pt-BR"]` |
+| `de,en` | `de` | `["de"]` |
+
+Two things fall out of that. A list is not reproducible on the wire, so
+promising one is a lie — `-lang "tr-TR,tr;q=0.9,en;q=0.8"` solves and replays as
+`tr-TR,tr;q=0.9`, and `send` says so. And the browser never lists the base
+language the header advertises at `q=0.9`, which is what the shim is for. Never
+hand the flag a finished header: given `en-US,en;q=0.9` Chrome 151 emits
+`en-US,en;q=0.9,en;q=0.9;q=0.8` — a q-value inside a language tag.
+
+`Intl` is the one no flag reaches. It answers from ICU, and ICU reads `LC_ALL`,
+not the accept-languages preference. On a `tr_TR` box with `--accept-lang=en-US`
+the header says `en-US` and `Intl.DateTimeFormat().resolvedOptions().locale`
+still says `tr`; pinning `LC_ALL` closes it, and it does not need the locale to
+be generated on the box — measured on an image whose `locale -a` lists only `C`,
+`C.utf8` and `POSIX`. `SOLVER_PIN_LOCALE=0` opts out.
+
+On the configuration this was originally validated on — an `en_US` box, the
+default language — every one of these is a measured no-op: header, page object
+and `Intl` are byte-identical with the flag and without it. It is off that
+configuration that they stop being one.
 
 Getting this wrong is quiet and it is not cosmetic: a browser advertising
 `en-US,en;q=0.9` while its page object lists only `en-US` is a client no
@@ -974,10 +1008,29 @@ no amount of work inside this package closes them:
   | `send -solve` on the branch before the solver was rewritten, live UAM zone, VPS address | **200**, 113/113 requests |
   | `send -solve` on the rewritten branch, same target and address | 403, managed challenge |
 
-  A real difference, and still unexplained. Three regressions found while
-  looking for it are fixed — a `navigator.languages` contradiction, a challenge
-  detector that read cleared pages as challenged, and session-bound cookies
-  being replayed — and none of them accounts for it.
+  A real difference, and still unexplained. The regressions found while looking
+  for it are fixed, and none of them accounts for it:
+
+  - a `navigator.languages` contradiction, and then a second one of the same
+    shape: with the launch flags removed the header followed the box's locale
+    while the shim asserted `SOLVER_LANG`, so the two agreed only on an `en_US`
+    image. Both checks written to catch that were reading the asked-for value
+    rather than the sent one, so neither could ever fire.
+  - a challenge detector that read cleared pages as challenged.
+  - session-bound cookies being replayed.
+  - a batch exiting on top of its own results: `process.exit(0)` one statement
+    after the last write, with stdout a pipe. Measured against a reader one
+    second behind, 168 of 200 result lines were lost — every one of them a
+    solved exit reported to `send` as "the solver exited without reporting this
+    exit".
+  - an attempt that earned a `cf_clearance` and then threw on the way out —
+    which is what `page.goto` does when the challenge navigates the frame out
+    from under it — reporting `status: "error"` with the cookie discarded.
+
+  The last two are single-exit-invisible or batch-only, so neither is a
+  candidate for the A/B above; the language one is invisible on an `en_US` box,
+  which is where the A/B was run. None of this closes the gap. It is listed so
+  the next person looking does not re-find them.
 
   Worth separating from the fingerprint question, because they get conflated:
   the aim is not to replay a clearance, it is to not be challenged, which is a

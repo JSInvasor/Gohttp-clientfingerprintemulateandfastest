@@ -27,6 +27,24 @@ import path from "node:path";
 const here = import.meta.dirname;
 const read = (...p) => fs.readFileSync(path.join(here, ...p), "utf8");
 
+// The reference used to be read out of workingBrowsers/, which is no longer in
+// the tree. Reading a deleted directory is not a weaker check, it is no check:
+// this test failed with ENOENT on every run, which is the same as not having
+// been written.
+//
+// So the reference is transcribed here instead. This is the complete set of
+// page-facing calls in workingBrowsers/index.js at 29f044c^, the last commit
+// that carried it; `git show 29f044c^:workingBrowsers/index.js` is the original
+// if it ever needs re-deriving.
+const WORKING_VERSION_PAGE_CALLS = new Set([
+  "page.setUserAgent",
+  "page.evaluateOnNewDocument",
+  "page.title",
+  "page.goto",
+  "page.evaluate",
+  "page.url",
+]);
+
 // Comments are prose about page APIs — this file's own subject — so they have to
 // go before anything counts calls.
 function code(text) {
@@ -57,14 +75,12 @@ const ALLOWED_EXTRA = new Map([
 ]);
 
 test("the solve presents nothing to the page that the working version does not", () => {
-  const theirs = pageCalls(read("..", "workingBrowsers", "index.js"));
+  const theirs = WORKING_VERSION_PAGE_CALLS;
   const ours = new Set([
     ...pageCalls(read("index.js")),
     ...pageCalls(read("identity.js")),
     ...pageCalls(read("behavior.js")),
   ]);
-
-  assert.ok(theirs.size > 0, "no page calls found in workingBrowsers/index.js");
 
   const extra = [...ours].filter((c) => !theirs.has(c) && !ALLOWED_EXTRA.has(c));
   assert.deepEqual(

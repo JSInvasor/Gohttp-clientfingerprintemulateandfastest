@@ -38,6 +38,20 @@ type solveCacheEntry struct {
 	// written before this was recorded, which reads back as 0 — "not measured",
 	// which the check skips rather than treats as a match.
 	ChromiumMajor int `json:"chromium_major,omitempty"`
+
+	// AcceptLanguage is the header the browser sent on the request that earned
+	// these cookies, and it belongs in the entry for the same reason the UA does.
+	//
+	// It was not stored, so a cached solve came back with an empty one, and
+	// session.go only pins the seed's language when it is non-empty — a run that
+	// reused a solve fell through to -lang's raw value instead. `-lang de-DE`
+	// replayed a bare `de-DE` against a cookie earned under `de-DE,de;q=0.9`:
+	// the same drift the fresh path takes care to avoid, reappearing on the path
+	// that is taken every time after the first.
+	//
+	// Empty in entries written before this was recorded, which reads back the
+	// way it always behaved.
+	AcceptLanguage string `json:"accept_language,omitempty"`
 }
 
 // solveCacheKey identifies a reusable solve. The UA is not in the key: it is
@@ -101,12 +115,13 @@ func storeSolveCache(path, target, proxy string, res *solveResult) {
 		host = u.Host
 	}
 	e := solveCacheEntry{
-		Host:          host,
-		Proxy:         proxy,
-		UserAgent:     res.UserAgent,
-		Cookies:       res.CookieList,
-		SolvedAt:      time.Now(),
-		ChromiumMajor: res.ChromiumMajor,
+		Host:           host,
+		Proxy:          proxy,
+		UserAgent:      res.UserAgent,
+		AcceptLanguage: res.AcceptLanguage,
+		Cookies:        res.CookieList,
+		SolvedAt:       time.Now(),
+		ChromiumMajor:  res.ChromiumMajor,
 	}
 	for _, c := range res.CookieList {
 		if c.Name == "cf_clearance" && c.Expires > 0 {
@@ -141,8 +156,8 @@ func seedFromCache(proxy string, e *solveCacheEntry, keepAll bool) *solveSeed {
 	logSolve(proxy, "reusing the solve from %s ago (expires in %s) — "+
 		"pass -solve-refresh to earn a new one\nseeding %s", age, left, cookieNames(kept))
 
-	seed := &solveSeed{proxy: proxy, userAgent: e.UserAgent, chromiumMajor: e.ChromiumMajor,
-		expiresAt: e.ExpiresAt}
+	seed := &solveSeed{proxy: proxy, userAgent: e.UserAgent, acceptLanguage: e.AcceptLanguage,
+		chromiumMajor: e.ChromiumMajor, expiresAt: e.ExpiresAt}
 	for _, c := range kept {
 		seed.cookies = append(seed.cookies, c.Name+"="+c.Value)
 	}

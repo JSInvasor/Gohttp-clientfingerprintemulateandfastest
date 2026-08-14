@@ -20,7 +20,22 @@
 // clearance" on every run it ever made, including the ones written up as a
 // finding. One module means there is no second place to forget it.
 
-import { TARGET_LANG, TARGET_UA, languageList, userAgentMetadata } from "./profile.js";
+import {
+  TARGET_LANG,
+  TARGET_UA,
+  expectedAcceptLanguage,
+  languageList,
+  userAgentMetadata,
+} from "./profile.js";
+
+// The one language value everything on this side is built from: the header the
+// browser will actually put on the wire, given the --accept-lang in LAUNCH_ARGS.
+//
+// The shim below and acceptLanguageOf() both read it, so the page object, the
+// wire and the seed gofire replays with cannot disagree with each other. They
+// used to: the header came from the box's locale and the other two came from
+// SOLVER_LANG.
+const SENT_LANG = expectedAcceptLanguage(TARGET_LANG);
 
 // preparePage puts the gofire-matching identity on a page before it navigates.
 //
@@ -75,29 +90,44 @@ export async function preparePage(page, chromiumVersion) {
   // ships until there is a live A/B saying otherwise. A better mechanism that
   // does not pass is not better.
   //
-  // The one liberty taken is reading the list from TARGET_LANG instead of the
-  // literal ["en-US", "en"]. For the default SOLVER_LANG the two are the same
-  // array, so nothing observable changes; on a localised run it is the
-  // difference between agreeing with the browser's own header and contradicting
-  // it.
+  // The one liberty taken is reading the list from the header the browser will
+  // send instead of the literal ["en-US", "en"]. On the default SOLVER_LANG the
+  // two are the same array, so nothing observable changes.
+  //
+  // It is derived from the *sent* header rather than from SOLVER_LANG, and that
+  // is the fix rather than a detail. SOLVER_LANG is what was asked for;
+  // everything past the first tag of it is discarded by the browser, so a shim
+  // built from it advertises languages the header does not carry. Measured on
+  // Chromium 141: --accept-lang=tr-TR,en-US,en sends `tr-TR,tr;q=0.9`, and a
+  // page claiming ["tr-TR","en-US","en"] beside it is a contradiction of the
+  // same kind this shim exists to remove.
   await page.evaluateOnNewDocument((languages) => {
     try {
       Object.defineProperty(navigator, "languages", {
         get: () => languages,
       });
     } catch {}
-  }, languageList(TARGET_LANG));
+  }, languageList(SENT_LANG));
 }
 
 // acceptLanguageOf reports the language this solve advertised, for the seed the
 // Go side replays with.
 //
-// It is the configured value rather than an observed one. Watching the wire —
-// a page.on("request") listener reading the navigation request's headers — is
-// one more thing the working version does not do, and this branch has run out
-// of credit for changes that "cannot possibly matter". The launch flags that
-// would have made the two diverge are gone with it, so the configured value and
-// the sent value are the same thing again.
+// It is derived rather than observed, because observing it means a
+// page.on("request") listener and the working version does not have one. What
+// changed is what it derives from. It used to return TARGET_LANG — the value
+// that was *asked for* — and that made it wrong twice over:
+//
+//   - with no --accept-lang the browser sent the box's locale, so on any image
+//     that is not en_US the reported header was simply not the one sent, and the
+//     cookie was replayed under a language its own session never advertised.
+//   - send's reportLanguageDrift and reportLanguageSplit are the checks for
+//     exactly that, and both were being handed the asked-for value. They
+//     compared it against itself and agreed every time. The instrument that
+//     would have caught this was blind by construction.
+//
+// Now the flag pins the header and this reports what the flag produces, so the
+// two are the same thing for a real reason rather than by luck of the locale.
 export function acceptLanguageOf(_page) {
-  return TARGET_LANG;
+  return SENT_LANG;
 }

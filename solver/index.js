@@ -15,12 +15,18 @@
 //                  cf_clearance is bound to the issuing IP, so a cookie earned
 //                  here and replayed from a different exit is dead on arrival.
 //   SOLVER_LANG    the Accept-Language to solve with, e.g. "en-US,en;q=0.9".
-//                  `send` passes whatever the run will replay with. Left unset
-//                  the browser used the box's locale, which on a localised image
-//                  is a language the replay never asks for. It reaches the
-//                  header through --accept-lang and navigator.languages through
-//                  preparePage's pinLanguage; both are needed, and only the
-//                  second one is detectable from inside the page.
+//                  `send` passes whatever the run will replay with. Only its
+//                  first tag survives — Chromium derives the header from that
+//                  alone — and the value it derives reaches all four places the
+//                  language shows: the header (--accept-lang), the page object
+//                  (preparePage's shim), Intl (pinProcessLocale) and the seed
+//                  gofire replays with (acceptLanguageOf). Left unset the
+//                  browser used the box's locale, which on a localised image is
+//                  a language the replay never asks for and the page object
+//                  openly contradicted.
+//   SOLVER_PIN_LOCALE=0
+//                  do not touch LANG/LC_ALL; let the box's own locale reach
+//                  Intl. See profile.js for what that costs.
 //   SOLVER_UA, SOLVER_SEC_CH_UA, SOLVER_PLATFORM
 //                  re-pin the identity when solving from a box whose OS or
 //                  Chrome major differs; see profile.js.
@@ -41,7 +47,10 @@
 //     "chromium_major": <int>,
 //     "proxy": "<host:port>",                 // "" when solved direct
 //     "launch_ms": <int>,                     // browser startup, out of the budget
-//     "error": "<message>" }                  // only on error
+//     "error": "<message>" }                  // why the attempt ended early. Set
+//                                             // on "error", and also beside a
+//                                             // usable result an attempt threw
+//                                             // its way out of — see attempt().
 //
 // Design (one-shot, no server):
 //   - puppeteer-real-browser launches a real Chromium with stealth patches.
@@ -64,15 +73,14 @@
 
 import { connect } from "puppeteer-real-browser";
 import {
-  TARGET_LANG,
   TARGET_UA,
   connectOptions,
   parseProxyURL,
+  pinProcessLocale,
   userAgentMetadata,
   chromiumMajor as parseChromiumMajor,
 } from "./profile.js";
 import {
-  cleanup,
   errorMessage,
   installExitHandlers,
   trackBrowser,
@@ -85,6 +93,8 @@ import { acceptLanguageOf, preparePage } from "./identity.js";
 import { detectChallengeInPage, isChallengeTitle } from "./challenge.js";
 import { withDeadline } from "./deadline.js";
 import { parseJobs, readAll } from "./jobs.js";
+import { betterResult, exhaustedResult, statusAfterThrow } from "./results.js";
+import { exitAfterFlush } from "./flush.js";
 
 const MAX_ATTEMPTS = 2;
 // 75 was too small on a real box. Chromium under Xvfb takes ~20s to come up,
@@ -132,6 +142,16 @@ function parseTimeoutSec(raw) {
 }
 
 const TIMEOUT_MS = Math.round(parseTimeoutSec(ARGV[1]) * 1000);
+
+// The locale the browser will inherit, set before anything can launch one.
+//
+// --accept-lang reaches the header and navigator.languages; it does not reach
+// Intl, which answers from ICU, which reads LC_ALL. Without this a solve on a
+// localised box advertised en-US on the wire and answered "tr" to
+// Intl.DateTimeFormat().resolvedOptions().locale — the same contradiction the
+// shim in identity.js exists to remove, one property further along. See
+// profile.js for the measurement, and SOLVER_PIN_LOCALE=0 to opt out.
+pinProcessLocale();
 
 // Client Hints are built once, up front: userAgentMetadata() throws when the
 // pinned UA and sec-ch-ua disagree, and finding that out after a 75-second
@@ -210,26 +230,14 @@ function emit(result) {
 // and printed a *second* JSON line, and a caller reading the last line saw
 // "watchdog timeout" instead of the real cause.
 //
-// The write callback is what makes this safe: process.exit() truncates pending
-// stdout on a pipe, which is exactly how this is invoked.
+// exitAfterFlush is what makes this safe: process.exit() truncates pending
+// stdout on a pipe, which is exactly how this is invoked. In a batch that
+// includes every emit() still queued ahead of this line, since stream writes
+// complete in order.
 function finish(result, code = 0) {
   if (finished) return;
   finished = true;
-  const line = JSON.stringify(result) + "\n";
-  try {
-    process.stdout.write(line, () => {
-      cleanup();
-      process.exit(code);
-    });
-  } catch {
-    cleanup();
-    process.exit(code);
-  }
-  // Backstop for a stdout that never drains (a closed pipe, a full buffer).
-  setTimeout(() => {
-    cleanup();
-    process.exit(code);
-  }, 2000).unref();
+  exitAfterFlush(code, JSON.stringify(result) + "\n");
 }
 
 
@@ -536,14 +544,20 @@ async function attempt(newSession, attemptNum, attemptDeadline) {
     // Harvest before giving up. A navigation timeout or a deadline hit is not a
     // reason to throw away cookies the challenge page already set — a run whose
     // goto timed out reported nothing at all, when the jar held the challenge's
-    // own cookies. The error is still what the status reports; the cookies ride
-    // along so the caller and solveExit()'s best-attempt pick can use them.
+    // own cookies. The cookies ride along so the caller and solveExit()'s
+    // best-attempt pick can use them.
     const salvaged = session
       ? await harvest(session.jar, session.page).catch(() => null)
       : null;
     return {
       ...(salvaged || {}),
-      status: "error",
+      // A salvage that found a cf_clearance is a solve, and it used to be
+      // reported as a failure. See statusAfterThrow.
+      //
+      // The error is kept beside the status rather than instead of it. Nothing
+      // reads it on a successful line, and throwing it away would lose the only
+      // record of why the attempt ended early.
+      status: statusAfterThrow(salvaged),
       error: errorMessage(err),
       chromiumVersion,
       chromiumMajor,
@@ -558,19 +572,6 @@ async function attempt(newSession, attemptNum, attemptDeadline) {
       } catch {}
     }
   }
-}
-
-// betterResult ranks two attempts: a clearance beats anything, then more
-// cookies, then anything at all over an error. It exists so the retry is a
-// second chance rather than a replacement.
-function rankResult(r) {
-  if (!r) return -1;
-  if (r.status === "ok") return 1_000_000;
-  return (r.cookie_list || []).length;
-}
-
-function betterResult(a, b) {
-  return rankResult(b) > rankResult(a) ? b : a || b;
 }
 
 // solveExit works one exit to a conclusion and returns the result object.
@@ -612,7 +613,7 @@ async function solveExit(newSession, budgetMs, proxyLabel) {
         status: "ok",
         url: r.url,
         user_agent: r.user_agent,
-        accept_language: r.accept_language || TARGET_LANG,
+        accept_language: r.accept_language || acceptLanguageOf(),
         page_languages: r.page_languages || [],
         cookies: r.cookies,
         cookie_list: r.cookie_list,
@@ -642,21 +643,14 @@ async function solveExit(newSession, budgetMs, proxyLabel) {
     proxy: proxyLabel,
     launch_ms: (lastResult && lastResult.launchMs) || 0,
   };
-  if (lastResult && lastResult.status === "no_clearance") {
-    return {
-      status: "no_clearance",
-      url: lastResult.url || url,
-      user_agent: lastResult.user_agent || TARGET_UA,
-      accept_language: lastResult.accept_language || TARGET_LANG,
-      page_languages: lastResult.page_languages || [],
-      cookies: lastResult.cookies || "",
-      cookie_list: lastResult.cookie_list || [],
-      ...base,
-    };
-  }
+  // Anything the attempts collected is reported, whichever way they ended — see
+  // exhaustedResult for what that replaced and why it mattered.
   return {
-    status: "error",
-    error: (lastResult && lastResult.error) || "solve failed",
+    ...exhaustedResult(lastResult, {
+      url,
+      userAgent: TARGET_UA,
+      acceptLanguage: acceptLanguageOf(),
+    }),
     ...base,
   };
 }
@@ -729,8 +723,7 @@ async function solveBatch(job) {
   } catch {}
   untrackBrowser(shared.browser);
 
-  cleanup();
-  process.exit(0);
+  exitAfterFlush(0);
 }
 
 // proxyLabel names an exit without its credentials, the same way the Go side

@@ -34,7 +34,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { connect } from "puppeteer-real-browser";
-import { connectOptions } from "./profile.js";
+import { connectOptions, pinProcessLocale } from "./profile.js";
 import { preparePage } from "./identity.js";
 import { simulateHumanBehavior } from "./behavior.js";
 import { explain, verdict } from "./verdict.js";
@@ -119,6 +119,11 @@ function cookiesFromCache(target) {
 }
 
 installExitHandlers();
+
+// The same locale the solve ran under, for the same reason preparePage is called
+// below: this file measures whether a cookie is replayable, and a replay under a
+// different locale than the solve is not the measurement it claims to be.
+pinProcessLocale();
 
 const entry = cookiesFromCache(url);
 

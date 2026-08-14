@@ -108,11 +108,9 @@ export function primaryLanguage(header) {
   return languageList(header)[0] || "";
 }
 
-// preferenceList turns an Accept-Language header into what --accept-lang and
-// CDP's Emulation.setUserAgentOverride both want, which is not an
-// Accept-Language header: the language *preference list*, the codes in order
-// with no quality values. Chromium generates the header from it, and
-// navigator.languages reports it back almost verbatim.
+// preferenceList turns an Accept-Language header into what --accept-lang wants,
+// which is not an Accept-Language header: the language *preference list*, the
+// codes in order with no quality values.
 //
 // Handing it a finished header instead makes it read the q-values as part of the
 // codes. Measured against Chrome 151.0.7922.108 with
@@ -126,22 +124,103 @@ export function primaryLanguage(header) {
 //   accept-language: en-US,en;q=0.9;q=0.9
 //   navigator.languages: ["en-US", "en;q=0.9"]
 //
-// So: codes only. What is emphatically *not* dropped is a tag implied by an
-// earlier one — "en" after "en-US". This used to remove it, on the reasoning
-// that Chrome re-adds the base language when it builds the header. It does, and
-// that is why the bug was invisible on the wire and expensive off it. Measured,
-// Chromium 141, one value per row:
-//
-//   preference list   header sent      navigator.languages
-//   en-US             en-US,en;q=0.9   ["en-US"]
-//   en-US,en          en-US,en;q=0.9   ["en-US", "en"]
-//
-// Identical headers, different page objects — and ["en-US"] beside a header
-// advertising "en" is a contradiction no ordinary Chrome shows, on the one
-// request that earns cf_clearance. The list is passed through whole so the two
-// halves agree.
+// So: codes only. Nothing here builds the flag from this any more —
+// primaryLanguage does, for the reason expectedAcceptLanguage records — but the
+// shape is still what the flag takes, and the two measurements above are the
+// reason a header must never be handed to it.
 export function preferenceList(header) {
   return languageList(header).join(",");
+}
+
+// expectedAcceptLanguage is the header Chromium will actually send once
+// --accept-lang is set to primaryLanguage(header).
+//
+// It exists because everything else in this solver was keyed off the *asked for*
+// value while the browser sent something else entirely, and the checks meant to
+// catch that were fed the asked-for value too — so they could never fire. Three
+// separate things have to agree on one request, and until now they agreed only
+// on an en_US box:
+//
+//   the Accept-Language header      the edge reads it
+//   navigator.languages             the challenge's JavaScript reads it
+//   what the solve reports back     gofire replays the cookie with it
+//
+// The browser does not send a preference list back verbatim. Measured against
+// Chromium 141.0.7390.37, one row per run, LANG/LC_ALL varied:
+//
+//   --accept-lang        header sent        navigator.languages
+//   (absent), en_US box  en-US,en;q=0.9     ["en-US"]
+//   (absent), tr_TR box  tr-TR,tr;q=0.9     ["tr-TR"]
+//   en-US                en-US,en;q=0.9     ["en-US"]
+//   en-US,en             en-US,en;q=0.9     ["en-US"]
+//   en-US,en,de          en-US,en;q=0.9     ["en-US"]
+//   tr-TR,en-US,en       tr-TR,tr;q=0.9     ["tr-TR"]
+//   de,en                de                 ["de"]
+//   pt-BR                pt-BR,pt;q=0.9     ["pt-BR"]
+//   es-419               es-419,es;q=0.9    ["es-419"]
+//
+// Two things fall out of that table and both were being got wrong. Everything
+// after the first entry is discarded — a list is not reproducible on the wire,
+// so promising one is a lie. And the header is derived: a tag carrying a region
+// gains its base language at q=0.9, a bare tag stands alone.
+//
+// So this is the single value the flag, the shim and the report are all built
+// from, and they cannot drift from each other by construction. Whether a future
+// Chromium changes the derivation is the one unknown left, and it is the one
+// send's reportLanguageDrift already exists to name.
+export function expectedAcceptLanguage(header) {
+  const primary = primaryLanguage(header);
+  if (!primary) return "";
+  const base = primary.split("-")[0];
+  return base && base !== primary ? `${primary},${base};q=0.9` : primary;
+}
+
+// localeEnv is the process locale a browser speaking this language would run
+// under, for the half of the identity no launch flag reaches.
+//
+// --accept-lang moves the header and navigator.languages. It does not move ICU,
+// which is what Intl answers from, and ICU follows LC_ALL/LANG. Measured on the
+// same Chromium, tr_TR box throughout:
+//
+//   flags / env                              header          languages    Intl
+//   (none)                                   tr-TR,tr;q=0.9  ["tr-TR"]    tr
+//   --accept-lang=en-US                      en-US,en;q=0.9  ["en-US"]    tr
+//   --accept-lang=en-US --lang=en-US         en-US,en;q=0.9  ["en-US"]    tr
+//   --accept-lang=en-US  LC_ALL=en_US.UTF-8  en-US,en;q=0.9  ["en-US"]    en-US
+//
+// --lang buys nothing here, which is why it is not in the launch list. The
+// environment is what closes it, and it does not need the locale to be generated
+// on the box: this was measured on an image whose `locale -a` lists only C,
+// C.utf8 and POSIX, and Chromium still answered Intl "en-US" — ICU carries its
+// own data and reads the variable directly.
+export function localeEnv(header) {
+  const primary = primaryLanguage(header);
+  if (!primary) return null;
+  const posix = primary.replace(/-/g, "_");
+  return {
+    LANG: `${posix}.UTF-8`,
+    LC_ALL: `${posix}.UTF-8`,
+    LANGUAGE: languageList(header)
+      .map((tag) => tag.replace(/-/g, "_"))
+      .join(":"),
+  };
+}
+
+// pinProcessLocale applies localeEnv() to this process, so the Chromium it
+// launches inherits it.
+//
+// Called explicitly by each entry point rather than run on import: a module that
+// rewrites the environment merely by being imported would do it to the test
+// runner too, and the point of this file is that its effects are inspectable.
+//
+// SOLVER_PIN_LOCALE=0 leaves the box alone, for anyone who wants the machine's
+// own locale to reach the browser and has read the table above.
+export function pinProcessLocale(env = process.env) {
+  if (env.SOLVER_PIN_LOCALE === "0") return null;
+  const locale = localeEnv(TARGET_LANG);
+  if (!locale) return null;
+  Object.assign(env, locale);
+  return locale;
 }
 
 // LAUNCH_ARGS and CONNECT_OPTIONS are shared so the fingerprint probe measures
@@ -173,27 +252,36 @@ export const LAUNCH_ARGS = [
   // to an explicit software renderer and only invites the two to disagree.
   "--use-gl=angle",
   "--use-angle=swiftshader",
-  // No --accept-lang and no --lang, which is the one thing about this list worth
-  // explaining, because both were here and both were removed again.
+  // --accept-lang, which was here, was removed, and is back — this time with the
+  // measurement that decides it rather than an argument about parity.
   //
-  // They were added to stop the solve advertising the box's locale while gofire
-  // replayed with its own default — a real problem on a localised image, and
-  // nothing at all on an en-US one. Measured on Chromium 141 they move the
-  // header and nothing else: a fresh profile reports navigator.languages
-  // ["en-US"] whether the flag says en-US, en-US,en, or is absent.
+  // It was removed because the version of this solver that passes a live Under
+  // Attack zone does not set it, and because it looked like a no-op. It is a
+  // no-op, on exactly one configuration: an en_US box. Measured on Chromium
+  // 141.0.7390.37, en_US box, with the flag and without it —
   //
-  // So on the default they are a no-op, which is exactly what makes them worth
-  // removing rather than keeping. The version of this solver that passes a live
-  // Under Attack zone from a datacenter address does not set them, this one did,
-  // and after three wrong theories about which of the differences was harmless
-  // the remaining ones are not being defended on argument. A launch flag that
-  // demonstrably changes nothing on the configuration people actually run is the
-  // cheapest of them to give up.
+  //   header en-US,en;q=0.9   navigator.languages ["en-US"]   Intl en-US
   //
-  // SOLVER_LANG still reaches the page through preparePage's shim, and reaches
-  // gofire through the seed, so the two halves of the handover still agree.
-  // Someone solving from a tr_TR box should set the locale, or set SOLVER_LANG
-  // and put these back knowing what they cost.
+  // byte-identical either way. So on the configuration the working version was
+  // validated on, adding this changes nothing a page or the edge can see, which
+  // is the whole of the parity rule.
+  //
+  // Off that configuration it is not a no-op, and what it removes is a
+  // contradiction rather than a preference. Without it the header follows the
+  // box's locale while preparePage's shim asserts navigator.languages from
+  // SOLVER_LANG — so a tr_TR box sent `Accept-Language: tr-TR,tr;q=0.9` while
+  // telling the challenge's own JavaScript it was ["en-US", "en"]. A browser
+  // advertising one language on the wire and listing another in the page object
+  // is not a browser that exists, and it was doing it on the one request that
+  // earns cf_clearance.
+  //
+  // primaryLanguage, not preferenceList: everything after the first tag is
+  // discarded by the browser, so passing more of them promises a header that
+  // will not be sent. See expectedAcceptLanguage for the table.
+  //
+  // --lang is still absent, and now for a measured reason rather than parity: it
+  // moves neither the header nor Intl. pinProcessLocale is what reaches Intl.
+  ...(primaryLanguage(TARGET_LANG) ? [`--accept-lang=${primaryLanguage(TARGET_LANG)}`] : []),
 ];
 
 export const CONNECT_OPTIONS = {

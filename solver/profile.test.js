@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import fs from "node:fs";
-import path from "node:path";
 
 import {
   LAUNCH_ARGS,
   TARGET_LANG,
+  expectedAcceptLanguage,
   languageList,
+  localeEnv,
   parseProxyURL,
+  pinProcessLocale,
   preferenceList,
   primaryLanguage,
 } from "./profile.js";
@@ -35,41 +36,135 @@ test("primaryLanguage is what --lang takes", () => {
   assert.equal(primaryLanguage(""), "");
 });
 
-// The launch list must stay exactly what the working solver launches with.
+// The launch list is what the solver that passes a live zone launches with, plus
+// exactly one flag whose absence was a bug.
 //
-// Two language flags lived here and are gone. They were a no-op on the default
-// configuration — measured on Chromium 141, navigator.languages reports
-// ["en-US"] whether --accept-lang says en-US, en-US,en, or is absent — and the
-// version of this solver that passes a live Under Attack zone does not set them.
-// After three wrong theories about which difference was harmless, "changes
-// nothing measurable and the working version does not have it" is enough to
-// remove something.
-//
-// Pinned against workingBrowsers/profile.js, which is that version, so this
-// fails if either side drifts rather than only when someone remembers to look.
+// It used to be read out of workingBrowsers/profile.js, which is no longer in the
+// tree — so the assertion had been failing with ENOENT rather than checking
+// anything. The reference is transcribed here instead; `git show
+// 29f044c^:workingBrowsers/profile.js` is the original.
+const WORKING_VERSION_LAUNCH_ARGS = [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-blink-features=AutomationControlled",
+  "--no-first-run",
+  "--no-default-browser-check",
+  "--disable-features=IsolateOrigins,site-per-process",
+  "--window-size=1920,1080",
+  "--use-gl=angle",
+  "--use-angle=swiftshader",
+];
+
 test("the launch flags match the solver that passes a live zone", () => {
-  const reference = fs.readFileSync(
-    path.join(import.meta.dirname, "..", "workingBrowsers", "profile.js"),
-    "utf8"
+  // Everything the working version has, in its order, unchanged.
+  assert.deepEqual(
+    LAUNCH_ARGS.filter((a) => !a.startsWith("--accept-lang=")),
+    WORKING_VERSION_LAUNCH_ARGS
   );
-  const theirs = [...reference.matchAll(/^\s*"(--[^"]+)",?\s*$/gm)].map((m) => m[1]);
 
-  assert.ok(theirs.length > 0, "no launch flags found in workingBrowsers/profile.js");
-  assert.deepEqual(LAUNCH_ARGS, theirs);
-
-  // Named explicitly, because the whole point is that these two are absent.
-  for (const flag of ["--accept-lang", "--lang"]) {
-    assert.ok(
-      !LAUNCH_ARGS.some((a) => a.startsWith(flag + "=")),
-      `${flag} is back in the launch list; the version that passes does not set it`
-    );
-  }
+  // --lang stays out. Measured on Chromium 141.0.7390.37 from a tr_TR box it
+  // moves neither the Accept-Language header nor Intl's resolved locale, so it
+  // is a difference from the working version that buys nothing.
+  assert.ok(
+    !LAUNCH_ARGS.some((a) => a.startsWith("--lang=")),
+    "--lang is back in the launch list; it changes nothing the page can see"
+  );
 });
 
-// The language still has to reach the page, now that no flag carries it. It goes
-// through the shim in identity.js, and this is the value it hands over.
-test("the pinned language reaches the page as the list navigator.languages takes", () => {
-  assert.deepEqual(languageList(TARGET_LANG), ["en-US", "en"]);
+// --accept-lang is the one addition, and this pins both halves of why it is safe.
+//
+// On the configuration the working version was validated on — an en_US box, the
+// default SOLVER_LANG — it is a measured no-op: header en-US,en;q=0.9,
+// navigator.languages ["en-US"], Intl en-US, with the flag and without it. Off
+// that configuration it is what stops the header following the box's locale while
+// the shim asserts something else.
+//
+// It carries the primary tag only, because everything after the first tag is
+// discarded by the browser; passing more promises a header that is not sent.
+test("--accept-lang carries the primary tag of the language being solved with", () => {
+  const flag = LAUNCH_ARGS.find((a) => a.startsWith("--accept-lang="));
+  assert.ok(flag, "--accept-lang is missing; the header follows the box's locale without it");
+  assert.equal(flag, `--accept-lang=${primaryLanguage(TARGET_LANG)}`);
+  assert.equal(flag, "--accept-lang=en-US", "the default pin moved");
+  assert.ok(
+    !/;q=/.test(flag),
+    "--accept-lang was handed a header rather than a preference list; " +
+      "Chrome 151 answered that with `en-US,en;q=0.9,en;q=0.9;q=0.8`"
+  );
+});
+
+// The header the browser derives from that flag, which is the value the shim and
+// the report are both built from. Measured on Chromium 141.0.7390.37, one run per
+// row, with LANG/LC_ALL varied to prove the flag rather than the locale decides:
+//
+//   --accept-lang        header sent        navigator.languages
+//   en-US                en-US,en;q=0.9     ["en-US"]
+//   en-US,en             en-US,en;q=0.9     ["en-US"]
+//   en-US,en,de          en-US,en;q=0.9     ["en-US"]
+//   tr-TR,en-US,en       tr-TR,tr;q=0.9     ["tr-TR"]
+//   de,en                de                 ["de"]
+//   pt-BR                pt-BR,pt;q=0.9     ["pt-BR"]
+//   es-419               es-419,es;q=0.9    ["es-419"]
+//   tr                   tr                 ["tr"]
+test("expectedAcceptLanguage is the header the browser derives, not the one asked for", () => {
+  assert.equal(expectedAcceptLanguage("en-US,en;q=0.9"), "en-US,en;q=0.9");
+  assert.equal(expectedAcceptLanguage("pt-BR"), "pt-BR,pt;q=0.9");
+  assert.equal(expectedAcceptLanguage("es-419"), "es-419,es;q=0.9");
+  assert.equal(expectedAcceptLanguage("tr"), "tr");
+  assert.equal(expectedAcceptLanguage("de,en"), "de");
+  // Everything past the first tag is discarded by the browser, so it must be
+  // discarded here too — reporting it would promise a header that is not sent,
+  // and the shim built from it would list languages the header does not carry.
+  assert.equal(expectedAcceptLanguage("tr-TR,en-US;q=0.8,en;q=0.7"), "tr-TR,tr;q=0.9");
+  assert.equal(expectedAcceptLanguage(""), "");
+});
+
+// The three places the language shows have to agree, because a browser that
+// advertises one language on the wire and lists another in the page object is not
+// a browser that exists — and it was doing it on the request that earns
+// cf_clearance.
+test("the header, the page object and the seed all come from one value", () => {
+  const sent = expectedAcceptLanguage(TARGET_LANG);
+  assert.equal(sent, "en-US,en;q=0.9");
+  // What the shim hands navigator.languages. The browser natively reports only
+  // the first tag (["en-US"], measured above), which is the contradiction the
+  // shim is there to remove: the header advertises "en" at q=0.9.
+  // Which on the default is byte-identical to the working version's hardcoded
+  // ["en-US", "en"], so nothing observable changed on the configuration that
+  // passes a live zone.
+  assert.deepEqual(languageList(sent), ["en-US", "en"]);
+});
+
+// Intl is the half no launch flag reaches: it answers from ICU, which reads
+// LC_ALL. Measured on a tr_TR box, --accept-lang=en-US set throughout —
+//
+//   env untouched            header en-US,en;q=0.9   Intl tr
+//   LC_ALL=en_US.UTF-8       header en-US,en;q=0.9   Intl en-US
+//
+// and it works on an image with no generated locales at all (`locale -a` lists
+// only C, C.utf8, POSIX): ICU carries its own data and reads the variable.
+test("the process locale is pinned to the language being solved with", () => {
+  assert.deepEqual(localeEnv("en-US,en;q=0.9"), {
+    LANG: "en_US.UTF-8",
+    LC_ALL: "en_US.UTF-8",
+    LANGUAGE: "en_US:en",
+  });
+  assert.deepEqual(localeEnv("tr-TR,tr;q=0.9"), {
+    LANG: "tr_TR.UTF-8",
+    LC_ALL: "tr_TR.UTF-8",
+    LANGUAGE: "tr_TR:tr",
+  });
+  assert.equal(localeEnv(""), null);
+
+  const env = { LANG: "tr_TR.UTF-8", LC_ALL: "tr_TR.UTF-8" };
+  pinProcessLocale(env);
+  assert.equal(env.LC_ALL, "en_US.UTF-8");
+
+  // The opt-out leaves the box alone rather than half-pinning it.
+  const untouched = { LANG: "tr_TR.UTF-8", LC_ALL: "tr_TR.UTF-8", SOLVER_PIN_LOCALE: "0" };
+  assert.equal(pinProcessLocale(untouched), null);
+  assert.equal(untouched.LC_ALL, "tr_TR.UTF-8");
 });
 
 test("parseProxyURL keeps a scheme Chrome would otherwise assume away", () => {
@@ -195,16 +290,22 @@ test("preferenceList gives the preference list it takes, not a header", () => {
   assert.equal(preferenceList("tr-TR,tr;q=0.9"), "tr-TR,tr");
   assert.equal(preferenceList("en-GB,en-US;q=0.9,en;q=0.8"), "en-GB,en-US,en");
 
-  // The base tag stays. It used to be dropped, on the reasoning that Chromium
-  // re-adds it when it builds the header — which it does, so the header looked
-  // right and navigator.languages did not. Measured on 141 through
-  // Emulation.setUserAgentOverride, the two inputs are not interchangeable:
+  // The base tag stays, and this is now the only thing preferenceList is for:
+  // nothing in the solver builds a flag from it any more.
   //
-  //   en-US      -> header en-US,en;q=0.9   navigator.languages ["en-US"]
-  //   en-US,en   -> header en-US,en;q=0.9   navigator.languages ["en-US","en"]
+  // The reason it was kept — that `en-US,en` makes navigator.languages report
+  // ["en-US","en"] where `en-US` alone reports ["en-US"] — was measured through
+  // Emulation.setUserAgentOverride, which the solver no longer uses. Through the
+  // launch flag it does not hold. Measured on Chromium 141.0.7390.37:
   //
-  // and only the second is a client whose page object agrees with its own
-  // header. Dropping it is what put the contradiction back on the wire.
+  //   --accept-lang=en-US      header en-US,en;q=0.9   navigator.languages ["en-US"]
+  //   --accept-lang=en-US,en   header en-US,en;q=0.9   navigator.languages ["en-US"]
+  //
+  // Identical, and neither lists the "en" the header advertises — which is
+  // precisely why the shim in identity.js earns its place rather than the flag
+  // being able to do the job alone. expectedAcceptLanguage is what the flag is
+  // built from now; this is kept for the shape, and for the Chrome 151
+  // measurement above that says a header must never be handed to the flag.
   assert.equal(preferenceList("en-US,en"), "en-US,en");
   assert.equal(preferenceList("de-DE,de;q=0.9"), "de-DE,de");
 
