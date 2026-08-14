@@ -891,13 +891,22 @@ no amount of work inside this package closes them:
   connections out of the pool, but browsers have no such fixed heartbeat. It only
   shows up on connections held open between requests, not on a single fetch.
 - **A `cf_clearance` does not always travel, and `-solve` depends on it doing
-  so.** Measured against a live zone in Under Attack mode, from a datacenter
-  address: the solver earned a clearance in a real Chromium, and the same cookie
-  presented from a *fresh context of that same browser* — same address, same
-  User-Agent, same TLS — was challenged again. Presenting `cf_clearance` alone,
-  without the `cf_chl_*` bookkeeping the solve also captured, made no difference.
-  Solving inside a context and continuing in it worked; carrying the result out
-  of that context did not.
+  so.** Measured against two independent zones in Under Attack mode, from a
+  datacenter address. The solver earned a clearance in a real Chromium; the same
+  cookie presented from a *fresh context of that same browser* — same address,
+  same User-Agent, same TLS — was challenged again. On both.
+
+  The cookie was verified to be on the wire, not merely in a jar:
+  `Network.requestWillBeSentExtraInfo` reported it on the navigation request.
+  That check is worth naming because the first version of it read
+  `request.headers()`, which omits `Cookie` — Chrome's network stack attaches it
+  after the interception point — and so reported every cookie as unsent,
+  including ones a local server confirmed receiving. A measurement is only as
+  good as its instrument, and this one was wrong once before it was right.
+
+  Presenting `cf_clearance` alone, without the `cf_chl_*` bookkeeping the solve
+  also captures, made no difference. Solving inside a context and continuing in
+  it returned 200; carrying the result out of that context did not.
 
   Nothing on the client side fixes that, and `solver/replay.js` is there to tell
   you which case you are in before you spend a day assuming otherwise. When the
