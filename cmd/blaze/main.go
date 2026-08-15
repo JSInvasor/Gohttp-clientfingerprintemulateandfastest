@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -294,7 +295,22 @@ func (lt *latencyTracker) percentile(p float64) time.Duration {
 	if total == 0 {
 		return 0
 	}
-	target := int64(float64(total) * p)
+	// Nearest rank, and never rank 0.
+	//
+	// This truncated instead of rounding up, so total*p below 1 gave a target of
+	// 0 — and `seen >= 0` is true on the first pass whether or not bucket 0 holds
+	// anything. Every percentile of a small sample came back as bucket 0's 1.5ms
+	// regardless of where the samples actually were: at one sample, p50 and p99
+	// both reported 1.5ms for a request that took a second. It corrects itself
+	// once the counts are large, which is why a live stats line hid it, but the
+	// first tick of every run is exactly the small-sample case.
+	//
+	// Rounding up is also what nearest-rank means: of three samples the median is
+	// the second, and truncation picked the first.
+	target := int64(math.Ceil(float64(total) * p))
+	if target < 1 {
+		target = 1
+	}
 	var seen int64
 	for i := 0; i < 32; i++ {
 		seen += counts[i]
