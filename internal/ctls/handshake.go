@@ -299,9 +299,12 @@ func (hs *handshakeState) run() (*Conn, error) {
 	if shell.isHRR {
 		// The server could not use either key share we sent. Answering the
 		// retry sets up hs.suite, hs.ks and the whole transcript — including
-		// the synthetic message_hash that stands in for ClientHello1 — and
-		// leaves the real ServerHello in hand.
-		serverHelloMsg, shell, err = hs.retryAfterHelloRetryRequest(serverHelloMsg, shell)
+		// the synthetic message_hash that stands in for ClientHello1 and the
+		// second ServerHello — so unlike the branch below there is nothing left
+		// for this function to hash. The message itself is discarded rather than
+		// assigned back: it was, and reading the old name afterwards would have
+		// given the *retry*, not the ServerHello that replaced it.
+		_, shell, err = hs.retryAfterHelloRetryRequest(serverHelloMsg, shell)
 		if err != nil {
 			return nil, err
 		}

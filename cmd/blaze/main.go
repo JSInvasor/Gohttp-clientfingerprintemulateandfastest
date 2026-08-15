@@ -260,10 +260,6 @@ func (s *statusBucket) record(code int) {
 	}
 }
 
-func (s *statusBucket) total() int64 {
-	return s.ok.Load() + s.r403.Load() + s.r429.Load() + s.r503.Load() + s.other.Load()
-}
-
 // latencyTracker keeps a tiny lock-free histogram for p50 / p99 reporting.
 // Each request samples into one of 32 power-of-two ms buckets via an atomic
 // counter increment. p99 from log-scale buckets is approximate (~30% bucket

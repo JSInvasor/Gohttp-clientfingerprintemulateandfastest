@@ -11,15 +11,9 @@ import (
 	"time"
 )
 
-// newH2TestClient starts an HTTP/2 test server and a client that trusts it.
-func newH2TestClient(t *testing.T, handler http.HandlerFunc) (*Client, string) {
-	client, url, _, _ := newCountingH2TestClient(t, handler)
-	return client, url
-}
-
-// newCountingH2TestClient is newH2TestClient plus counters for the connections
-// the server accepted and the requests it served, so a test can tell "warmed a
-// connection" apart from "sent a request".
+// newCountingH2TestClient starts an HTTP/2 test server and a client that trusts
+// it, plus counters for the connections the server accepted and the requests it
+// served, so a test can tell "warmed a connection" apart from "sent a request".
 func newCountingH2TestClient(t *testing.T, handler http.HandlerFunc) (c *Client, url string, conns, reqs *atomic.Int64) {
 	t.Helper()
 

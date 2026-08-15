@@ -713,6 +713,39 @@ func (t *Transport) dialViaProxy(ctx context.Context, network, targetAddr string
 	}
 }
 
+// defaultProxyHandshakeTimeout bounds a proxy handshake when nothing else does.
+// It matches the TLS handshake default, because it is the same failure: a peer
+// that completes the TCP connection and then goes quiet.
+const defaultProxyHandshakeTimeout = 10 * time.Second
+
+// proxyHandshakeDeadline bounds the exchange that turns a raw TCP connection
+// into a tunnel — the CONNECT request and its response, or the SOCKS5
+// greeting/auth/connect round trips.
+//
+// Both used to set a deadline only when the context already carried one, and
+// nothing upstream guarantees it does: net.Dialer.Timeout covers the TCP connect
+// and stops there, and an http.NewRequest with no client timeout produces a
+// context with no deadline at all. So a proxy that accepted the connection and
+// then said nothing hung the dial forever. Measured against a listener that
+// accepts and never writes, dialled with context.Background():
+//
+//	http   CONNECT : still blocked after 4s
+//	socks5 greeting: still blocked after 4s
+//
+// This is the same hole wrapTLS was written to close one layer up, and the same
+// answer: honour the caller's deadline when there is one, impose the configured
+// handshake bound when there is not.
+func (t *Transport) proxyHandshakeDeadline(ctx context.Context) time.Time {
+	if deadline, ok := ctx.Deadline(); ok {
+		return deadline
+	}
+	bound := t.handshakeTimeout
+	if bound <= 0 {
+		bound = defaultProxyHandshakeTimeout
+	}
+	return time.Now().Add(bound)
+}
+
 // proxyDefaultPort returns the conventional default port for a proxy scheme.
 func proxyDefaultPort(scheme string) string {
 	switch strings.ToLower(scheme) {
@@ -748,6 +781,10 @@ func (t *Transport) dialViaHTTPConnect(ctx context.Context, network, targetAddr 
 		return nil, fmt.Errorf("dial proxy %s: %w", proxyAddr, err)
 	}
 
+	// Bounded whether or not the caller brought a deadline — see
+	// proxyHandshakeDeadline.
+	deadline := t.proxyHandshakeDeadline(ctx)
+
 	// HTTPS proxy: TLS-wrap the tunnel BEFORE sending CONNECT.
 	var proxyConn net.Conn = rawConn
 	if strings.ToLower(proxyURL.Scheme) == "https" {
@@ -757,9 +794,7 @@ func (t *Transport) dialViaHTTPConnect(ctx context.Context, network, targetAddr 
 			RootCAs:            t.rootCAs,
 		}
 		tlsConn := cryptotls.Client(rawConn, tlsCfg)
-		if deadline, ok := ctx.Deadline(); ok {
-			tlsConn.SetDeadline(deadline)
-		}
+		tlsConn.SetDeadline(deadline)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			rawConn.Close()
 			return nil, fmt.Errorf("tls handshake to proxy %s: %w", proxyAddr, err)
@@ -767,9 +802,7 @@ func (t *Transport) dialViaHTTPConnect(ctx context.Context, network, targetAddr 
 		proxyConn = tlsConn
 	}
 
-	if deadline, ok := ctx.Deadline(); ok {
-		proxyConn.SetDeadline(deadline)
-	}
+	proxyConn.SetDeadline(deadline)
 
 	// Build CONNECT request.
 	var b strings.Builder
@@ -798,8 +831,20 @@ func (t *Transport) dialViaHTTPConnect(ctx context.Context, network, targetAddr 
 		proxyConn.Close()
 		return nil, fmt.Errorf("read CONNECT status from %s: %w", proxyAddr, err)
 	}
-	// Drain the rest of the response headers byte-by-byte until empty line.
-	for {
+	// Drain the rest of the response headers byte-by-byte until the empty line.
+	//
+	// Counted, because the loop's only other exit is a read error: a proxy that
+	// keeps sending header lines and never sends the blank one would be followed
+	// forever. The deadline above ends that too, but a bound on the header count
+	// is what makes it a protocol error rather than a timeout — and 100 is far
+	// more than any CONNECT response carries.
+	const maxCONNECTHeaders = 100
+	for i := 0; ; i++ {
+		if i >= maxCONNECTHeaders {
+			proxyConn.Close()
+			return nil, fmt.Errorf("proxy %s sent more than %d CONNECT response headers",
+				proxyAddr, maxCONNECTHeaders)
+		}
 		line, err := readHeaderLine(proxyConn)
 		if err != nil {
 			proxyConn.Close()
@@ -871,9 +916,11 @@ func (t *Transport) dialViaSocks5(ctx context.Context, network, targetAddr strin
 		return nil, fmt.Errorf("dial socks5 %s: %w", proxyAddr, err)
 	}
 
-	if deadline, ok := ctx.Deadline(); ok {
-		conn.SetDeadline(deadline)
-	}
+	// Bounded whether or not the caller brought a deadline. Every read below is
+	// an io.ReadFull of a fixed size, so a proxy that accepts and stays silent
+	// blocks on the first one until something ends it — see
+	// proxyHandshakeDeadline.
+	conn.SetDeadline(t.proxyHandshakeDeadline(ctx))
 
 	var (
 		username string
