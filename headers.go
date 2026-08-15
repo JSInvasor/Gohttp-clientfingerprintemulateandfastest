@@ -126,8 +126,30 @@ func fetchModeFor(req *http.Request) fetchMode {
 // value always wins; only the built-in navigation default is swapped for the
 // */* that fetch and XHR send.
 func acceptFor(configured string, mode fetchMode) string {
+	// An empty value falls back to the profile default rather than through.
+	// setIfEmpty at the call site treats "" as "nothing to set", so the header
+	// was dropped from the request entirely — and a request from a browser
+	// profile carrying no Accept at all is a stronger signal than any wrong
+	// value would be. WithAccept("") is the way in: the config default is
+	// non-empty, so only an explicit empty string reaches here, which is exactly
+	// the case a caller computing the value can produce by accident.
+	if configured == "" {
+		configured = defaultNavigateAccept
+	}
 	if mode == modeFetch && isBuiltinNavigateAccept(configured) {
 		return "*/*"
+	}
+	return configured
+}
+
+// acceptLanguageFor is the Accept-Language a request goes out with.
+//
+// Same reasoning as acceptFor: setIfEmpty reads "" as "leave it alone", so
+// WithAcceptLanguage("") produced a browser that sends no Accept-Language, which
+// no browser does. The default is the one every profile ships with.
+func acceptLanguageFor(configured string) string {
+	if configured == "" {
+		return DefaultAcceptLanguage
 	}
 	return configured
 }
@@ -232,7 +254,7 @@ func applySafariHeaders(req *http.Request, accept, lang, userAgent string, mode 
 		h["Sec-Fetch-Mode"] = []string{secFetchModeFor(req, mode)}
 	}
 	if _, ok := h["Accept-Language"]; !ok {
-		h["Accept-Language"] = []string{lang}
+		h["Accept-Language"] = []string{acceptLanguageFor(lang)}
 	}
 	if _, ok := h["Priority"]; !ok {
 		// u=0 is reserved for the main document. The navigation value is
@@ -400,7 +422,7 @@ func applyChromeHeaders(req *http.Request, accept, lang, userAgent string, mode 
 		setIfEmpty(h, "Priority", "u=1, i")
 	}
 	setIfEmpty(h, "Accept-Encoding", "gzip, deflate, br, zstd")
-	setIfEmpty(h, "Accept-Language", lang)
+	setIfEmpty(h, "Accept-Language", acceptLanguageFor(lang))
 
 	// NOTE: Chrome does NOT send TE, DNT, Sec-GPC, or Connection.
 }

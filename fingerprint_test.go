@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -146,5 +147,55 @@ func TestH2SettingsOrder(t *testing.T) {
 				t.Errorf("SETTINGS\n got: %v\nwant: %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// A browser profile always sends Accept and Accept-Language.
+//
+// Both were built with setIfEmpty, which reads "" as "nothing to set", so an
+// empty configured value dropped the header from the request entirely rather
+// than falling back. A request from a profile that claims to be Chrome or Safari
+// and carries neither header is a stronger signal than any wrong value would be,
+// and WithAccept("")/WithAcceptLanguage("") is an easy accident for a caller
+// computing the value — the config defaults are non-empty, so only an explicit
+// empty string gets here.
+//
+// The User-Agent already worked this way through resolveUserAgent; this is the
+// same rule applied to the other two.
+func TestEmptyAcceptAndLanguageFallBackToTheProfileDefaults(t *testing.T) {
+	for _, profile := range []BrowserProfile{Chrome151, SafariIOS18} {
+		req, err := http.NewRequest("GET", "https://site.test/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		applyBrowserHeaders(req, profile, "", "", "")
+
+		if got := req.Header.Get("Accept-Language"); got != DefaultAcceptLanguage {
+			t.Errorf("%v: Accept-Language = %q, want the default %q",
+				profile, got, DefaultAcceptLanguage)
+		}
+		if got := req.Header.Get("Accept"); got == "" {
+			t.Errorf("%v: Accept was dropped from the request", profile)
+		}
+		if got := req.Header.Get("User-Agent"); got == "" {
+			t.Errorf("%v: User-Agent was dropped from the request", profile)
+		}
+	}
+}
+
+// A value the caller did give still wins, so the fallback cannot mask a real
+// setting.
+func TestConfiguredAcceptAndLanguageAreNotOverridden(t *testing.T) {
+	req, err := http.NewRequest("GET", "https://site.test/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyBrowserHeaders(req, Chrome151, "text/plain", "tr-TR,tr;q=0.9", "")
+
+	if got := req.Header.Get("Accept-Language"); got != "tr-TR,tr;q=0.9" {
+		t.Errorf("Accept-Language = %q, want the configured value", got)
+	}
+	if got := req.Header.Get("Accept"); got != "text/plain" {
+		t.Errorf("Accept = %q, want the configured value", got)
 	}
 }
