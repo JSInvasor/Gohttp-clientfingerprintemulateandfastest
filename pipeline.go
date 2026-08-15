@@ -103,6 +103,43 @@ type pipelineJob struct {
 	blockResult bool
 }
 
+// releaseJob returns a job to the pool with every field cleared.
+//
+// Six of the eight Put sites cleared nothing, and the field that made that a bug
+// rather than a leak is blockResult — the one field no caller sets explicitly.
+// Send and FireAndForget assign ctx, method, url, body, headers and result on
+// every reuse, so a stale value in any of those is overwritten before it can be
+// read. blockResult is set by spraySubmit alone, and spraySubmit returned its
+// jobs to the pool with it still true whenever the context was cancelled.
+//
+// A Send that then drew that job got a worker taking the blocking delivery path:
+//
+//	select {
+//	case job.result <- result:
+//	case <-p.stopCh:
+//	case <-job.ctx.Done():
+//	}
+//
+// Send's channel has a slot free, so the first case is always ready — but if the
+// caller's context expired during the request, so is the third, and Go picks
+// between ready cases at random. Half the time the result is dropped and the
+// caller, still blocked on the channel Send handed it, waits forever. A request
+// timing out is the ordinary case, not an exotic one; all it needed was one
+// earlier cancelled Spray to put a poisoned job in the pool.
+//
+// Clearing everything in one place is the fix, and it also stops the pool
+// holding on to a caller's context and body between uses.
+func (p *Pipeline) releaseJob(job *pipelineJob) {
+	job.ctx = nil
+	job.method = ""
+	job.url = ""
+	job.body = nil
+	job.headers = nil
+	job.result = nil
+	job.blockResult = false
+	p.jobPool.Put(job)
+}
+
 // PipelineConfig tunes pipeline internals beyond worker count.
 //
 // DrainWorkers controls how many goroutines read response bodies in the
@@ -370,15 +407,7 @@ func (p *Pipeline) worker() {
 			}
 		}
 
-		// Return job to pool
-		job.ctx = nil
-		job.method = ""
-		job.url = ""
-		job.body = nil
-		job.headers = nil
-		job.result = nil
-		job.blockResult = false
-		p.jobPool.Put(job)
+		p.releaseJob(job)
 	}
 }
 
@@ -407,10 +436,10 @@ func (p *Pipeline) Send(ctx context.Context, method, url string, body []byte, he
 	case p.jobCh <- job:
 	case <-ctx.Done():
 		ch <- &PipelineResult{Err: ctx.Err()}
-		p.jobPool.Put(job)
+		p.releaseJob(job)
 	case <-p.stopCh:
 		ch <- &PipelineResult{Err: ErrPipelineClosed}
-		p.jobPool.Put(job)
+		p.releaseJob(job)
 	}
 
 	return ch
@@ -438,9 +467,9 @@ func (p *Pipeline) FireAndForget(ctx context.Context, method, url string, body [
 	select {
 	case p.jobCh <- job:
 	case <-ctx.Done():
-		p.jobPool.Put(job)
+		p.releaseJob(job)
 	case <-p.stopCh:
-		p.jobPool.Put(job)
+		p.releaseJob(job)
 	}
 }
 
@@ -601,10 +630,10 @@ func (p *Pipeline) spraySubmit(ctx context.Context, method, url string, n int, r
 		case p.jobCh <- job:
 			submitted++
 		case <-ctx.Done():
-			p.jobPool.Put(job)
+			p.releaseJob(job)
 			return
 		case <-p.stopCh:
-			p.jobPool.Put(job)
+			p.releaseJob(job)
 			return
 		}
 	}
@@ -678,12 +707,7 @@ func (p *Pipeline) failQueuedJobs() {
 					// has its own shutdown path and is not waiting on us.
 				}
 			}
-			job.ctx = nil
-			job.body = nil
-			job.headers = nil
-			job.result = nil
-			job.blockResult = false
-			p.jobPool.Put(job)
+			p.releaseJob(job)
 		default:
 			return
 		}

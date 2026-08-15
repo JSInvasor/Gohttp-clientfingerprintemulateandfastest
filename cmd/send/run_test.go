@@ -240,3 +240,66 @@ func TestPipelineReportsTheBytesItActuallyRead(t *testing.T) {
 		t.Errorf("the per-request counter is %d; pipeline mode does not read bodies at the call site", n)
 	}
 }
+
+// A fast run has to send the cookies the run was given.
+//
+// It sent none. FastDo goes straight to the transport, which is what makes it
+// fast, so nothing consults the cookie jar — and the jar is where both -cookie
+// and -solve's cf_clearance land. Measured against a local server recording what
+// it received:
+//
+//	client mode Cookie header: "cf_clearance=THE_SOLVED_COOKIE"
+//	fast   mode Cookie header: ""
+//
+// So `send -solve -mode fast` earned a clearance and then made every request
+// without it: a 403 per request, on a run whose own log says the cookie was
+// seeded.
+func TestFastTemplateCarriesTheSeededCookies(t *testing.T) {
+	seen := make(chan string, 8)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case seen <- r.Header.Get("Cookie"):
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	o := &options{
+		mode: modeFast, method: "GET", count: 1, concurrency: 1, sessions: 1,
+		timeout: 10 * time.Second, handshake: 10 * time.Second, insecure: true,
+		cookies: []string{"cf_clearance=THE_SOLVED_COOKIE"},
+	}
+	pool, err := newSessionPool(o, gofire.Chrome151, srv.URL)
+	if err != nil {
+		t.Fatalf("session pool: %v", err)
+	}
+	defer pool.Close()
+	client := pool.sessions[0].client
+
+	tmpl, err := newFastTemplate(client, "GET", srv.URL, nil, nil)
+	if err != nil {
+		t.Fatalf("template: %v", err)
+	}
+	if _, err := client.FastDo(t.Context(), tmpl); err != nil {
+		t.Fatalf("FastDo: %v", err)
+	}
+	if got := <-seen; got != "cf_clearance=THE_SOLVED_COOKIE" {
+		t.Errorf("fast mode sent Cookie %q, want the seeded clearance", got)
+	}
+
+	// And a value the user typed still wins: appending the jar to an explicit
+	// -H "Cookie: ..." would send both.
+	tmpl, err = newFastTemplate(client, "GET", srv.URL, map[string]string{"Cookie": "typed=1"}, nil)
+	if err != nil {
+		t.Fatalf("template: %v", err)
+	}
+	if _, err := client.FastDo(t.Context(), tmpl); err != nil {
+		t.Fatalf("FastDo: %v", err)
+	}
+	if got := <-seen; got != "typed=1" {
+		t.Errorf("an explicit -H Cookie became %q", got)
+	}
+}

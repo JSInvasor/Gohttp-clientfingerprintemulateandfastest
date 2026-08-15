@@ -331,6 +331,26 @@ func runPipeline(ctx context.Context, pool *sessionPool, o *options, target stri
 // makes shares the single reader, which is consumed after the first send, so a
 // template carrying only Body would produce one real POST followed by a stream
 // of empty ones.
+//
+// The jar's cookies are baked into the template, and that is the whole reason
+// this function is more than two lines. FastDo goes straight to the transport —
+// that is what makes it fast — so nothing consults the cookie jar on the way
+// out. Everything that puts a cookie into a session puts it in the jar:
+// -cookie, and -solve's cf_clearance. Measured against a local server recording
+// what it received:
+//
+//	client mode Cookie header: "cf_clearance=THE_SOLVED_COOKIE"
+//	fast   mode Cookie header: ""
+//
+// So `send -solve -mode fast` spent two and a half minutes earning a clearance
+// and then sent every request without it — a 403 per request, on a run whose
+// own log says the cookie was seeded.
+//
+// Baking it in is the right shape rather than a workaround: a fast run is one
+// URL and one identity per session, so the Cookie header is a constant for the
+// life of the template. What it still cannot do is pick up a Set-Cookie from
+// the responses — no jar means nothing to update — which is what -mode client
+// is for, and what -scout already recommends when the target sets __cf_bm.
 func newFastTemplate(client *gofire.Client, method, target string, headers map[string]string, body []byte) (*http.Request, error) {
 	req, err := client.PrepareRequest(method, target)
 	if err != nil {
@@ -338,6 +358,18 @@ func newFastTemplate(client *gofire.Client, method, target string, headers map[s
 	}
 	for name, value := range headers {
 		req.Header.Set(name, value)
+	}
+
+	// After the caller's headers, so an explicit -H "Cookie: ..." stays the one
+	// the run sends rather than being appended to.
+	if req.Header.Get("Cookie") == "" {
+		jar, err := client.GetCookies(target)
+		if err != nil {
+			return nil, fmt.Errorf("read the cookie jar for the fast template: %w", err)
+		}
+		for _, c := range jar {
+			req.AddCookie(c)
+		}
 	}
 	if len(body) > 0 {
 		req.ContentLength = int64(len(body))
