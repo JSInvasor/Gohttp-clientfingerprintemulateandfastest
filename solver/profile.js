@@ -108,6 +108,150 @@ export function primaryLanguage(header) {
   return languageList(header)[0] || "";
 }
 
+// regionTimezones maps the region subtag of a language to the IANA zone a
+// browser in that region most often reports.
+//
+// One zone per region, deliberately: several of these cover countries with more
+// than one, and picking the most populous is the whole ambition. The point is
+// not to be right about where the exit is — nothing here can know that — it is
+// to report a zone a real browser could report, in a region the run has already
+// said it is pretending to be in.
+const regionTimezones = {
+  US: "America/New_York",
+  CA: "America/Toronto",
+  MX: "America/Mexico_City",
+  BR: "America/Sao_Paulo",
+  AR: "America/Argentina/Buenos_Aires",
+  GB: "Europe/London",
+  IE: "Europe/Dublin",
+  FR: "Europe/Paris",
+  DE: "Europe/Berlin",
+  AT: "Europe/Vienna",
+  CH: "Europe/Zurich",
+  NL: "Europe/Amsterdam",
+  BE: "Europe/Brussels",
+  ES: "Europe/Madrid",
+  PT: "Europe/Lisbon",
+  IT: "Europe/Rome",
+  PL: "Europe/Warsaw",
+  SE: "Europe/Stockholm",
+  NO: "Europe/Oslo",
+  DK: "Europe/Copenhagen",
+  FI: "Europe/Helsinki",
+  CZ: "Europe/Prague",
+  GR: "Europe/Athens",
+  RO: "Europe/Bucharest",
+  UA: "Europe/Kyiv",
+  RU: "Europe/Moscow",
+  TR: "Europe/Istanbul",
+  IL: "Asia/Jerusalem",
+  SA: "Asia/Riyadh",
+  AE: "Asia/Dubai",
+  IN: "Asia/Kolkata",
+  PK: "Asia/Karachi",
+  ID: "Asia/Jakarta",
+  TH: "Asia/Bangkok",
+  VN: "Asia/Ho_Chi_Minh",
+  CN: "Asia/Shanghai",
+  HK: "Asia/Hong_Kong",
+  TW: "Asia/Taipei",
+  SG: "Asia/Singapore",
+  JP: "Asia/Tokyo",
+  KR: "Asia/Seoul",
+  AU: "Australia/Sydney",
+  NZ: "Pacific/Auckland",
+  ZA: "Africa/Johannesburg",
+  NG: "Africa/Lagos",
+  EG: "Africa/Cairo",
+};
+
+// languageTimezones covers the bare tags, where there is no region to read. The
+// zone is the one the largest population of that language sits in.
+const languageTimezones = {
+  en: "America/New_York",
+  es: "Europe/Madrid",
+  pt: "America/Sao_Paulo",
+  fr: "Europe/Paris",
+  de: "Europe/Berlin",
+  it: "Europe/Rome",
+  nl: "Europe/Amsterdam",
+  pl: "Europe/Warsaw",
+  sv: "Europe/Stockholm",
+  tr: "Europe/Istanbul",
+  ru: "Europe/Moscow",
+  uk: "Europe/Kyiv",
+  ar: "Asia/Riyadh",
+  he: "Asia/Jerusalem",
+  hi: "Asia/Kolkata",
+  id: "Asia/Jakarta",
+  th: "Asia/Bangkok",
+  vi: "Asia/Ho_Chi_Minh",
+  zh: "Asia/Shanghai",
+  ja: "Asia/Tokyo",
+  ko: "Asia/Seoul",
+};
+
+// isValidTimezone reports whether ICU knows this zone.
+//
+// Worth checking rather than trusting, because the failure is silent and it is
+// the worst possible value: measured on Chromium 141, TZ=Nonsense/Bogus does not
+// error, it reports Etc/Unknown — the same thing an unset TZ reports, and the
+// thing this whole mechanism exists to stop reporting.
+export function isValidTimezone(tz) {
+  if (!tz) return false;
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// timezoneForLanguage picks the IANA zone that goes with an Accept-Language.
+//
+// Derived from the language rather than configured separately, for the same
+// reason the header and navigator.languages are: they are all claims about the
+// same imagined user, and a browser asking for tr-TR from a machine set to
+// America/New_York is a combination worth not producing when the alternative
+// costs nothing. SOLVER_TZ overrides it for anyone who knows where their exit
+// actually is — which is the better answer, and the one this cannot compute.
+export function timezoneForLanguage(header) {
+  const primary = primaryLanguage(header);
+  if (!primary) return "";
+  const [language, region] = primary.split("-");
+  if (region) {
+    const byRegion = regionTimezones[region.toUpperCase()];
+    if (byRegion) return byRegion;
+  }
+  return languageTimezones[String(language || "").toLowerCase()] || "";
+}
+
+// TARGET_TZ is the timezone the solve runs in.
+//
+// It exists because the default on the machines this runs on is not a timezone
+// at all. Measured on Chromium 141.0.7390.37 in a container with no
+// /etc/localtime and no TZ — which is every minimal Docker image and most small
+// VPS builds:
+//
+//   TZ unset             Intl timeZone "Etc/Unknown"  offset 0
+//   TZ=Europe/Istanbul   Intl timeZone "Europe/Istanbul"  offset -180
+//   TZ=America/New_York  Intl timeZone "America/New_York"  offset  240
+//   TZ=Nonsense/Bogus    Intl timeZone "Etc/Unknown"  offset 0
+//
+// Etc/Unknown is not a zone any installed browser reports; it is what ICU says
+// when it was given nothing to work with. A page that asks — and a challenge
+// does, it is one property read — gets an answer no real client produces, on the
+// request that earns cf_clearance.
+//
+// So the default is a real zone derived from the language, and an invalid
+// SOLVER_TZ falls back to it rather than silently becoming Etc/Unknown again.
+export const TARGET_TZ = (() => {
+  const configured = process.env.SOLVER_TZ;
+  if (configured && isValidTimezone(configured)) return configured;
+  const derived = timezoneForLanguage(TARGET_LANG);
+  return isValidTimezone(derived) ? derived : "UTC";
+})();
+
 // preferenceList turns an Accept-Language header into what --accept-lang wants,
 // which is not an Accept-Language header: the language *preference list*, the
 // codes in order with no quality values.
@@ -193,7 +337,10 @@ export function expectedAcceptLanguage(header) {
 // on the box: this was measured on an image whose `locale -a` lists only C,
 // C.utf8 and POSIX, and Chromium still answered Intl "en-US" — ICU carries its
 // own data and reads the variable directly.
-export function localeEnv(header) {
+// TZ rides along for the same reason and by the same mechanism: ICU reads it,
+// and nothing else reaches Intl. See TARGET_TZ for what the default was before
+// this — Etc/Unknown, which is not a timezone any browser reports.
+export function localeEnv(header, timezone = TARGET_TZ) {
   const primary = primaryLanguage(header);
   if (!primary) return null;
   const posix = primary.replace(/-/g, "_");
@@ -203,6 +350,7 @@ export function localeEnv(header) {
     LANGUAGE: languageList(header)
       .map((tag) => tag.replace(/-/g, "_"))
       .join(":"),
+    TZ: timezone,
   };
 }
 
@@ -213,8 +361,11 @@ export function localeEnv(header) {
 // rewrites the environment merely by being imported would do it to the test
 // runner too, and the point of this file is that its effects are inspectable.
 //
-// SOLVER_PIN_LOCALE=0 leaves the box alone, for anyone who wants the machine's
-// own locale to reach the browser and has read the table above.
+// SOLVER_PIN_LOCALE=0 leaves the box alone — locale and timezone both — for
+// anyone whose machine is already configured to match its exit and who has read
+// the tables above. It is an opt-out rather than the default because the
+// unconfigured state is not neutral: a container reports Etc/Unknown, which is
+// worse than any zone this could pick.
 export function pinProcessLocale(env = process.env) {
   if (env.SOLVER_PIN_LOCALE === "0") return null;
   const locale = localeEnv(TARGET_LANG);

@@ -66,7 +66,11 @@ type solveResult struct {
 	// exists to be compared against AcceptLanguage: the header is what the
 	// server sees, this is what the challenge's JavaScript sees, and a solve
 	// where they disagree is a browser no ordinary Chrome install produces.
-	PageLanguages []string       `json:"page_languages"`
+	PageLanguages []string `json:"page_languages"`
+	// Timezone is Intl's resolved zone as the solved page reported it. Nothing
+	// on this side replays it — no JS, no timezone on the wire — but it is read
+	// back so the run can say when the solve ran in a zone no browser reports.
+	Timezone      string         `json:"timezone"`
 	Cookies       string         `json:"cookies"`
 	CookieList    []solvedCookie `json:"cookie_list"`
 	DurationMS    int64          `json:"duration_ms"`
@@ -106,6 +110,10 @@ type solveSeed struct {
 	// — nothing on this side can set a page object — but a disagreement is worth
 	// naming, since it is the shape of two separate bugs this repo has shipped.
 	pageLanguages []string
+	// timezone is Intl's resolved zone in the solved page. Not replayed either —
+	// there is no timezone on the wire — but a solve that ran in a zone no
+	// browser reports is worth saying out loud rather than leaving in the JSON.
+	timezone      string
 	cookies       []string
 	chromiumMajor int
 	// expiresAt is when the cf_clearance stops being worth anything, zero when
@@ -501,6 +509,7 @@ func seedFromResult(o *options, target string, e exit, res *solveResult) *solveS
 		userAgent:      res.UserAgent,
 		acceptLanguage: res.AcceptLanguage,
 		pageLanguages:  res.PageLanguages,
+		timezone:       res.Timezone,
 		chromiumMajor:  res.ChromiumMajor,
 	}
 	if gotClearance && cf.Expires > 0 {
@@ -526,6 +535,33 @@ func reportSolveDrift(seed *solveSeed, o *options) {
 	reportChromiumDrift(seed.chromiumMajor)
 	reportLanguageDrift(seed.acceptLanguage, acceptLanguage(o))
 	reportLanguageSplit(seed.acceptLanguage, seed.pageLanguages)
+	reportTimezone(seed.timezone)
+}
+
+// reportTimezone says so when the solve ran in something that is not a timezone.
+//
+// Intl answers from ICU, and ICU answers from TZ. On a container with no
+// /etc/localtime and no TZ — every minimal Docker image and most small VPS
+// builds — it resolves to "Etc/Unknown", which is not a zone any installed
+// browser reports. A challenge reads that property, and it read it on the
+// request that earned the cookie.
+//
+// solver/profile.js pins TZ for exactly this reason, so reaching here means the
+// pin was turned off or did not apply. A note rather than an error: the solve
+// may well have worked, and refusing to continue over it would be worse than
+// saying what was noticed.
+func reportTimezone(tz string) {
+	if tz == "" || (tz != "Etc/Unknown" && tz != "UTC") {
+		return
+	}
+	detail := "no timezone at all"
+	if tz == "UTC" {
+		detail = "UTC, which a server has and a desktop browser rarely does"
+	}
+	fmt.Fprintf(os.Stderr, "note: the solve reported Intl timezone %q — %s.\n"+
+		"  solver/profile.js pins TZ from the language for this reason, so either\n"+
+		"  SOLVER_PIN_LOCALE=0 is set or SOLVER_TZ named a zone ICU does not know.\n"+
+		"  Set SOLVER_TZ to where your exit actually is.\n", tz, detail)
 }
 
 // reportLanguageSplit says so when the browser's Accept-Language header and its

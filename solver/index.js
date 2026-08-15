@@ -24,9 +24,17 @@
 //                  browser used the box's locale, which on a localised image is
 //                  a language the replay never asks for and the page object
 //                  openly contradicted.
+//   SOLVER_TZ      the IANA timezone to solve in, e.g. "Europe/Istanbul".
+//                  Left unset it is derived from SOLVER_LANG's region, because
+//                  the alternative is not neutral: a container with no
+//                  /etc/localtime reports Intl timeZone "Etc/Unknown", which no
+//                  installed browser produces. An invalid value falls back to
+//                  the derived one rather than silently becoming Etc/Unknown.
+//                  Set it to where your exit actually is — that is the answer
+//                  this cannot compute.
 //   SOLVER_PIN_LOCALE=0
-//                  do not touch LANG/LC_ALL; let the box's own locale reach
-//                  Intl. See profile.js for what that costs.
+//                  do not touch LANG/LC_ALL/TZ; let the box's own locale and
+//                  timezone reach Intl. See profile.js for what that costs.
 //   SOLVER_UA, SOLVER_SEC_CH_UA, SOLVER_PLATFORM
 //                  re-pin the identity when solving from a box whose OS or
 //                  Chrome major differs; see profile.js.
@@ -39,6 +47,10 @@
 //     "accept_language": "<what the browser actually sent, not what was asked>",
 //     "page_languages": ["en-US", "en"],       // navigator.languages, to check
 //                                              // against accept_language
+//     "timezone": "America/New_York",          // Intl's resolved zone, read back
+//                                              // from the page. "Etc/Unknown" is
+//                                              // a container with no TZ, which no
+//                                              // installed browser reports.
 //     "cookies": "name=val; name=val; ...",   // header-ready
 //     "cookie_list": [{name, value, domain, expires}, ...],
 //     "duration_ms": <int>,
@@ -343,11 +355,21 @@ async function harvest(jar, page) {
   // pair was added to make impossible to ship again — a browser advertising
   // "en" it does not list is not a browser any ordinary Chrome install
   // produces. send compares them and says so.
+  // The timezone rides in the same round trip rather than being assumed from
+  // what was pinned. It is the half of the identity no header carries and no
+  // launch flag reaches — Intl answers it from ICU — and the value it reports on
+  // an unconfigured container is Etc/Unknown, which no installed browser
+  // produces. Reading it back is how a run says whether the pin took.
   const identity = await page
-    .evaluate(() => ({ userAgent: navigator.userAgent, languages: navigator.languages }))
+    .evaluate(() => ({
+      userAgent: navigator.userAgent,
+      languages: navigator.languages,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    }))
     .catch(() => null);
   const userAgent = (identity && identity.userAgent) || TARGET_UA;
   const pageLanguages = (identity && identity.languages) || [];
+  const timezone = (identity && identity.timezone) || "";
 
   const finalUrl = (() => {
     try {
@@ -363,6 +385,7 @@ async function harvest(jar, page) {
     user_agent: userAgent,
     accept_language: acceptLanguageOf(page),
     page_languages: pageLanguages,
+    timezone: timezone,
     cookies: cookies.map((c) => `${c.name}=${c.value}`).join("; "),
     cookie_list: cookies.map((c) => ({
       name: c.name,
@@ -615,6 +638,7 @@ async function solveExit(newSession, budgetMs, proxyLabel) {
         user_agent: r.user_agent,
         accept_language: r.accept_language || acceptLanguageOf(),
         page_languages: r.page_languages || [],
+        timezone: r.timezone || "",
         cookies: r.cookies,
         cookie_list: r.cookie_list,
         duration_ms: Date.now() - startTs,

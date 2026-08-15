@@ -650,6 +650,7 @@ The language shows in four places, and all four have to say the same thing:
 | the `Accept-Language` header | the edge | `--accept-lang` |
 | `navigator.languages` | the challenge's own JavaScript | the shim in `solver/identity.js` |
 | `Intl`'s resolved locale | the same JavaScript | `LC_ALL`, via `pinProcessLocale` |
+| `Intl`'s resolved timezone | the same JavaScript | `TZ`, via `pinProcessLocale` |
 | the seed the run replays with | the edge, on every later request | `acceptLanguageOf` |
 
 They are all derived from one value — `expectedAcceptLanguage` in
@@ -687,6 +688,40 @@ the header says `en-US` and `Intl.DateTimeFormat().resolvedOptions().locale`
 still says `tr`; pinning `LC_ALL` closes it, and it does not need the locale to
 be generated on the box — measured on an image whose `locale -a` lists only `C`,
 `C.utf8` and `POSIX`. `SOLVER_PIN_LOCALE=0` opts out.
+
+### The timezone
+
+Same mechanism, and the reason it is pinned by default rather than on request:
+**the unconfigured state is not neutral.** Measured on Chromium 141.0.7390.37 in
+a container with no `/etc/localtime` and no `TZ` — every minimal Docker image and
+most small VPS builds:
+
+| `TZ` | `Intl` timeZone | offset |
+|---|---|---|
+| *(unset)* | `Etc/Unknown` | 0 |
+| `Europe/Istanbul` | `Europe/Istanbul` | −180 |
+| `America/New_York` | `America/New_York` | +240 |
+| `Nonsense/Bogus` | `Etc/Unknown` | 0 |
+
+`Etc/Unknown` is not a zone any installed browser reports — it is what ICU says
+when it was given nothing to work with. A challenge reads that property, and it
+read it on the request that earns `cf_clearance`.
+
+So `TZ` is pinned alongside the locale, derived from `SOLVER_LANG`'s region
+(`tr-TR` → `Europe/Istanbul`, `en-US` → `America/New_York`). That is a guess
+about where the exit is, and a wrong-but-real zone beats a value no browser
+produces. **Set `SOLVER_TZ` to where your exit actually is** — that is the answer
+this cannot compute:
+
+```bash
+SOLVER_TZ=Europe/Istanbul send -solve -proxy http://user:pass@istanbul-exit:8080 https://site.com
+```
+
+An invalid `SOLVER_TZ` falls back to the derived zone rather than through: note
+from the table that Chromium accepts a nonsense zone silently and resolves it to
+`Etc/Unknown`, so the value is validated against ICU before it is used. The
+solver reports what the page actually saw as `timezone`, and `send` says so when
+it is one no browser reports.
 
 On the configuration this was originally validated on — an `en_US` box, the
 default language — every one of these is a measured no-op: header, page object

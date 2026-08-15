@@ -4,13 +4,16 @@ import test from "node:test";
 import {
   LAUNCH_ARGS,
   TARGET_LANG,
+  TARGET_TZ,
   expectedAcceptLanguage,
   languageList,
   localeEnv,
   parseProxyURL,
   pinProcessLocale,
+  isValidTimezone,
   preferenceList,
   primaryLanguage,
+  timezoneForLanguage,
 } from "./profile.js";
 import { CHALLENGE_TITLE_RE, detectChallengeInPage, isChallengeTitle } from "./challenge.js";
 import { explain, verdict } from "./verdict.js";
@@ -145,15 +148,17 @@ test("the header, the page object and the seed all come from one value", () => {
 // and it works on an image with no generated locales at all (`locale -a` lists
 // only C, C.utf8, POSIX): ICU carries its own data and reads the variable.
 test("the process locale is pinned to the language being solved with", () => {
-  assert.deepEqual(localeEnv("en-US,en;q=0.9"), {
+  assert.deepEqual(localeEnv("en-US,en;q=0.9", "America/New_York"), {
     LANG: "en_US.UTF-8",
     LC_ALL: "en_US.UTF-8",
     LANGUAGE: "en_US:en",
+    TZ: "America/New_York",
   });
-  assert.deepEqual(localeEnv("tr-TR,tr;q=0.9"), {
+  assert.deepEqual(localeEnv("tr-TR,tr;q=0.9", "Europe/Istanbul"), {
     LANG: "tr_TR.UTF-8",
     LC_ALL: "tr_TR.UTF-8",
     LANGUAGE: "tr_TR:tr",
+    TZ: "Europe/Istanbul",
   });
   assert.equal(localeEnv(""), null);
 
@@ -377,4 +382,84 @@ test("the replay verdict names the case the three attempts describe", () => {
   }
   assert.match(explain("zone_challenges"), /different exit|-proxy/);
   assert.match(explain("challenge_state"), /solve-all-cookies/);
+});
+
+// The timezone the solve runs in.
+//
+// Measured on Chromium 141.0.7390.37 in a container with no /etc/localtime and
+// no TZ — which is every minimal Docker image and most small VPS builds:
+//
+//   TZ unset             Intl timeZone "Etc/Unknown"      offset 0
+//   TZ=Europe/Istanbul   Intl timeZone "Europe/Istanbul"  offset -180
+//   TZ=America/New_York  Intl timeZone "America/New_York" offset  240
+//   TZ=Asia/Tokyo        Intl timeZone "Asia/Tokyo"       offset -540
+//   TZ=Nonsense/Bogus    Intl timeZone "Etc/Unknown"      offset 0
+//
+// Etc/Unknown is not a zone any installed browser reports — it is what ICU says
+// when it was given nothing. So the unconfigured state is not neutral, which is
+// why this is pinned by default rather than only on request, and why an invalid
+// SOLVER_TZ must not be passed through: it lands on exactly the value the pin
+// exists to avoid.
+test("the timezone is derived from the language when none is given", () => {
+  assert.equal(timezoneForLanguage("en-US,en;q=0.9"), "America/New_York");
+  assert.equal(timezoneForLanguage("tr-TR,tr;q=0.9"), "Europe/Istanbul");
+  assert.equal(timezoneForLanguage("de-DE"), "Europe/Berlin");
+  assert.equal(timezoneForLanguage("pt-BR"), "America/Sao_Paulo");
+  assert.equal(timezoneForLanguage("ja-JP"), "Asia/Tokyo");
+
+  // A bare tag has no region to read, so it falls back to the language.
+  assert.equal(timezoneForLanguage("tr"), "Europe/Istanbul");
+  assert.equal(timezoneForLanguage("ja"), "Asia/Tokyo");
+
+  // A region nothing knows falls back to the language rather than to nothing.
+  assert.equal(timezoneForLanguage("en-ZZ"), "America/New_York");
+
+  assert.equal(timezoneForLanguage(""), "");
+});
+
+test("every derived timezone is one ICU actually knows", () => {
+  const langs = [
+    "en-US,en;q=0.9", "tr-TR,tr;q=0.9", "de-DE", "fr-FR", "es-ES", "pt-BR",
+    "it-IT", "nl-NL", "pl-PL", "ru-RU", "uk-UA", "ar-SA", "he-IL", "hi-IN",
+    "id-ID", "th-TH", "vi-VN", "zh-CN", "zh-TW", "ja-JP", "ko-KR", "en-GB",
+    "en-AU", "en-CA", "es-MX", "pt-PT", "sv-SE", "nb-NO", "da-DK", "fi-FI",
+  ];
+  for (const lang of langs) {
+    const tz = timezoneForLanguage(lang);
+    assert.ok(tz, `${lang} derived no timezone`);
+    assert.ok(isValidTimezone(tz), `${lang} derived ${tz}, which ICU does not know`);
+  }
+});
+
+test("an invalid timezone never reaches the browser", () => {
+  assert.equal(isValidTimezone("Nonsense/Bogus"), false);
+  assert.equal(isValidTimezone(""), false);
+  assert.equal(isValidTimezone("Europe/Istanbul"), true);
+
+  // Etc/Unknown is rejected by the validator itself, which is the property that
+  // makes this safe rather than merely careful: the one value the whole pin
+  // exists to avoid cannot be reached by configuring it, only by turning the pin
+  // off. Chromium accepts it silently — TZ=Nonsense/Bogus resolves to
+  // Etc/Unknown rather than erroring — so the check has to happen here.
+  assert.equal(isValidTimezone("Etc/Unknown"), false);
+
+  // Whatever the default resolved to, it is a real zone and not the one an
+  // unconfigured container reports.
+  assert.ok(isValidTimezone(TARGET_TZ), `TARGET_TZ ${TARGET_TZ} is not a zone ICU knows`);
+  assert.notEqual(TARGET_TZ, "Etc/Unknown");
+});
+
+test("the pin carries the timezone alongside the locale", () => {
+  const locale = localeEnv("tr-TR,tr;q=0.9", "Europe/Istanbul");
+  assert.equal(locale.TZ, "Europe/Istanbul");
+  assert.equal(locale.LC_ALL, "tr_TR.UTF-8");
+
+  const env = { TZ: "Etc/Unknown", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" };
+  pinProcessLocale(env);
+  assert.equal(env.TZ, TARGET_TZ);
+
+  // And the opt-out leaves the box's own zone alone, same as the locale.
+  const untouched = { TZ: "Etc/Unknown", SOLVER_PIN_LOCALE: "0" };
+  assert.equal(pinProcessLocale(untouched), null);
+  assert.equal(untouched.TZ, "Etc/Unknown");
 });

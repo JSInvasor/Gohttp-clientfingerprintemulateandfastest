@@ -67,6 +67,7 @@ export function exhaustedResult(lastResult, defaults) {
     user_agent: (lastResult && lastResult.user_agent) || defaults.userAgent,
     accept_language: (lastResult && lastResult.accept_language) || defaults.acceptLanguage,
     page_languages: (lastResult && lastResult.page_languages) || [],
+    timezone: (lastResult && lastResult.timezone) || "",
     cookies: (lastResult && lastResult.cookies) || "",
     cookie_list: collected,
     error: (lastResult && lastResult.error) || "",

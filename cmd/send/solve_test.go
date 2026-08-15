@@ -704,3 +704,39 @@ func captureStderr(t *testing.T, f func()) string {
 	os.Stderr = saved
 	return <-done
 }
+
+// A solve that ran in something that is not a timezone is worth a line.
+//
+// Intl answers from ICU, and ICU answers from TZ. On a container with no
+// /etc/localtime and no TZ — every minimal Docker image — it resolves to
+// "Etc/Unknown", which is not a zone any installed browser reports, on the
+// request that earns the cookie. solver/profile.js pins TZ for that reason, so
+// reaching this means the pin was off or the zone was one ICU does not know.
+func TestTimezoneIsReportedOnlyWhenItIsNotOne(t *testing.T) {
+	t.Run("silent for a real zone", func(t *testing.T) {
+		for _, tz := range []string{
+			"America/New_York", "Europe/Istanbul", "Asia/Tokyo", "Europe/Berlin",
+			// Empty is "not measured" — an older solver, or a cache entry
+			// written before this was recorded. Absence of a measurement is not
+			// evidence of a bad one.
+			"",
+		} {
+			stderr := captureStderr(t, func() { reportTimezone(tz) })
+			if stderr != "" {
+				t.Errorf("%q was reported as a problem:\n%s", tz, stderr)
+			}
+		}
+	})
+
+	t.Run("names the two that are not zones a browser reports", func(t *testing.T) {
+		for _, tz := range []string{"Etc/Unknown", "UTC"} {
+			stderr := captureStderr(t, func() { reportTimezone(tz) })
+			if !strings.Contains(stderr, tz) {
+				t.Errorf("the note for %q does not name it:\n%s", tz, stderr)
+			}
+			if !strings.Contains(stderr, "SOLVER_TZ") {
+				t.Errorf("the note for %q does not say how to fix it:\n%s", tz, stderr)
+			}
+		}
+	})
+}
