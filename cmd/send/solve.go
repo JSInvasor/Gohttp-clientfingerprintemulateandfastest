@@ -512,6 +512,15 @@ func seedFromResult(o *options, target string, e exit, res *solveResult) *solveS
 	switch {
 	case gotClearance:
 		report += fmt.Sprintf("\ncf_clearance issued for %s", cf.Domain)
+
+	case res.Status == solver.StatusOK:
+		// Got through without a cf_clearance, which is what passing anything
+		// that is not Cloudflare looks like. Saying "no cf_clearance — the
+		// challenge was not solved" here would be flatly untrue: the solver
+		// waited out an interstitial and watched the target start serving.
+		report += "\nno cf_clearance, and none was needed — the target stopped " +
+			"refusing and started serving. Seeding what it issued instead."
+
 	default:
 		// Worth continuing: a site behind Bot Fight Mode alone never issues a
 		// clearance cookie, and the __cf_bm the solve did earn is still the
