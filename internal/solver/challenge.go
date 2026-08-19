@@ -33,6 +33,34 @@ func IsChallengeTitle(title string) bool {
 	return challengeTitleRe.MatchString(title)
 }
 
+// IsChallengeStatus reports whether an edge answering a document with this
+// status is refusing rather than serving.
+//
+// This is the half of the detection that belongs to no vendor. Everything else
+// in this file describes Cloudflare — its element ids, its bootstrap global, its
+// wording — and against anything else those all read as the absence of a
+// challenge, which is the loudest way to be wrong: the solver concludes it was
+// never challenged and gives up in about a second with its whole budget left.
+// That is not hypothetical. A Turkish WAF serving a proof-of-work interstitial
+// under its own markup (`#capca-grid`, `/__ka/verify`, an inline script and no
+// `src` to match) trips none of the markers and none of the wording, and the
+// only thing about it that says "this is not the page you asked for" is the 403
+// it arrives with.
+//
+// 401 is not here. It is an origin asking for credentials, which is a thing to
+// report rather than a thing to wait out — nothing a browser does unattended
+// turns a 401 into a 200. The three that are here all describe an edge that
+// expects the client to do something and come back.
+func IsChallengeStatus(status int) bool {
+	switch status {
+	case 403, // the common interstitial answer, Cloudflare and otherwise
+		429, // rate limited: a wait may genuinely clear it
+		503: // "under attack", the other Cloudflare answer
+		return true
+	}
+	return false
+}
+
 // DetectChallengeScript runs inside the page and answers whether it carries any
 // Cloudflare challenge structure.
 //

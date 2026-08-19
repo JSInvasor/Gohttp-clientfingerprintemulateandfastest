@@ -143,6 +143,87 @@ func (t *Tab) WatchSentCookies(ctx context.Context) (*SentCookies, error) {
 	return s, nil
 }
 
+// DocumentStatus is what the edge answered this tab's main frame with, most
+// recent first-and-only.
+//
+// It exists because "is the challenge over" has no vendor-neutral answer in the
+// markup. The interstitial's markers are whatever that vendor happens to build,
+// its title is whatever it happens to say, and a detector written against one
+// vendor reads every other vendor's challenge as an absence of one. The status
+// line is the one thing every edge has to send and every one of them means the
+// same by: an interstitial is served with a refusal, and the content is served
+// with a 200. A challenge page replaces itself when it passes, so the passage
+// arrives here as a second main-frame response with a different status.
+type DocumentStatus struct {
+	mu     sync.Mutex
+	seen   int
+	status int
+	url    string
+}
+
+// Latest reports the most recent main-frame status, the URL it came from, and
+// how many main-frame responses have arrived.
+//
+// A count of zero is not a status of zero: it means nothing was observed, which
+// is a different claim from "the edge answered with nothing" and the caller has
+// to be able to tell them apart before concluding anything.
+func (d *DocumentStatus) Latest() (status int, url string, seen int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.status, d.url, d.seen
+}
+
+// WatchDocuments records the status of every main-frame document response.
+//
+// Subframes are excluded by frame id rather than by guessing from the URL: an
+// iframe is also type Document, and a Turnstile widget is an iframe — so a
+// watcher that took every Document would report the widget's status as the
+// page's. The main frame's id is read once here; it outlives the navigations
+// this watches.
+func (t *Tab) WatchDocuments(ctx context.Context) (*DocumentStatus, error) {
+	var tree struct {
+		FrameTree struct {
+			Frame struct {
+				ID string `json:"id"`
+			} `json:"frame"`
+		} `json:"frameTree"`
+	}
+	if err := t.call(ctx, "Page.getFrameTree", nil, &tree); err != nil {
+		return nil, err
+	}
+	mainFrame := tree.FrameTree.Frame.ID
+
+	d := &DocumentStatus{}
+	// Deliberately not removed: this watches for as long as the caller is
+	// interested, which is the whole life of the tab.
+	_ = t.on("Network.responseReceived", func(raw json.RawMessage) {
+		var ev struct {
+			FrameID  string `json:"frameId"`
+			Type     string `json:"type"`
+			Response struct {
+				Status int    `json:"status"`
+				URL    string `json:"url"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			return
+		}
+		if ev.Type != "Document" || ev.FrameID != mainFrame {
+			return
+		}
+		d.mu.Lock()
+		d.seen++
+		d.status = ev.Response.Status
+		d.url = ev.Response.URL
+		d.mu.Unlock()
+	})
+
+	if err := t.call(ctx, "Network.enable", nil, nil); err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
 // Response is what a captured navigation returned.
 type Response struct {
 	Status  int
@@ -162,11 +243,12 @@ type Response struct {
 // Sec-Fetch-* values being measured are the ones a document load produces, which
 // is what the Go client's default profile emits.
 //
-// This enables the Network domain, which the solve path deliberately does not.
-// Network.enable is not observable from the page the way Runtime.enable is — it
-// delivers events to us and changes nothing the document can read — but it is
-// still one more domain than a solve needs, so it lives on this call rather than
-// on Tab.
+// This enables the Network domain, which the solve path also does now — see
+// WatchDocuments, which needs it to read the status the edge answered with.
+// Network.enable is not observable from the page the way Runtime.enable is: it
+// delivers events to us and changes nothing the document can read. It stays on
+// the calls that need it rather than on Tab, so a caller that needs neither
+// still pays for neither.
 func (t *Tab) NavigateCapturing(ctx context.Context, url string) (*Response, error) {
 	if err := t.call(ctx, "Network.enable", nil, nil); err != nil {
 		return nil, err

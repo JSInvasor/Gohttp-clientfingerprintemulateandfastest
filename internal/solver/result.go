@@ -9,9 +9,13 @@ package solver
 
 // Status is how a solve ended.
 const (
-	// StatusOK means cf_clearance was issued for the target.
+	// StatusOK means the target let this session through: either it issued a
+	// cf_clearance, or it stopped refusing and started serving. The second half
+	// is what makes this mean anything off Cloudflare — an edge that answers a
+	// proof-of-work interstitial with a 403 and then the page with a 200 has
+	// cleared the session just as surely, and it never names a cookie.
 	StatusOK = "ok"
-	// StatusNoClearance means the run collected cookies but no clearance —
+	// StatusNoClearance means the run collected cookies but never got through —
 	// a zone with Bot Fight Mode and no UAM produces exactly this, and the
 	// __cf_bm it sets is worth reporting.
 	StatusNoClearance = "no_clearance"

@@ -569,7 +569,7 @@ latency  min 80µs   p50 2.3ms   p90 4ms   p99 5.9ms   max 35.2ms
 the summary — per-second series included — as JSON, and `send -h` lists the
 transport knobs (`-max-streams`, `-idle-conns`, `-sockbuf`, `-tfo`, …).
 
-### Getting past a Cloudflare challenge
+### Getting past a JS challenge
 
 `-solve` drives a real Chromium through the challenge first, then seeds what it
 earned into every session before the run starts. There is nothing to install
@@ -591,6 +591,21 @@ held back __cf_bm — bound to the browser session that earned them, not to the
 client replaying it (-solve-all-cookies to send them anyway)
 cf_clearance issued for .site.com
 ```
+
+Most of what the solver knows by name is Cloudflare's, but what it waits *for*
+is not. A solve ends when the edge stops refusing the main frame and starts
+serving it — the status line, which every vendor sends and all of them mean the
+same by. Asking "did a `cf_clearance` appear" instead is what made every other
+WAF read as a site that never challenged: a proof-of-work interstitial under its
+own markup, in its own language, tripped none of Cloudflare's markers, and the
+solve returned about a second after landing on it with its whole budget unspent.
+The behavioural simulation runs for the same window rather than after it, since
+a challenge that scores pointer movement and time-to-first-interaction decides
+before the old choreography had moved anything.
+
+What that does not buy is a challenge needing a human: an interstitial gated on
+a real click, or one asking you to pick the odd image out of a grid, is not
+something a solve completes unattended.
 
 Not everything the browser collected is a credential this client can carry, and
 the report names both halves rather than printing a count. `cf_clearance` is the

@@ -1,6 +1,7 @@
-// Package solver earns a Cloudflare clearance cookie with a real browser.
+// Package solver gets a real browser through an interstitial and hands back what
+// it earned.
 //
-// It drives the Chromium in internal/cdp through a challenge and hands back the
+// It drives the Chromium in internal/cdp through a challenge and returns the
 // cookies, the identity that earned them, and enough context for the caller to
 // tell a solve that will replay from one that will not.
 //
@@ -11,6 +12,16 @@
 // address, the cookie is issued to one identity and presented by another, and it
 // dies — usually within seconds under load, with no diagnostic beyond a wall of
 // 403s. Everything here is in service of making the two the same.
+//
+// That binding is Cloudflare's, and so is most of what this package knows by
+// name: cf_clearance, the interstitial's wording, its element ids, the Turnstile
+// widget. What is deliberately not Cloudflare's is how the solve decides it is
+// done. Asking "did a cf_clearance appear" answers no for every other vendor,
+// and the old code read that no as "this site does not challenge" — so a
+// proof-of-work interstitial under its own markup was reported as an open site,
+// about a second after landing on it, with the whole budget unspent. The
+// decision is the status the edge answered the main frame with, which every
+// vendor sends and all of them mean the same by. See waitForPassage.
 package solver
 
 import (

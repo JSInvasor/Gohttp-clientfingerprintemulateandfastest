@@ -290,7 +290,22 @@ func attempt(ctx context.Context, l Launcher, open newSession, target string, n 
 		return fail(err), true
 	}
 
-	outcome := waitForClearance(ctx, s, target)
+	// The page is occupied for the whole time the challenge is running, not
+	// only after it clears. A challenge that scores mouse movement, time to
+	// first interaction and scroll position decides during this window and
+	// submits as soon as its own work finishes — so activity that starts after
+	// the verdict is activity the verdict never saw. See startAttention.
+	stopAttention := startAttention(ctx, s.tab)
+	attentionStopped := false
+	endAttention := func() {
+		if !attentionStopped {
+			attentionStopped = true
+			stopAttention()
+		}
+	}
+	defer endAttention()
+
+	outcome := waitForPassage(ctx, s, target)
 
 	if !outcome.cleared && outcome.challenged {
 		// Still on a challenge. A widget will sit there until something clicks
@@ -298,7 +313,7 @@ func attempt(ctx context.Context, l Launcher, open newSession, target string, n 
 		// because the click is what starts the solve rather than finishing it.
 		if ctx.Err() == nil {
 			solveTurnstile(ctx, s.tab)
-			outcome = waitForClearance(ctx, s, target)
+			outcome = waitForPassage(ctx, s, target)
 		}
 	}
 
@@ -309,8 +324,13 @@ func attempt(ctx context.Context, l Launcher, open newSession, target string, n 
 		// page itself, and abandoning the attempt used to throw it away, so a
 		// run whose retry also failed reported nothing when it had in fact
 		// collected something usable.
+		endAttention()
 		return l.harvest(ctx, s, target), true
 	}
+
+	// The drift stops here so the post-clearance choreography is the only thing
+	// moving the pointer: two of them at once is a hand in two places.
+	endAttention()
 
 	// Whether clearance was present or not, give the behavioural scoring
 	// something to sample: on a bot-fight-mode-only zone this is what makes the
@@ -318,7 +338,15 @@ func attempt(ctx context.Context, l Launcher, open newSession, target string, n 
 	simulateHumanBehavior(ctx, s.tab)
 
 	// Re-read after the behaviour, which can elevate __cf_bm.
-	return l.harvest(ctx, s, target), outcome.cleared || outcome.challenged
+	res := l.harvest(ctx, s, target)
+	// harvest decides the status from the jar, which only knows about
+	// cf_clearance. A target that let us through without issuing one is still a
+	// target we got through to, and reporting that as no_clearance is what made
+	// every non-Cloudflare success look like a failure.
+	if outcome.cleared {
+		res.Status = StatusOK
+	}
+	return res, outcome.cleared || outcome.challenged
 }
 
 // ErrNoBrowser is what a caller gets when there is nothing to drive.

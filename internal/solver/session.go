@@ -27,8 +27,13 @@ import (
 // Both produce the same shape and everything below is written against it, so the
 // solving logic cannot drift between the one-exit path and the list.
 type session struct {
-	tab      *cdp.Tab
-	context  *cdp.Context
+	tab     *cdp.Tab
+	context *cdp.Context
+	// docs is what the edge answered this session's main frame with, which is
+	// how waitForPassage recognises a challenge that carries none of
+	// Cloudflare's markers. nil when the watcher could not be started, and
+	// waitForPassage falls back to the markup alone rather than to nothing.
+	docs     *cdp.DocumentStatus
 	version  string
 	major    int
 	launchMS int64
@@ -104,6 +109,27 @@ func (l Launcher) prepare(ctx context.Context, tab *cdp.Tab, browserVersion stri
 	return tab.SetTimezone(ctx, l.Profile.Timezone)
 }
 
+// watchDocuments starts the main-frame status watcher for a session, before
+// anything navigates.
+//
+// A failure here is a degradation rather than an error: without it the solve
+// still recognises a Cloudflare challenge by its markup, which is every
+// challenge the previous version could recognise at all. What it loses is the
+// vendor-neutral half — so it is said out loud rather than swallowed, because
+// the symptom otherwise is a non-Cloudflare challenge reported as a site that
+// never challenged, which is indistinguishable from the bug this replaced.
+func (l Launcher) watchDocuments(ctx context.Context, tab *cdp.Tab) *cdp.DocumentStatus {
+	docs, err := tab.WatchDocuments(ctx)
+	if err != nil {
+		if l.Stderr != nil {
+			fmt.Fprintf(l.Stderr, "solver: document status unavailable (%v); "+
+				"challenge detection falls back to page markup\n", err)
+		}
+		return nil
+	}
+	return docs
+}
+
 // newBrowserSession is a fresh Chromium per attempt: the single-exit path.
 func (l Launcher) newBrowserSession(proxy *Proxy) newSession {
 	return func(ctx context.Context) (*session, error) {
@@ -153,6 +179,7 @@ func (l Launcher) newBrowserSession(proxy *Proxy) newSession {
 		return &session{
 			tab:      tab,
 			context:  bctx,
+			docs:     l.watchDocuments(ctx, tab),
 			version:  b.Version.Product,
 			major:    ChromiumMajor(b.Version.Product),
 			launchMS: time.Since(start).Milliseconds(),
@@ -222,6 +249,7 @@ func (l Launcher) newContextSession(b *cdp.Browser, proxy *Proxy) newSession {
 		return &session{
 			tab:      tab,
 			context:  bctx,
+			docs:     l.watchDocuments(ctx, tab),
 			version:  b.Version.Product,
 			major:    ChromiumMajor(b.Version.Product),
 			launchMS: time.Since(start).Milliseconds(),
@@ -291,8 +319,12 @@ func (l Launcher) harvest(ctx context.Context, s *session, target string) *Resul
 	return res
 }
 
-// clearanceOutcome is what waitForClearance concluded.
-type clearanceOutcome struct {
+// passageOutcome is what waitForPassage concluded.
+type passageOutcome struct {
+	// cleared says the target is serving us rather than refusing us. It is not
+	// "a cf_clearance was issued": that is one way to get here and the only one
+	// the previous version could see, which is why every non-Cloudflare edge
+	// read as a site that never challenged.
 	cleared bool
 	// challenged says whether a retry has anything to retry. A site with no
 	// challenge at all has already given us everything it is going to, and
@@ -300,20 +332,55 @@ type clearanceOutcome struct {
 	challenged bool
 }
 
-// waitForClearance polls until cf_clearance appears for the target origin, or
-// until the page leaves the challenge state, or until the deadline.
-func waitForClearance(ctx context.Context, s *session, target string) clearanceOutcome {
+// waitForPassage polls until the target is serving content, until it is clear
+// nothing is in the way, or until the deadline.
+//
+// Three signals, in the order their answers can be trusted:
+//
+//  1. The clearance cookie. Definitive where it applies and cheaper than
+//     anything else, so it stays the fast path — but only Cloudflare issues one,
+//     and treating its absence as "not challenged" is the bug this replaces.
+//  2. The status the edge answered the main frame with. This is the vendor-
+//     neutral one: an interstitial is a refusal and content is a 200, whoever is
+//     serving it, in whatever language, under whatever markup. A challenge that
+//     passes replaces its own page, so the passage arrives as a second
+//     main-frame response carrying a different status.
+//  3. The page's own markup. Cloudflare's markers and wording, unchanged. It is
+//     last because it is the one that only recognises one vendor.
+//
+// The combination matters more than any of them. Status alone is not enough —
+// some managed challenges are served with a 200 — and markup alone is what was
+// there before. So a refusal keeps the wait alive whatever the markup says, and
+// only a served status with nothing interstitial about the page ends it.
+func waitForPassage(ctx context.Context, s *session, target string) passageOutcome {
+	// Whether anything was ever in the way. It is the difference between "we got
+	// through a challenge" and "there was never a challenge", and collapsing the
+	// two is not cosmetic: `send` keys on it, and a solve that reports success
+	// with an empty jar seeds a run with no cookies that then replays as though
+	// it had solved something. A site that simply serves its content has given
+	// us nothing to carry, and says so.
+	sawChallenge := false
+
 	for {
 		select {
 		case <-ctx.Done():
-			return clearanceOutcome{cleared: false, challenged: true}
+			return passageOutcome{cleared: false, challenged: true}
 		default:
 		}
 
 		if all, err := s.context.Cookies(ctx); err == nil {
 			if HasClearance(CookiesForURL(all, target)) {
-				return clearanceOutcome{cleared: true}
+				// A clearance is only ever issued by something that challenged,
+				// so this is passage whether or not a refusal was observed on
+				// the way — the first navigation can be answered with the
+				// interstitial and the cookie in one round trip.
+				return passageOutcome{cleared: true, challenged: true}
 			}
+		}
+
+		status, _, seen := 0, "", 0
+		if s.docs != nil {
+			status, _, seen = s.docs.Latest()
 		}
 
 		// Wording first, structure only as the tie-breaker — and the order is
@@ -332,20 +399,51 @@ func waitForClearance(ctx context.Context, s *session, target string) clearanceO
 		// case here is one title read, and the probe is reached only when the
 		// title says the challenge is over: the one moment its answer changes
 		// anything, and a moment that happens at most once per attempt.
+		interstitial := true
 		title, err := s.tab.Title(ctx)
 		if err == nil && title != "" && !IsChallengeTitle(title) {
-			var challenged bool
+			var marked bool
 			// A probe that cannot run — an execution context torn down
 			// mid-navigation — leaves the decision to the title, exactly as
 			// before.
-			if err := s.tab.Evaluate(ctx, DetectChallengeScript, &challenged); err != nil || !challenged {
-				return clearanceOutcome{cleared: false, challenged: false}
+			if err := s.tab.Evaluate(ctx, DetectChallengeScript, &marked); err != nil || !marked {
+				interstitial = false
 			}
+		}
+
+		refusing := seen > 0 && IsChallengeStatus(status)
+		if refusing || interstitial {
+			sawChallenge = true
+		}
+
+		switch {
+		case refusing:
+			// The edge is still refusing, so keep waiting whatever the markup
+			// says. This is the whole of the generalisation: a challenge with no
+			// Cloudflare markers and a title in nobody's regex used to fall
+			// straight through the check below and be reported as a site that
+			// never challenged.
+
+		case interstitial:
+			// The markup still says challenge even though the status does not.
+			// Some managed challenges are served with a 200.
+
+		case sawChallenge:
+			// Something was in the way and no longer is: the edge is serving and
+			// the page is not an interstitial. That is passage, whether or not a
+			// cookie named cf_clearance was ever involved.
+			return passageOutcome{cleared: true, challenged: true}
+
+		default:
+			// Nothing was ever in the way. There is no clearance to earn here
+			// and nothing for a retry to retry — this is the answer the site
+			// gives, not a failure to get one.
+			return passageOutcome{cleared: false, challenged: false}
 		}
 
 		select {
 		case <-ctx.Done():
-			return clearanceOutcome{cleared: false, challenged: true}
+			return passageOutcome{cleared: false, challenged: true}
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
