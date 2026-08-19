@@ -305,17 +305,14 @@ func attempt(ctx context.Context, l Launcher, open newSession, target string, n 
 	}
 	defer endAttention()
 
+	// The click that used to be here is inside waitForPassage now, and it had to
+	// move to happen at all. It ran only when the wait came back challenged and
+	// the context was still live — but the wait comes back challenged only when
+	// the context is done, so the second half of that condition was false every
+	// single time. Pressing a widget after the budget is spent is not a thing
+	// worth doing anyway: the click is what starts a managed challenge, so it
+	// belongs where there is still time left to solve in.
 	outcome := waitForPassage(ctx, s, target)
-
-	if !outcome.cleared && outcome.challenged {
-		// Still on a challenge. A widget will sit there until something clicks
-		// it, so try that before spending the retry — and then keep waiting,
-		// because the click is what starts the solve rather than finishing it.
-		if ctx.Err() == nil {
-			solveTurnstile(ctx, s.tab)
-			outcome = waitForPassage(ctx, s, target)
-		}
-	}
 
 	if !outcome.cleared && outcome.challenged && n < maxAttempts {
 		// Still challenged with a retry left. A fresh context often gets a

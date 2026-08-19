@@ -361,12 +361,31 @@ func waitForPassage(ctx context.Context, s *session, target string) passageOutco
 	// us nothing to carry, and says so.
 	sawChallenge := false
 
+	// A control that is waiting to be pressed waits forever, so the press has to
+	// happen inside this loop. It used to live at the call site, guarded by
+	// `ctx.Err() == nil` and reached only when the wait returned challenged —
+	// and the wait returns challenged only when the context is done, so the
+	// guard was false every time it was evaluated. Turnstile checkboxes were
+	// never clicked once, by anything, on any run.
+	//
+	// The first pass is too early: an interstitial fetches its own bootstrap
+	// before it builds the control, so there is nothing to find yet. After that
+	// it is retried a few times rather than once, because a page that rejects an
+	// answer rebuilds its controls and the click has to survive that.
+	const (
+		firstClickPass = 2
+		clickEveryPass = 12
+		maxClicks      = 3
+	)
+	pass, clicks := 0, 0
+
 	for {
 		select {
 		case <-ctx.Done():
 			return passageOutcome{cleared: false, challenged: true}
 		default:
 		}
+		pass++
 
 		if all, err := s.context.Cookies(ctx); err == nil {
 			if HasClearance(CookiesForURL(all, target)) {
@@ -414,6 +433,15 @@ func waitForPassage(ctx context.Context, s *session, target string) passageOutco
 		refusing := seen > 0 && IsChallengeStatus(status)
 		if refusing || interstitial {
 			sawChallenge = true
+
+			// Still in the way, so look for something to press. Soft on every
+			// failure: most interstitials solve themselves and have no control
+			// at all, which is the expected answer rather than a problem.
+			due := pass == firstClickPass || (pass > firstClickPass && pass%clickEveryPass == 0)
+			if due && clicks < maxClicks {
+				clicks++
+				clickVerification(ctx, s.tab)
+			}
 		}
 
 		switch {
@@ -459,15 +487,119 @@ func waitForPassage(ctx context.Context, s *session, target string) passageOutco
 // Every failure here is soft. Most pages have no widget at all — an interstitial
 // that solves itself is the common case — so "no checkbox found" is the expected
 // answer and not a reason to end an attempt that is otherwise going fine.
-func solveTurnstile(ctx context.Context, tab *cdp.Tab) {
+func solveTurnstile(ctx context.Context, tab *cdp.Tab) bool {
 	box, ok := findTurnstileBox(ctx, tab)
 	if !ok {
-		return
+		return false
 	}
 	// 15% in from the left edge and centred vertically is where the checkbox
 	// sits inside the widget; the rest of the box is its label.
-	_ = tab.MouseClick(ctx, box.x+box.width*0.15, box.y+box.height/2)
+	return tab.MouseClick(ctx, box.x+box.width*0.15, box.y+box.height/2) == nil
 }
+
+// clickVerification presses whatever the page is waiting to be pressed.
+//
+// Turnstile first, because it is precise and because its checkbox carries no
+// text for the generic probe to recognise. Then the generic one, for the
+// interstitials that gate on an ordinary button — "I am human", "doğrula",
+// "continue" — which is a shape Cloudflare does not have a monopoly on and
+// which nothing here could press before.
+func clickVerification(ctx context.Context, tab *cdp.Tab) bool {
+	if solveTurnstile(ctx, tab) {
+		return true
+	}
+	var box *struct {
+		X float64 `json:"x"`
+		Y float64 `json:"y"`
+		W float64 `json:"w"`
+		H float64 `json:"h"`
+	}
+	if err := tab.Evaluate(ctx, findVerifyControlScript, &box); err != nil || box == nil {
+		return false
+	}
+	return tab.MouseClick(ctx, box.X+box.W/2, box.Y+box.H/2) == nil
+}
+
+// findVerifyControlScript returns the box of the one control on this page that
+// is asking to be clicked, or null.
+//
+// It is deliberately unwilling. A challenge page is single-purpose, so clicking
+// the wrong thing on one is cheap — but this runs on whatever the target served,
+// and "press the only button" would eventually press something that submits an
+// order. So a candidate has to be a real control, has to be visible, and has to
+// say what it is: the text, the aria-label, the id or the class has to read like
+// a verification. Anything that only looks like a button is left alone, and a
+// widget with no text at all is Turnstile's business rather than this one's.
+//
+// Open shadow roots are walked because a control inside a web component is still
+// an ordinary control. Closed ones are not reachable from here at all, which is
+// what findTurnstileBox exists for.
+const findVerifyControlScript = `(() => {
+  // Both cases spelled out for Turkish: the i/İ pair does not fold under the
+  // JS "i" flag, so /insan/i does not match "İnsan".
+  const VERIFY = new RegExp(
+    "verify|verification|human|not a robot|i'?m not human|continue|proceed|" +
+    "doğrula|dogrula|İnsan|insan|robot değilim|devam et|" +
+    "ich bin kein roboter|bestätigen|je ne suis pas un robot|vérifier|" +
+    "no soy un robot|verificar|sou humano|" +
+    "не робот|подтверди|" +
+    "我不是机器人|私は人間",
+    "i");
+
+  const nodes = [];
+  const walk = (root, depth) => {
+    if (depth > 4 || nodes.length > 2000) return;
+    let found;
+    try { found = root.querySelectorAll("*"); } catch { return; }
+    for (const el of found) {
+      if (nodes.length > 2000) return;
+      nodes.push(el);
+      if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+    }
+  };
+  walk(document, 0);
+
+  let best = null;
+  for (const el of nodes) {
+    const tag = (el.tagName || "").toLowerCase();
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    const type = (el.getAttribute("type") || "").toLowerCase();
+
+    const isControl = tag === "button"
+      || (tag === "input" && (type === "checkbox" || type === "submit" || type === "button"))
+      || role === "button" || role === "checkbox";
+    if (!isControl || el.disabled) continue;
+
+    let style;
+    try { style = getComputedStyle(el); } catch { continue; }
+    if (!style || style.visibility === "hidden" || style.display === "none") continue;
+    if (Number(style.opacity) < 0.1) continue;
+
+    const r = el.getBoundingClientRect();
+    // On screen, and big enough to be a target rather than a tracking pixel.
+    if (r.width < 16 || r.height < 16 || r.width > 1600 || r.height > 600) continue;
+    if (r.x < 0 || r.y < 0) continue;
+
+    const cls = typeof el.className === "string" ? el.className : "";
+    const text = [
+      el.innerText || "",
+      el.getAttribute("aria-label") || "",
+      el.getAttribute("value") || "",
+      el.getAttribute("title") || "",
+      el.id || "",
+      cls,
+    ].join(" ").slice(0, 400);
+    if (!VERIFY.test(text)) continue;
+
+    // A checkbox that says it is a verification is the strongest shape there
+    // is; a button that says so is next.
+    const score = (type === "checkbox" || role === "checkbox") ? 2 : 1;
+    if (!best || score > best.score) {
+      best = {score: score, x: r.x, y: r.y, w: r.width, h: r.height};
+    }
+  }
+  return best ? {x: best.x, y: best.y, w: best.w, h: best.h} : null;
+})()`
 
 type widgetBox struct {
 	x, y, width, height float64

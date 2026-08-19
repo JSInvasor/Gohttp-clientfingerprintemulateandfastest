@@ -29,6 +29,10 @@ type fakeWAF struct {
 	// for the proof-of-work. It is what decides whether anything had a chance to
 	// move the pointer first.
 	solveAfter time.Duration
+	// interactive gates the submit on a real click, the way an interstitial that
+	// wants a human does. The proof of work still runs; it just does not count
+	// for anything until the button is pressed.
+	interactive bool
 
 	mu       sync.Mutex
 	verified bool
@@ -36,8 +40,19 @@ type fakeWAF struct {
 }
 
 type wafSignals struct {
-	MouseMoves int `json:"mm"`
-	ElapsedMS  int `json:"el"`
+	MouseMoves int  `json:"mm"`
+	ElapsedMS  int  `json:"el"`
+	Clicked    bool `json:"clicked"`
+}
+
+// hiddenAttr keeps the button out of the way on the pages that do not gate on
+// it, so the non-interactive tests stay a test of the wait rather than of the
+// click.
+func hiddenAttr(interactive bool) string {
+	if interactive {
+		return ""
+	}
+	return ` style="display:none"`
 }
 
 const wafCookie = "__ka_pass"
@@ -45,6 +60,18 @@ const wafCookie = "__ka_pass"
 func newFakeWAF(t *testing.T, solveAfter time.Duration) *fakeWAF {
 	t.Helper()
 	w := &fakeWAF{solveAfter: solveAfter}
+	return w.serve(t)
+}
+
+// newInteractiveWAF is the same interstitial gated on a button press.
+func newInteractiveWAF(t *testing.T, solveAfter time.Duration) *fakeWAF {
+	t.Helper()
+	w := &fakeWAF{solveAfter: solveAfter, interactive: true}
+	return w.serve(t)
+}
+
+func (w *fakeWAF) serve(t *testing.T) *fakeWAF {
+	t.Helper()
 	mux := http.NewServeMux()
 
 	// The endpoint the interstitial's own script posts its answer to. It issues
@@ -73,23 +100,42 @@ func newFakeWAF(t *testing.T, solveAfter time.Duration) *fakeWAF {
 		rw.WriteHeader(http.StatusForbidden)
 		fmt.Fprintf(rw, `<html><head><title>site.example — bağlantı kontrol ediliyor</title></head>
 <body>
-  <div id="card"><div id="capca-grid"></div></div>
+  <div id="card">
+    <div id="capca-grid"></div>
+    <button id="cbtn" type="button"%s>
+      <span id="cbox"></span>
+      <span id="ctext">İnsan olduğumu doğrula</span>
+    </button>
+  </div>
   <script>
   (function(){
+    var INTERACTIVE = %t;
     var moves = 0;
     window.addEventListener("mousemove", function(){ moves++; }, {passive:true});
     var started = Date.now();
-    setTimeout(function(){
+
+    var confirmed = !INTERACTIVE, pending = null;
+    function submit(){
       fetch("/__ka/verify", {
         method: "POST",
         credentials: "same-origin",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({mm: moves, el: Date.now() - started})
+        body: JSON.stringify({mm: moves, el: Date.now() - started, clicked: INTERACTIVE})
       }).then(function(){ location.reload(); });
+    }
+    document.getElementById("cbtn").addEventListener("click", function(ev){
+      // A synthetic click must not count. The whole point of gating on a press
+      // is that something outside the page made it.
+      if (!ev.isTrusted) return;
+      confirmed = true;
+      if (pending !== null) submit();
+    });
+    setTimeout(function(){
+      if (confirmed) { submit(); } else { pending = 1; }
     }, %d);
   })();
   </script>
-</body></html>`, w.solveAfter.Milliseconds())
+</body></html>`, hiddenAttr(w.interactive), w.interactive, w.solveAfter.Milliseconds())
 	})
 
 	w.server = httptest.NewServer(mux)
@@ -172,5 +218,42 @@ func TestChallengeSeesActivityBeforeItDecides(t *testing.T) {
 	if sig.MouseMoves == 0 {
 		t.Errorf("the challenge saw %d mouse moves before it decided; "+
 			"the behaviour simulation is running after the verdict, not during it", sig.MouseMoves)
+	}
+}
+
+// An interstitial gated on a real press has to actually be pressed.
+//
+// Two things were wrong before this. The click lived at the call site behind
+// `ctx.Err() == nil`, reached only when the wait returned challenged — and the
+// wait returns challenged only when the context is done, so the guard was false
+// every time it was evaluated and no widget was ever clicked by anything. And
+// what it would have clicked was a Turnstile widget, which is one vendor's shape
+// of a question every WAF asks.
+//
+// The button here refuses a synthetic click, so passing this needs a real input
+// event rather than an element.click() from a shim.
+func TestSolveClicksAVerifyButton(t *testing.T) {
+	requireBrowser(t)
+	waf := newInteractiveWAF(t, 1500*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	res, err := Solve(ctx, testOptions(t, waf.server.URL+"/", 60*time.Second), "")
+	if err != nil {
+		t.Fatalf("Solve: %v", err)
+	}
+	if res.Status != StatusOK {
+		t.Fatalf("status = %q (%s), want ok — the button was there to be pressed", res.Status, res.Error)
+	}
+	sig, ok := waf.observed()
+	if !ok {
+		t.Fatal("the page never submitted: nothing pressed the button")
+	}
+	if !sig.Clicked {
+		t.Error("the page submitted without its gate being satisfied, which this fake cannot do")
+	}
+	if !strings.Contains(res.Cookies, wafCookie+"=earned") {
+		t.Errorf("cookies = %q, want the cookie the interstitial issued", res.Cookies)
 	}
 }
