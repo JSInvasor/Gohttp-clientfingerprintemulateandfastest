@@ -32,12 +32,13 @@ a browser at that layer requires editing the transport, not configuring it.
 
 ## Local changes
 
-Six files differ from upstream. Anything not listed here is unmodified, so an
+Seven files differ from upstream. Anything not listed here is unmodified, so an
 upstream bump only needs these to be re-applied.
 
 | File | Change |
 | --- | --- |
 | `frame.go`, `server.go`, `write.go` | Import path only: `golang.org/x/net/http2/hpack` → the vendored `internal/http2/hpack`. |
+| `headermap.go` | Adds the nine request headers this client sends that Go's table predates — the `sec-ch-ua*`, `sec-fetch-*`, `upgrade-insecure-requests` and `priority` names. A name missing from the table takes `asciiToLower`, which is a `strings.ToLower` and an allocation per header per request, so without this the profile the package exists to emit is also the one it encodes slowest. `TestCommonHeaderTableCoversTheProfileHeaders` fails if a re-apply drops them. |
 | `http2.go` | Adds `SettingNoRFC7540Priorities` (0x9). Safari sends it, and the Akamai fingerprint includes it. |
 | `client_conn_pool.go` | `getStartDialLocked` no longer de-duplicates concurrent dials to the same host. Upstream allows one in-flight dial per address, which caps connection-pool growth at one connection at a time and is the main throughput ceiling when thousands of workers start together. |
 | `transport.go` | The bulk of the fork (~228 diff lines): configurable SETTINGS and their emission order, per-profile initial WINDOW_UPDATE, pseudo-header order, `HeaderOrder` for HEADERS frames, and `MaxStreamsPerConn`. |
