@@ -2,10 +2,13 @@ package cdp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -51,6 +54,210 @@ func (t *Tab) Navigate(ctx context.Context, url string) error {
 		// happened rather than discarding the session.
 		return fmt.Errorf("navigate %s: %w", url, ctx.Err())
 	}
+}
+
+// SentCookies records the Cookie header the browser actually put on the wire.
+//
+// This exists because "the cookie was presented and refused" and "the cookie was
+// never sent" look identical from the response, and a cookie that fails to be
+// stored quietly produces the second while reading as the first. Any tool that
+// concludes something about a clearance from a challenged response is asserting
+// the cookie went out, and until this is observed that assertion is unfounded.
+//
+// It has to come from Network.requestWillBeSentExtraInfo rather than from the
+// request event. Chrome's network stack adds Cookie after the interception
+// point, so the plain request headers report no Cookie on a request that carries
+// one — a false "never sent" on every attempt. Measured against a local server
+// that recorded what it received:
+//
+//	server actually received   "cf_clearance=abc123"
+//	requestWillBeSent headers  (absent)
+//	extraInfo headers.Cookie   "cf_clearance=abc123"
+type SentCookies struct {
+	mu       sync.Mutex
+	observed bool
+	header   string
+}
+
+// Header returns the Cookie header that went out and whether the wire could be
+// observed at all. Not observed is not the same as nothing having been sent, and
+// reporting an empty string for both would turn one into the other.
+func (s *SentCookies) Header() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.header, s.observed
+}
+
+// Names are the cookie names that went out, in wire order.
+func (s *SentCookies) Names() ([]string, bool) {
+	header, ok := s.Header()
+	if !ok {
+		return nil, false
+	}
+	var names []string
+	for _, part := range strings.Split(header, ";") {
+		name, _, _ := strings.Cut(strings.TrimSpace(part), "=")
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names, true
+}
+
+// WatchSentCookies starts recording what the next request carries.
+//
+// Only the first request is kept: a challenge redirects, and the redirects carry
+// whatever the interstitial set rather than what was presented to it.
+func (t *Tab) WatchSentCookies(ctx context.Context) (*SentCookies, error) {
+	s := &SentCookies{}
+	t.on("Network.requestWillBeSentExtraInfo", func(raw json.RawMessage) {
+		var ev struct {
+			Headers map[string]string `json:"headers"`
+		}
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			return
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.observed {
+			return
+		}
+		s.observed = true
+		for name, value := range ev.Headers {
+			if strings.EqualFold(name, "cookie") {
+				s.header = value
+				return
+			}
+		}
+	})
+	if err := t.call(ctx, "Network.enable", nil, nil); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// Response is what a captured navigation returned.
+type Response struct {
+	Status  int
+	Body    string
+	Headers map[string]string
+}
+
+// NavigateCapturing loads url and hands back the raw response body.
+//
+// The body is read from the network rather than from the rendered document, and
+// that is the whole reason this exists: Chrome's JSON viewer wraps a JSON
+// response in markup and truncates the visible text on a large one, so scraping
+// the DOM measures the viewer instead of the response. A fingerprint endpoint's
+// answer has to arrive byte for byte.
+//
+// It is also a real navigation rather than a fetch(): the header order and the
+// Sec-Fetch-* values being measured are the ones a document load produces, which
+// is what the Go client's default profile emits.
+//
+// This enables the Network domain, which the solve path deliberately does not.
+// Network.enable is not observable from the page the way Runtime.enable is — it
+// delivers events to us and changes nothing the document can read — but it is
+// still one more domain than a solve needs, so it lives on this call rather than
+// on Tab.
+func (t *Tab) NavigateCapturing(ctx context.Context, url string) (*Response, error) {
+	if err := t.call(ctx, "Network.enable", nil, nil); err != nil {
+		return nil, err
+	}
+	defer func() {
+		dctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = t.call(dctx, "Network.disable", nil, nil)
+	}()
+
+	type captured struct {
+		requestID string
+		status    int
+		headers   map[string]string
+	}
+	var (
+		mu   sync.Mutex
+		doc  *captured
+		done = make(chan struct{})
+		once sync.Once
+	)
+
+	t.on("Network.responseReceived", func(raw json.RawMessage) {
+		var ev struct {
+			RequestID string `json:"requestId"`
+			Type      string `json:"type"`
+			Response  struct {
+				Status  int               `json:"status"`
+				Headers map[string]string `json:"headers"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			return
+		}
+		// The document, not its subresources: a page pulls scripts and images
+		// and any of them would otherwise be captured as the answer.
+		if ev.Type != "Document" {
+			return
+		}
+		mu.Lock()
+		doc = &captured{requestID: ev.RequestID, status: ev.Response.Status, headers: ev.Response.Headers}
+		mu.Unlock()
+	})
+
+	finished := func(raw json.RawMessage) {
+		var ev struct {
+			RequestID string `json:"requestId"`
+		}
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			return
+		}
+		mu.Lock()
+		match := doc != nil && doc.requestID == ev.RequestID
+		mu.Unlock()
+		if match {
+			once.Do(func() { close(done) })
+		}
+	}
+	t.on("Network.loadingFinished", finished)
+	// A failed load still ends the wait; the status captured above is what says
+	// what happened, and hanging until the deadline would say nothing at all.
+	t.on("Network.loadingFailed", finished)
+
+	if err := t.Navigate(ctx, url); err != nil {
+		return nil, err
+	}
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("capture %s: %w", url, ctx.Err())
+	}
+
+	mu.Lock()
+	got := doc
+	mu.Unlock()
+	if got == nil {
+		return nil, fmt.Errorf("no document response from %s", url)
+	}
+
+	var body struct {
+		Body          string `json:"body"`
+		Base64Encoded bool   `json:"base64Encoded"`
+	}
+	err := t.call(ctx, "Network.getResponseBody",
+		map[string]any{"requestId": got.requestID}, &body)
+	if err != nil {
+		return nil, err
+	}
+	text := body.Body
+	if body.Base64Encoded {
+		decoded, err := base64.StdEncoding.DecodeString(text)
+		if err != nil {
+			return nil, fmt.Errorf("decode %s body: %w", url, err)
+		}
+		text = string(decoded)
+	}
+	return &Response{Status: got.status, Body: text, Headers: got.headers}, nil
 }
 
 // URL is where the tab currently is.

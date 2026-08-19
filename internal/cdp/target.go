@@ -90,6 +90,23 @@ func (c *Context) Cookies(ctx context.Context) ([]Cookie, error) {
 	return out.Cookies, nil
 }
 
+// SetCookies puts cookies into this context's jar, for a session that is meant
+// to present a credential it did not earn.
+//
+// Storage.setCookies scoped to the context, for the same reason the read is: in
+// a browser serving several contexts, writing at browser scope would put one
+// exit's credential where another exit can present it.
+func (c *Context) SetCookies(ctx context.Context, cookies []Cookie) error {
+	if len(cookies) == 0 {
+		return nil
+	}
+	params := map[string]any{"cookies": cookies}
+	if c.id != "" {
+		params["browserContextId"] = c.id
+	}
+	return c.b.conn.call(ctx, "", "Storage.setCookies", params, nil)
+}
+
 // Cookie is CDP's Network.Cookie, trimmed to the fields a solve reports.
 type Cookie struct {
 	Name     string  `json:"name"`
