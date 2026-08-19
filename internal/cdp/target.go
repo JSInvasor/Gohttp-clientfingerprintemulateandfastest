@@ -159,6 +159,8 @@ func (c *Context) NewTab(ctx context.Context) (*Tab, error) {
 		sessionID: attached.SessionID,
 		events:    make(map[string][]func(json.RawMessage)),
 	}
+	t.wake = sync.NewCond(&t.mu)
+	go t.pump()
 	c.b.conn.onEvent(attached.SessionID, t.handleEvent)
 
 	// Page has to be enabled for lifecycle events; that is a domain the page
@@ -178,7 +180,11 @@ type Tab struct {
 	sessionID string
 
 	mu     sync.Mutex
+	wake   *sync.Cond
 	events map[string][]func(json.RawMessage)
+	// queue holds events the read loop handed over but the pump has not run yet.
+	// See handleEvent for why they cannot be run where they arrive.
+	queue  []*message
 	closed bool
 	// Where the pointer was left. Input.dispatchMouseEvent carries an absolute
 	// position and no state, so the browser has no notion of "the cursor" —
@@ -191,16 +197,57 @@ func (t *Tab) call(ctx context.Context, method string, params any, out any) erro
 	return t.b.conn.call(ctx, t.sessionID, method, params, out)
 }
 
+// handleEvent is called by the connection's read loop. It only queues.
+//
+// Running handlers here would be a deadlock, not a slow path. A handler that
+// issues a CDP command — Fetch.continueWithAuth answering a proxy's 407 is the
+// one this driver needs — blocks waiting for a response that only the read loop
+// can deliver, and the read loop is the goroutine it is blocking. Every
+// authenticated proxy request would stall until its context expired and then
+// fail to authenticate.
+//
+// The queue is a slice rather than a buffered channel because a full channel
+// puts the block back where it was. Ordering is kept: one pump per tab, events
+// in arrival order, which is what Network.responseReceived-then-loadingFinished
+// depends on.
 func (t *Tab) handleEvent(msg *message) {
 	t.mu.Lock()
-	hs := append([]func(json.RawMessage){}, t.events[msg.Method]...)
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.queue = append(t.queue, msg)
 	t.mu.Unlock()
-	for _, h := range hs {
-		h(msg.Params)
+	t.wake.Signal()
+}
+
+// pump runs this tab's handlers, one event at a time, off the read loop.
+func (t *Tab) pump() {
+	for {
+		t.mu.Lock()
+		for len(t.queue) == 0 && !t.closed {
+			t.wake.Wait()
+		}
+		if t.closed && len(t.queue) == 0 {
+			t.mu.Unlock()
+			return
+		}
+		msg := t.queue[0]
+		t.queue = t.queue[1:]
+		hs := append([]func(json.RawMessage){}, t.events[msg.Method]...)
+		t.mu.Unlock()
+
+		for _, h := range hs {
+			h(msg.Params)
+		}
 	}
 }
 
 // on registers a handler for one CDP event on this tab.
+//
+// Handlers run on the tab's pump, so they may issue CDP commands — but they run
+// one at a time, so a slow handler delays this tab's later events. Nothing here
+// needs one that is slow.
 func (t *Tab) on(method string, h func(json.RawMessage)) {
 	t.mu.Lock()
 	t.events[method] = append(t.events[method], h)
@@ -216,6 +263,9 @@ func (t *Tab) Close(ctx context.Context) error {
 	}
 	t.closed = true
 	t.mu.Unlock()
+	// Wake the pump so it can see the close and return rather than sitting on
+	// the condition for the life of the process.
+	t.wake.Broadcast()
 
 	t.b.conn.onEvent(t.sessionID, nil)
 	return t.b.conn.call(ctx, "", "Target.closeTarget",

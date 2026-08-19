@@ -605,13 +605,14 @@ func TestLanguageSplitIsReported(t *testing.T) {
 			reportLanguageSplit("en-US,en;q=0.9", []string{"en-US"})
 		})
 		// The note has to name both sides and where they are supposed to come
-		// from. It used to send the reader to Emulation.setUserAgentOverride,
-		// which the solver deliberately does not use — solver/parity.test.js
-		// fails if it comes back. Both halves are built from one value in
-		// profile.js now, so that is where the note points.
+		// from. The Node solver derived the header from a launch flag and then
+		// shimmed navigator.languages to match, so the note sent the reader to
+		// the shim. There is no shim now — the browser sets both halves from one
+		// preference list — so the note points at the derivation and at the
+		// measurement behind it.
 		for _, want := range []string{
 			"en-US,en;q=0.9", "[en-US en]", "[en-US]",
-			"expectedAcceptLanguage", "--accept-lang",
+			"expectedAcceptLanguage", "setUserAgentOverride",
 		} {
 			if !strings.Contains(stderr, want) {
 				t.Errorf("the note does not mention %q:\n%s", want, stderr)
@@ -755,7 +756,7 @@ func captureStderr(t *testing.T, f func()) string {
 // Intl answers from ICU, and ICU answers from TZ. On a container with no
 // /etc/localtime and no TZ — every minimal Docker image — it resolves to
 // "Etc/Unknown", which is not a zone any installed browser reports, on the
-// request that earns the cookie. solver/profile.js pins TZ for that reason, so
+// request that earns the cookie. internal/solver pins TZ for that reason, so
 // reaching this means the pin was off or the zone was one ICU does not know.
 func TestTimezoneIsReportedOnlyWhenItIsNotOne(t *testing.T) {
 	t.Run("silent for a real zone", func(t *testing.T) {

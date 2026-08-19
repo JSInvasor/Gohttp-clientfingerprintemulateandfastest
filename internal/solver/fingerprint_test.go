@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -16,11 +17,19 @@ import (
 func TestFingerprintMeasuresTheInstalledBrowser(t *testing.T) {
 	requireBrowser(t)
 
-	var gotUA string
+	// Guarded: the handler runs on the server's goroutine and the assertions run
+	// on the test's.
+	var (
+		mu    sync.Mutex
+		gotUA string
+	)
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotUA = r.Header.Get("User-Agent")
+		ua := r.Header.Get("User-Agent")
+		mu.Lock()
+		gotUA = ua
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"user_agent":%q,"ja4":"t13d1516h2_8daaf6152771_b0da82dd1658"}`, gotUA)
+		fmt.Fprintf(w, `{"user_agent":%q,"ja4":"t13d1516h2_8daaf6152771_b0da82dd1658"}`, ua)
 	}))
 	defer site.Close()
 
@@ -37,6 +46,8 @@ func TestFingerprintMeasuresTheInstalledBrowser(t *testing.T) {
 	}
 	// The whole point: the browser answers for itself here, so the UA on the
 	// wire must be its own and not the pinned Chrome 151.
+	mu.Lock()
+	defer mu.Unlock()
 	if gotUA == "" {
 		t.Fatal("the endpoint saw no User-Agent")
 	}

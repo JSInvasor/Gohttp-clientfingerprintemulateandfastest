@@ -15,7 +15,7 @@ import (
 // title is a check that quietly stops matching, and stops matching in exactly
 // the case it was written for. The title is still consulted, last, as a second
 // opinion on an interstitial whose markup changed but whose wording did not.
-// That is the order solver/challenge.js uses, for the same reason.
+// That is the order internal/solver/challenge.go uses, for the same reason.
 
 // edgeSignature is a header that names its vendor.
 type edgeSignature struct {
@@ -126,7 +126,7 @@ const (
 )
 
 // cloudflareMarkers are the challenge platform's own structure. They are the
-// raw-HTML form of the selectors solver/challenge.js looks for in the DOM,
+// raw-HTML form of the selectors internal/solver/challenge.go looks for in the DOM,
 // because a probe has bytes where the solver has a document.
 //
 // interstitialOnly separates the markers that only ever appear on a challenge
@@ -289,7 +289,7 @@ func hasSetCookie(h http.Header, name string) bool {
 	return false
 }
 
-// challengeTitles mirrors CHALLENGE_TITLE_RE in solver/challenge.js. The
+// challengeTitles mirrors CHALLENGE_TITLE_RE in internal/solver/challenge.go. The
 // non-English entries are the point rather than thoroughness: the interstitial
 // follows Accept-Language, so an exit that asks for anything but English gets a
 // title an English-only list would miss — and missing it looks exactly like a

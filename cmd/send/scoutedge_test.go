@@ -97,7 +97,7 @@ func TestIdentifyChallenge(t *testing.T) {
 			want: challengeCloudflare,
 		},
 		{
-			// The regression solver/challenge.js was written for: the
+			// The regression internal/solver/challenge.go was written for: the
 			// interstitial follows Accept-Language, so an English-only check
 			// reports "no challenge" on the exits that most need one.
 			name: "a localised interstitial with no markers left", status: 403,
@@ -212,7 +212,7 @@ func TestDocumentTitle(t *testing.T) {
 	}
 }
 
-// The title list has to stay in step with solver/challenge.js, and the entries
+// The title list has to stay in step with internal/solver/challenge.go, and the entries
 // that matter are the ones nobody would write from memory: a solve routed
 // through a non-English exit sees the interstitial in that exit's language.
 func TestChallengeTitlesAreLocalised(t *testing.T) {

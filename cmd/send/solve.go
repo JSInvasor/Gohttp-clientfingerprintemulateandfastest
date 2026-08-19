@@ -16,7 +16,7 @@ import (
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/solver"
 )
 
-// -solve earns a cf_clearance with the real browser in solver/ and seeds it
+// -solve earns a cf_clearance by driving a real Chromium, and seeds it
 // into every session before the run starts.
 //
 // The three things Cloudflare binds that cookie to — User-Agent, JA3/JA4, and
@@ -49,7 +49,7 @@ const minSolveTimeout = 10 * time.Second
 // ceiling, not a wait — a fast box finishes early.
 const defaultSolveTimeout = 150 * time.Second
 
-// solveResult is what solver/index.js prints.
+// solveResult is what a solve reports, in the shape this command caches.
 type solveResult struct {
 	Status    string `json:"status"`
 	Error     string `json:"error"`
@@ -563,7 +563,7 @@ func reportSolveDrift(seed *solveSeed, o *options) {
 // browser reports. A challenge reads that property, and it read it on the
 // request that earned the cookie.
 //
-// solver/profile.js pins TZ for exactly this reason, so reaching here means the
+// internal/solver pins TZ for exactly this reason, so reaching here means the
 // pin was turned off or did not apply. A note rather than an error: the solve
 // may well have worked, and refusing to continue over it would be worse than
 // saying what was noticed.
@@ -576,7 +576,7 @@ func reportTimezone(tz string) {
 		detail = "UTC, which a server has and a desktop browser rarely does"
 	}
 	fmt.Fprintf(os.Stderr, "note: the solve reported Intl timezone %q — %s.\n"+
-		"  solver/profile.js pins TZ from the language for this reason, so either\n"+
+		"  internal/solver pins TZ from the language for this reason, so either\n"+
 		"  SOLVER_PIN_LOCALE=0 is set or SOLVER_TZ named a zone ICU does not know.\n"+
 		"  Set SOLVER_TZ to where your exit actually is.\n", tz, detail)
 }
@@ -608,10 +608,13 @@ func reportLanguageSplit(header string, pageLanguages []string) {
 	}
 	fmt.Fprintf(os.Stderr, "note: the solve's Accept-Language and navigator.languages disagree —\n"+
 		"  header %q -> %v\n  navigator.languages %v\n"+
-		"  A real Chrome reports the same list in both. Both halves come from one value in\n"+
-		"  solver/profile.js (expectedAcceptLanguage): --accept-lang puts it on the wire and\n"+
-		"  preparePage's shim puts it on the page. A disagreement means one of the two did not\n"+
-		"  apply — most likely the shim, since evaluateOnNewDocument fails silently.\n",
+		"  A real Chrome reports the same list in both, and here they are meant to be the same\n"+
+		"  value: internal/solver's expectedAcceptLanguage derives the header, and the browser\n"+
+		"  sets the header and navigator.languages together from the preference list it is\n"+
+		"  given (Network.setUserAgentOverride). Nothing shims navigator, so a disagreement is\n"+
+		"  the override not having applied before the navigation, or a Chromium whose\n"+
+		"  derivation changed — internal/cdp's TestAcceptLanguageDerivation is the table it\n"+
+		"  was measured against.\n",
 		header, sent, pageLanguages)
 }
 
@@ -654,7 +657,7 @@ func reportLanguageDrift(sent, asked string) {
 	if bad := malformedLanguage(sent); bad != "" {
 		fmt.Fprintf(os.Stderr, "warning: the solve advertised Accept-Language %q, which is malformed "+
 			"(%s). No browser emits that, and it was on the request that earned the cookie. "+
-			"Please report the Chromium version — solver/profile.js builds this flag from a "+
+			"Please report the Chromium version — internal/solver builds this flag from a "+
 			"measurement that this build evidently does not share.\n", sent, bad)
 		return
 	}
@@ -721,7 +724,7 @@ func reportChromiumDrift(major int) {
 	fmt.Fprintf(os.Stderr, "warning: the solver's Chromium is %d but this client replays as Chrome %d —\n"+
 		"  the cookie is bound to the TLS fingerprint that earned it, and the ClientHello moves\n"+
 		"  between majors, so it will work once and then stop under load.\n"+
-		"  Upgrade the browser in solver/, or run `go run ./cmd/fpcheck -via-chromium -profile chrome`\n"+
+		"  Upgrade the browser, or run `go run ./cmd/fpcheck -via-chromium -profile chrome`\n"+
 		"  to see how far apart they actually are\n", major, want)
 }
 
@@ -784,7 +787,7 @@ func truncate(s string, n int) string {
 // clearance that the *browser that earned it* could not reuse from a fresh
 // context on the same address, same UA, same TLS. No fingerprint work in this
 // client would have changed that, and someone staring at a 403 has no way to
-// know it. solver/replay.js is the one-command answer, so it is named here
+// know it. `send -solve-replay` is the one-command answer, so it is named here
 // rather than described.
 func reportRejectedClearance(o *options, target string, status int, header http.Header, body []byte) {
 	kind, why := identifyChallenge(status, header, body)

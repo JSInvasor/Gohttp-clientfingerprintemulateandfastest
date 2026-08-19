@@ -11,9 +11,5 @@ vendor/
 proxies.txt
 http.txt
 
-# solver deps: `npm install` in solver/ pulls ~100 packages plus a Chromium
-solver/node_modules/
-solver/package-lock.json
-
 # cross-compiled binaries from `go build -o dist/...`
 /dist/

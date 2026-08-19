@@ -193,25 +193,25 @@ gate CI.
 
 ### Checking against the browser the solver drives
 
-If you use `solver/` to earn `cf_clearance`, the browser it launches and the
+If you use `-solve` to earn `cf_clearance`, the browser it launches and the
 client that replays the cookie have to be the same browser. Cloudflare binds the
 cookie to the issuing session's (UA, JA3/JA4, IP), so a mismatch produces a
 cookie that works once, dies within seconds under load, and looks exactly like a
-solver bug. That agreement used to be maintained by hand — `index.js` pinned a
+solver bug. That agreement used to be maintained by hand — the solver pinned a
 User-Agent in a comment and nothing checked it, which is how it ended up pinned
 to Chrome 147 while the Go profile moved to 151.
 
 ```bash
-cd solver && npm install && cd ..
 go run ./cmd/fpcheck -via-chromium -profile chrome
 ```
 
-This launches the solver's own Chromium — same `puppeteer-real-browser` build,
-same flags, from `solver/profile.js` — sends it to the fingerprint endpoint, and
-reports two things: the browser against the pinned reference, then this client
-against that same browser, field by field.
+This launches the solver's own Chromium — same discovery, same launch flags,
+same CDP driver, from `internal/solver/profile.go` — sends it to the fingerprint
+endpoint, and reports two things: the browser against the pinned reference, then
+this client against that same browser, field by field.
 
-If Chromium is not on the default path, set `CHROME_PATH` to the binary.
+If Chromium is not on the default path, point at it with `-chrome
+/path/to/chrome` or set `SOLVER_CHROME`.
 
 A version difference between the box's Chromium and the emulated Chrome is
 reported, not failed: Chrome's TLS layer went unchanged across 146–151, so what
@@ -571,12 +571,12 @@ transport knobs (`-max-streams`, `-idle-conns`, `-sockbuf`, `-tfo`, …).
 
 ### Getting past a Cloudflare challenge
 
-`-solve` runs the browser in `solver/` first, then seeds what it earned into
-every session before the run starts:
+`-solve` drives a real Chromium through the challenge first, then seeds what it
+earned into every session before the run starts. There is nothing to install
+beyond a browser — the solver is compiled into the binary and speaks CDP
+directly:
 
 ```bash
-cd solver && npm install && cd ..
-
 go run ./cmd/send -solve https://site.com                       # solve, then one request
 go run ./cmd/send -solve https://site.com 30s 100                # solve, then a load run
 go run ./cmd/send -solve -proxy socks5://host:1080 https://site.com
@@ -584,7 +584,7 @@ go run ./cmd/send -solve https://site.com 1m 100 8 -proxy-file proxies.txt
 ```
 
 ```
-solving https://site.com with the browser in solver/ (direct, up to 1m15s)
+solving https://site.com with /usr/bin/chromium (direct, up to 1m15s)
 solved in 9.4s, 1 attempt(s), chromium Chrome/151.0.7204.50
 seeding cf_clearance, session_id
 held back __cf_bm — bound to the browser session that earned them, not to the
@@ -632,30 +632,40 @@ warning: the solver's Chromium is 141 but this client replays as Chrome 151 —
   between majors, so it will work once and then stop under load.
 ```
 
-Nothing else surfaces that. The UA is pinned by `solver/profile.js`, so a
+Nothing else surfaces that. The UA is pinned by `internal/solver/profile.go`, so a
 Chromium 141 solving with a Chrome 151 identity looks correct in every header —
 the version it actually shook hands with is the only tell, and it is now read
 rather than printed and discarded. `fpcheck -via-chromium` still measures how far
 apart the two really are.
 
 The language travels with them. `send` hands the solver whatever the run will
-replay with — `-lang`, or the library default — as `SOLVER_LANG`. Left to itself
-the browser used the box's locale, so a localised image solved in one language
-and replayed in another.
+replay with — `-lang`, or the library default. Left to itself the browser used
+the box's locale, so a localised image solved in one language and replayed in
+another.
 
 The language shows in four places, and all four have to say the same thing:
 
 | where | who reads it | set by |
 |---|---|---|
-| the `Accept-Language` header | the edge | `--accept-lang` |
-| `navigator.languages` | the challenge's own JavaScript | the shim in `solver/identity.js` |
-| `Intl`'s resolved locale | the same JavaScript | `LC_ALL`, via `pinProcessLocale` |
-| `Intl`'s resolved timezone | the same JavaScript | `TZ`, via `pinProcessLocale` |
-| the seed the run replays with | the edge, on every later request | `acceptLanguageOf` |
+| the `Accept-Language` header | the edge | `Network.setUserAgentOverride`, plus `--accept-lang` for the browser as a whole |
+| `navigator.languages` | the challenge's own JavaScript | the same call, from the same list |
+| `Intl`'s resolved locale | the same JavaScript | `LC_ALL` in the browser's environment |
+| `Intl`'s resolved timezone | the same JavaScript | `TZ`, and `Emulation.setTimezoneOverride` per tab |
+| the seed the run replays with | the edge, on every later request | `ExpectedAcceptLanguage` |
 
-They are all derived from one value — `expectedAcceptLanguage` in
-`solver/profile.js` — because they were derived from three, and on any box that
-is not `en_US` the three disagreed. The header followed the machine's locale
+They are all derived from one value — `ExpectedAcceptLanguage` in
+`internal/solver/profile.go` — because they were derived from three, and on any box that
+is not `en_US` the three disagreed.
+
+The header and `navigator.languages` are now set together by the browser, from
+one preference list. The Node solver could not do that: it derived the header
+from a launch flag and then shimmed `navigator.languages` with
+`Object.defineProperty` to match, which leaves an own property on the instance
+where `Navigator.prototype` is the only place one belongs, and a getter that
+stringifies as an arrow function where every native one reads `[native code]`.
+Both are one probe away on the request that earns `cf_clearance`. The values are
+the same; the tells are gone. `internal/cdp`'s `TestAcceptLanguageNeedsNoShim`
+checks the getter stays native. The header followed the machine's locale
 while the page object asserted `SOLVER_LANG`, so a `tr_TR` image sent
 `Accept-Language: tr-TR,tr;q=0.9` and told the challenge it was
 `["en-US", "en"]`. Both checks meant to catch that were fed the asked-for value
@@ -758,8 +768,8 @@ the session pool:
 $ send -solve https://site.com 1m 100 4 -proxy-file proxies.txt
 12 proxies loaded but only 4 session(s) — solving 4 of them; raise -s to spread the run across more exits
 solving https://site.com through 4 exit(s), 2 at a time (up to 5m0s)
-1.2.3.4:8080: solving https://site.com with the browser in solver/ (via 1.2.3.4:8080, up to 2m30s)
-5.6.7.8:8080: solving https://site.com with the browser in solver/ (via 5.6.7.8:8080, up to 2m30s)
+1.2.3.4:8080: solving https://site.com with /usr/bin/chromium (via 1.2.3.4:8080, up to 2m30s)
+5.6.7.8:8080: solving https://site.com with /usr/bin/chromium (via 5.6.7.8:8080, up to 2m30s)
 1.2.3.4:8080: solved in 1m4s, 1 attempt(s), 4 cookie(s), chromium Chrome/151.0.7922.108
 1.2.3.4:8080: cf_clearance issued for .site.com
 ...
@@ -871,7 +881,7 @@ paying it twice. The clearance is cached and reused while it is still valid:
 
 ```
 $ send -solve https://site.com          # first run
-solving https://site.com with the browser in solver/ (direct, up to 2m30s)
+solving https://site.com with /usr/bin/chromium (direct, up to 2m30s)
 solved in 1m11s, 1 attempt(s), 1 cookie(s), chromium Chrome/151.0.7922.108
 
 $ send -solve https://site.com          # every run after
@@ -888,8 +898,8 @@ an entry may be (default 30m, since Cloudflare can invalidate server-side well
 before the stated expiry), and `-solve-cache ""` turns it off. The file is
 written 0600: it holds a bearer token for the origin.
 
-`-solver-dir` points at a solver checkout somewhere else, and `-solve-timeout`
-bounds the solve (default 150s). Browser startup comes out of that budget and
+`-chrome` points at a specific browser (`$SOLVER_CHROME` does the same), and
+`-solve-timeout` bounds the solve (default 150s). Browser startup comes out of that budget and
 costs ~20s on a small VPS, twice if the first attempt is retried, so a small
 timeout can leave a managed challenge no time to solve in — against a live UAM,
 75s failed with no cookie at all while 150s cleared it on the first attempt in
@@ -1015,11 +1025,11 @@ no amount of work inside this package closes them:
   shows up on connections held open between requests, not on a single fetch.
 - **`-solve` has not been shown to work or to fail, and the tool that was
   supposed to decide it was broken.** This entry has twice carried a confident
-  conclusion drawn from `solver/replay.js`, and both are withdrawn.
+  conclusion drawn from the replay tool, and both are withdrawn.
 
-  `replay.js` presents a solved `cf_clearance` in a fresh context of the same
-  browser and reports whether the edge accepts it. It never pinned the identity
-  on those contexts. `cf_clearance` is bound to the User-Agent it was issued to,
+  `send -solve-replay` presents a solved `cf_clearance` in a fresh context of
+  the same browser and reports whether the edge accepts it. It never pinned the
+  identity on those contexts. `cf_clearance` is bound to the User-Agent it was issued to,
   the solve pins Chrome's frozen build — `Chrome/151.0.0.0` — and an unpinned
   page reports the browser's real one, `Chrome/151.0.7922.108`. Same browser,
   different string, refused cookie. Every "the clearance was challenged" it
@@ -1031,10 +1041,10 @@ no amount of work inside this package closes them:
   90-second wait was indistinguishable from a zone that re-challenges
   everything. A solve on the reference box takes over 80 seconds.
 
-  Both are fixed: the identity now comes from `solver/identity.js`, which
-  `index.js` and `replay.js` share so there is no second place to forget it; the
-  follow-up reports `solved_here`; the wait is 180s; and the verdict refuses to
-  say `zone_challenges` unless the browser demonstrably solved one itself.
+  Both are fixed: the identity comes from one place in `internal/solver` that
+  the solve and the replay both call, so there is no second place to forget it;
+  the follow-up reports `solved_here`; the wait is 180s; and the verdict refuses
+  to say `zone_challenges` unless the browser demonstrably solved one itself.
 
   What is actually known, with the instrument out of it:
 
@@ -1066,6 +1076,18 @@ no amount of work inside this package closes them:
   candidate for the A/B above; the language one is invisible on an `en_US` box,
   which is where the A/B was run. None of this closes the gap. It is listed so
   the next person looking does not re-find them.
+
+  The solver has since moved from `puppeteer-real-browser` to a CDP driver in
+  this repo (`internal/cdp`), which retires two of those bugs as categories
+  rather than as instances: there is no pipe to lose results on and no exit to
+  race, because there is no second process, and there is no `navigator` shim to
+  contradict the header, because the browser sets the header and
+  `navigator.languages` together from one value. The driver also never calls
+  `Runtime.enable`, which is the loudest thing an automation can do over CDP and
+  which `puppeteer-real-browser` needed `rebrowser` patches to work around. What
+  it does **not** do is close the gap above: none of this has been A/B'd against
+  a live Under Attack zone, and until it has, the port is a change of mechanism
+  and not evidence about the outcome.
 
   Worth separating from the fingerprint question, because they get conflated:
   the aim is not to replay a clearance, it is to not be challenged, which is a

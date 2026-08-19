@@ -43,7 +43,7 @@
 //	send -scout https://site.com -proxy-file proxies.txt
 //
 // A target behind a Cloudflare challenge needs the cookie before the run: -solve
-// earns one with the real browser in solver/ and seeds it into every session.
+// drives a real Chromium through it and seeds what it earns into every session.
 //
 //	send -solve https://site.com
 //	send -solve https://site.com 30s 100 -proxy socks5://host:1080

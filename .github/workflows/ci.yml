@@ -19,6 +19,17 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # internal/cdp and internal/solver drive a real Chromium. Their tests skip
+      # when none is installed, which would quietly turn the half of the solver
+      # that needs a browser into untested code — so CI installs one. Everything
+      # else in the tree needs nothing.
+      - name: install Chromium
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends chromium-browser xvfb \
+            || sudo apt-get install -y --no-install-recommends chromium xvfb
+          command -v chromium-browser || command -v chromium
+
       # internal/http2 is a vendored fork of golang.org/x/net/http2 and is kept
       # byte-comparable with upstream, so it is excluded from formatting checks
       # (see internal/http2/FORK.md).
