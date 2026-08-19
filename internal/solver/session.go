@@ -118,19 +118,35 @@ func (l Launcher) newBrowserSession(proxy *Proxy) newSession {
 		}
 
 		bctx := b.DefaultContext()
-		tab, err := bctx.NewTab(ctx)
-		if err != nil {
+
+		// Same teardown contract as newContextSession: killing the browser ends
+		// the page but leaves this side's pump goroutine parked on its
+		// condition forever, so the tab is closed first. One browser per
+		// attempt means one leak per attempt, which a retrying solve across a
+		// proxy list turns into one per exit.
+		var tab *cdp.Tab
+		closeSession := func() {
+			if tab != nil {
+				cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_ = tab.Close(cctx)
+				cancel()
+			}
 			b.Close()
+		}
+
+		tab, err = bctx.NewTab(ctx)
+		if err != nil {
+			closeSession()
 			return nil, err
 		}
 		if proxy != nil && (proxy.Username != "" || proxy.Password != "") {
 			if err := tab.AuthenticateProxy(ctx, proxy.Username, proxy.Password); err != nil {
-				b.Close()
+				closeSession()
 				return nil, err
 			}
 		}
 		if err := l.prepare(ctx, tab, b.Version.Product); err != nil {
-			b.Close()
+			closeSession()
 			return nil, err
 		}
 
@@ -140,7 +156,7 @@ func (l Launcher) newBrowserSession(proxy *Proxy) newSession {
 			version:  b.Version.Product,
 			major:    ChromiumMajor(b.Version.Product),
 			launchMS: time.Since(start).Milliseconds(),
-			close:    func() { b.Close() },
+			close:    closeSession,
 		}, nil
 	}
 }
@@ -162,28 +178,44 @@ func (l Launcher) newContextSession(b *cdp.Browser, proxy *Proxy) newSession {
 		if err != nil {
 			return nil, err
 		}
-		closeContext := func() {
+		// Teardown closes the tab before disposing the context, and closing the
+		// tab is not redundant. Target.disposeBrowserContext ends the page in
+		// the browser, but nothing tells this side: Tab.Close is what stops the
+		// tab's pump goroutine and drops its handler from the connection's
+		// session map. Without it every solved exit leaked one of each, for the
+		// life of the process — and the batch path this function exists for is
+		// one browser serving a whole proxy list, so the leak scales with
+		// exactly the run it was written for.
+		//
+		// The tab is captured rather than passed because teardown has to be
+		// callable from the failure paths below, which is before there is a tab
+		// to pass.
+		var tab *cdp.Tab
+		closeSession := func() {
 			// Teardown gets its own context: the attempt's is usually already
 			// expired by the time this runs, and a dispose that inherits an
 			// expired deadline never reaches the browser.
 			cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
+			if tab != nil {
+				_ = tab.Close(cctx)
+			}
 			_ = bctx.Close(cctx)
 		}
 
-		tab, err := bctx.NewTab(ctx)
+		tab, err = bctx.NewTab(ctx)
 		if err != nil {
-			closeContext()
+			closeSession()
 			return nil, err
 		}
 		if proxy != nil && (proxy.Username != "" || proxy.Password != "") {
 			if err := tab.AuthenticateProxy(ctx, proxy.Username, proxy.Password); err != nil {
-				closeContext()
+				closeSession()
 				return nil, err
 			}
 		}
 		if err := l.prepare(ctx, tab, b.Version.Product); err != nil {
-			closeContext()
+			closeSession()
 			return nil, err
 		}
 
@@ -193,7 +225,7 @@ func (l Launcher) newContextSession(b *cdp.Browser, proxy *Proxy) newSession {
 			version:  b.Version.Product,
 			major:    ChromiumMajor(b.Version.Product),
 			launchMS: time.Since(start).Milliseconds(),
-			close:    closeContext,
+			close:    closeSession,
 		}, nil
 	}
 }

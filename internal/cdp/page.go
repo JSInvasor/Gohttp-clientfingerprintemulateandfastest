@@ -26,12 +26,16 @@ import (
 // turned into an aborted run.
 func (t *Tab) Navigate(ctx context.Context, url string) error {
 	loaded := make(chan struct{}, 1)
-	t.on("Page.domContentEventFired", func(json.RawMessage) {
+	// Registered before the navigate so the event cannot be missed, and dropped
+	// on the way out so the next navigation on this tab does not find this one
+	// still listening.
+	remove := t.on("Page.domContentEventFired", func(json.RawMessage) {
 		select {
 		case loaded <- struct{}{}:
 		default:
 		}
 	})
+	defer remove()
 
 	var out struct {
 		FrameID   string `json:"frameId"`
@@ -110,7 +114,10 @@ func (s *SentCookies) Names() ([]string, bool) {
 // whatever the interstitial set rather than what was presented to it.
 func (t *Tab) WatchSentCookies(ctx context.Context) (*SentCookies, error) {
 	s := &SentCookies{}
-	t.on("Network.requestWillBeSentExtraInfo", func(raw json.RawMessage) {
+	// Deliberately not removed: the caller reads what this records after the
+	// navigation it is watching, so the registration has to outlive this call.
+	// It is one per tab and it goes when the tab does.
+	_ = t.on("Network.requestWillBeSentExtraInfo", func(raw json.RawMessage) {
 		var ev struct {
 			Headers map[string]string `json:"headers"`
 		}
@@ -182,7 +189,7 @@ func (t *Tab) NavigateCapturing(ctx context.Context, url string) (*Response, err
 		once sync.Once
 	)
 
-	t.on("Network.responseReceived", func(raw json.RawMessage) {
+	removeResponse := t.on("Network.responseReceived", func(raw json.RawMessage) {
 		var ev struct {
 			RequestID string `json:"requestId"`
 			Type      string `json:"type"`
@@ -218,10 +225,20 @@ func (t *Tab) NavigateCapturing(ctx context.Context, url string) (*Response, err
 			once.Do(func() { close(done) })
 		}
 	}
-	t.on("Network.loadingFinished", finished)
+	removeFinished := t.on("Network.loadingFinished", finished)
 	// A failed load still ends the wait; the status captured above is what says
 	// what happened, and hanging until the deadline would say nothing at all.
-	t.on("Network.loadingFailed", finished)
+	removeFailed := t.on("Network.loadingFailed", finished)
+
+	// All three go when this call does. A second capture on the same tab —
+	// which replay.go makes — would otherwise run this one's handlers alongside
+	// its own, writing into a `doc` nobody reads and closing a `done` nobody
+	// waits on.
+	defer func() {
+		removeResponse()
+		removeFinished()
+		removeFailed()
+	}()
 
 	if err := t.Navigate(ctx, url); err != nil {
 		return nil, err
@@ -436,8 +453,11 @@ func (t *Tab) SetTimezone(ctx context.Context, tz string) error {
 // handleAuthRequests, and every request that draws a challenge gets these back.
 // Nothing else is intercepted — Fetch.requestPaused is continued untouched — so
 // the request that earns the cookie is the browser's own bytes.
+// Both handlers below are deliberately permanent: they answer every request the
+// tab makes for as long as it exists, so there is no point at which removing
+// them would be right. They go when the tab does.
 func (t *Tab) AuthenticateProxy(ctx context.Context, username, password string) error {
-	t.on("Fetch.authRequired", func(raw json.RawMessage) {
+	_ = t.on("Fetch.authRequired", func(raw json.RawMessage) {
 		var ev struct {
 			RequestID     string `json:"requestId"`
 			AuthChallenge struct {
@@ -459,7 +479,7 @@ func (t *Tab) AuthenticateProxy(ctx context.Context, username, password string) 
 			map[string]any{"requestId": ev.RequestID, "authChallengeResponse": resp}, nil)
 	})
 
-	t.on("Fetch.requestPaused", func(raw json.RawMessage) {
+	_ = t.on("Fetch.requestPaused", func(raw json.RawMessage) {
 		var ev struct {
 			RequestID string `json:"requestId"`
 		}

@@ -30,6 +30,14 @@ type xvfbDisplay struct {
 	cmd     *exec.Cmd
 	display string
 	lock    string
+
+	// exited closes once the reaper below has collected the process, and
+	// waitErr is what it collected. There is exactly one cmd.Wait() per process
+	// and it lives in that goroutine: Wait is the only thing that populates
+	// ProcessState, and a second reap racing it — which is what stop() used to
+	// do with Process.Wait — is undefined.
+	exited  chan struct{}
+	waitErr error
 }
 
 // startXvfb brings up a virtual display and returns the DISPLAY to point at it.
@@ -62,7 +70,9 @@ func startXvfb() (*xvfbDisplay, error) {
 			continue
 		}
 
-		x := &xvfbDisplay{cmd: cmd, display: display, lock: lock}
+		x := &xvfbDisplay{cmd: cmd, display: display, lock: lock, exited: make(chan struct{})}
+		go func() { x.waitErr = cmd.Wait(); close(x.exited) }()
+
 		if err := x.waitReady(); err != nil {
 			x.stop()
 			lastErr = err
@@ -81,24 +91,52 @@ func startXvfb() (*xvfbDisplay, error) {
 // Xvfb forks and returns before it is listening, so a browser started on the
 // strength of Start() alone races it and dies with "Missing X server". The lock
 // file is what the server itself creates when it is ready to serve.
+//
+// A server that dies during startup has to end the wait, and the version this
+// replaces could not see that happen: it tested cmd.ProcessState, which stays
+// nil until cmd.Wait() is called and nothing here called it. So the guard never
+// fired once, and an Xvfb that exited immediately — a display number claimed
+// between the Stat and the Start, a missing font path, no permission on /tmp —
+// cost the full ten seconds instead of the few milliseconds it took to fail.
+// Twenty of those is the caller's whole budget spent finding out nothing.
+// The signal is the reaper goroutine now, which is the only thing that can
+// observe an exit without racing it.
 func (x *xvfbDisplay) waitReady() error {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if x.cmd.ProcessState != nil && x.cmd.ProcessState.Exited() {
-			return fmt.Errorf("Xvfb on %s exited during startup", x.display)
-		}
 		if _, err := os.Stat(x.lock); err == nil {
 			return nil
 		}
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-x.exited:
+			// The lock is re-read rather than assumed absent: a server that
+			// came up and only then died still served, and reporting that as a
+			// failed startup would send the caller to the next display number
+			// for a reason that is not the one it would be told.
+			if _, err := os.Stat(x.lock); err == nil {
+				return nil
+			}
+			if x.waitErr != nil {
+				return fmt.Errorf("Xvfb on %s exited during startup: %w", x.display, x.waitErr)
+			}
+			return fmt.Errorf("Xvfb on %s exited during startup", x.display)
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("Xvfb on %s did not come up within 10s", x.display)
 }
 
+// stop kills the server and waits for the reaper to collect it.
+//
+// It waits on the channel rather than reaping itself. Two Waits on one process
+// is a race whichever way it lands, and the goroutine started in startXvfb owns
+// this one.
 func (x *xvfbDisplay) stop() {
 	if x == nil || x.cmd == nil {
 		return
 	}
 	killProcessGroup(x.cmd)
-	_, _ = x.cmd.Process.Wait()
+	if x.exited != nil {
+		<-x.exited
+	}
 }

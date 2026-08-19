@@ -157,7 +157,7 @@ func (c *Context) NewTab(ctx context.Context) (*Tab, error) {
 		ctxID:     c.id,
 		targetID:  created.TargetID,
 		sessionID: attached.SessionID,
-		events:    make(map[string][]func(json.RawMessage)),
+		events:    make(map[string][]tabHandler),
 	}
 	t.wake = sync.NewCond(&t.mu)
 	go t.pump()
@@ -179,9 +179,14 @@ type Tab struct {
 	targetID  string
 	sessionID string
 
-	mu     sync.Mutex
-	wake   *sync.Cond
-	events map[string][]func(json.RawMessage)
+	mu   sync.Mutex
+	wake *sync.Cond
+	// events are the per-method handlers, each carrying the id its remover
+	// closes over. A slice rather than a map because order of registration is
+	// the order they run in, and an id rather than a function pointer because
+	// two registrations of the same function are two handlers.
+	events      map[string][]tabHandler
+	nextHandler int
 	// queue holds events the read loop handed over but the pump has not run yet.
 	// See handleEvent for why they cannot be run where they arrive.
 	queue  []*message
@@ -234,24 +239,59 @@ func (t *Tab) pump() {
 		}
 		msg := t.queue[0]
 		t.queue = t.queue[1:]
-		hs := append([]func(json.RawMessage){}, t.events[msg.Method]...)
+		hs := append([]tabHandler{}, t.events[msg.Method]...)
 		t.mu.Unlock()
 
 		for _, h := range hs {
-			h(msg.Params)
+			h.fn(msg.Params)
 		}
 	}
 }
 
-// on registers a handler for one CDP event on this tab.
+// tabHandler is one registration: the callback and the id that removes it.
+type tabHandler struct {
+	id int
+	fn func(json.RawMessage)
+}
+
+// on registers a handler for one CDP event on this tab and returns the function
+// that removes it again.
 //
 // Handlers run on the tab's pump, so they may issue CDP commands — but they run
 // one at a time, so a slow handler delays this tab's later events. Nothing here
 // needs one that is slow.
-func (t *Tab) on(method string, h func(json.RawMessage)) {
+//
+// Removal is not decoration. Navigate, NavigateCapturing and WatchSentCookies
+// all register per call, and a tab is navigated more than once — replay.go does
+// it twice on the same tab. Without a remover those registrations only ever
+// accumulate, and the stale ones keep running: an old Navigate's handler is
+// still listening for the DOMContentLoaded the next one is waiting on, holding
+// its dead channel and closure alive for the life of the tab.
+func (t *Tab) on(method string, h func(json.RawMessage)) (remove func()) {
 	t.mu.Lock()
-	t.events[method] = append(t.events[method], h)
+	id := t.nextHandler
+	t.nextHandler++
+	t.events[method] = append(t.events[method], tabHandler{id: id, fn: h})
 	t.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			hs := t.events[method]
+			for i, e := range hs {
+				if e.id != id {
+					continue
+				}
+				// Full slice expression: the copy the pump is holding shares
+				// nothing with this one, so a removal cannot rewrite handlers
+				// out from under an event that is mid-dispatch.
+				t.events[method] = append(hs[:i:i], hs[i+1:]...)
+				return
+			}
+		})
+	}
 }
 
 // Close detaches from the tab and closes it.

@@ -114,7 +114,7 @@ func Launch(ctx context.Context, cfg LaunchConfig) (*Browser, error) {
 		cfg.ExecPath = p
 	}
 
-	b := &Browser{cfg: cfg, closeOnce: make(chan struct{})}
+	b := &Browser{closeOnce: make(chan struct{})}
 
 	if cfg.UserDataDir == "" {
 		// A profile per launch, and a fresh one. A shared profile carries the
@@ -148,6 +148,14 @@ func Launch(ctx context.Context, cfg LaunchConfig) (*Browser, error) {
 			env = append(env, "DISPLAY="+x.display)
 		}
 	}
+
+	// Recorded here rather than at the top, which is where it used to be and was
+	// wrong by two fields: the temporary UserDataDir and the headless fallback
+	// above are both decided after the struct was built, so a copy taken before
+	// them describes a browser that was never launched. Nothing reads b.cfg
+	// today, which is exactly why it would have been believed when something
+	// did.
+	b.cfg = cfg
 
 	args := []string{
 		"--remote-debugging-pipe",

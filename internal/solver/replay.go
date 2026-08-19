@@ -122,13 +122,21 @@ func replayAttempt(ctx context.Context, l Launcher, b *cdp.Browser, proxy *Proxy
 	if err != nil {
 		return nil, err
 	}
+	// The tab is closed before the context for the reason session.go documents:
+	// disposing the context ends the page in the browser but leaves this side's
+	// pump goroutine parked forever. Declared ahead of the defer so one teardown
+	// covers both, whichever way this function leaves.
+	var tab *cdp.Tab
 	defer func() {
 		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		if tab != nil {
+			_ = tab.Close(cctx)
+		}
 		_ = bctx.Close(cctx)
 	}()
 
-	tab, err := bctx.NewTab(ctx)
+	tab, err = bctx.NewTab(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -225,13 +233,21 @@ func solveThenContinue(ctx context.Context, l Launcher, b *cdp.Browser, proxy *P
 	if err != nil {
 		return nil, err
 	}
+	// The tab is closed before the context for the reason session.go documents:
+	// disposing the context ends the page in the browser but leaves this side's
+	// pump goroutine parked forever. Declared ahead of the defer so one teardown
+	// covers both, whichever way this function leaves.
+	var tab *cdp.Tab
 	defer func() {
 		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		if tab != nil {
+			_ = tab.Close(cctx)
+		}
 		_ = bctx.Close(cctx)
 	}()
 
-	tab, err := bctx.NewTab(ctx)
+	tab, err = bctx.NewTab(ctx)
 	if err != nil {
 		return nil, err
 	}
