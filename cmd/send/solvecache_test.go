@@ -11,7 +11,6 @@ import (
 func cacheOptions(t *testing.T) *options {
 	t.Helper()
 	return &options{
-		solverDir:    t.TempDir(),
 		solveTimeout: 30 * time.Second,
 		solveCache:   t.TempDir(),
 		solveMaxAge:  30 * time.Minute,

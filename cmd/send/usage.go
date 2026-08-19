@@ -165,9 +165,13 @@ func printUsage(w io.Writer) {
                 and fonts it references — a document alone is not a page load
 -fingerprint    print the profile's reference fingerprint and continue`))
 
-	fmt.Fprint(w, p.section("cloudflare", `-solve                earn a cf_clearance with the real browser in solver/.
-                      Implies -p chrome. Needs npm install in solver/
--solver-dir path      where index.js and node_modules live (default solver)
+	fmt.Fprint(w, p.section("cloudflare", `-solve                earn a cf_clearance by driving a real Chromium.
+                      Implies -p chrome. Needs Chrome or Chromium installed
+-chrome path          the browser to drive (default: the first one found,
+                      or $SOLVER_CHROME)
+-solve-replay         replay the cookies already earned for this target and
+                      say whether they still work — the question a 403 after
+                      a successful solve leaves open
 -solve-refresh        ignore the cached solve and earn a new one
 -solve-timeout dur    how long one solve may take (default 150s). Browser
                       startup comes out of this, so a small VPS needs more

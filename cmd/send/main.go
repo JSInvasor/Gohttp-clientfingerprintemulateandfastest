@@ -140,8 +140,12 @@ type options struct {
 	assetParallel int
 
 	// Challenge solving
-	solve         bool
-	solverDir     string
+	solve bool
+	// chromePath is the browser to drive. Empty means discovery — see
+	// solver.CheckBrowser. It replaced -solver-dir, which pointed at the Node
+	// solver's script and its npm tree; the solver is compiled in now, so the
+	// only thing left to point at is a browser.
+	chromePath    string
 	solveTimeout  time.Duration
 	solveCache    string
 	solveRefresh  bool
@@ -149,6 +153,9 @@ type options struct {
 	solveParallel int
 	exitCheck     string
 	solveIsolate  bool
+	// solveReplay measures whether cookies already earned still work, instead of
+	// making a run. See solvereplay.go.
+	solveReplay bool
 	// solveAllCookies seeds everything the solve captured, including Cloudflare's
 	// per-session bookkeeping. Off by default — see splitSolvedCookies.
 	solveAllCookies bool
@@ -241,6 +248,13 @@ func run() error {
 	// challenge can be interrupted too.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// -solve-replay is a measurement rather than a run: it asks whether a cookie
+	// already earned still works, which is the question a 403 after a successful
+	// solve leaves open. Nothing below it happens — there is no run to seed.
+	if o.solveReplay {
+		return runSolveReplay(ctx, o, target)
+	}
 
 	// -scout answers the questions the other flags ask, and then goes no
 	// further: it is a handful of requests and a command to paste, not a run.
@@ -335,7 +349,7 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.IntVar(&o.assetParallel, "asset-parallel", 6, "")
 
 	fs.BoolVar(&o.solve, "solve", false, "")
-	fs.StringVar(&o.solverDir, "solver-dir", "solver", "")
+	fs.StringVar(&o.chromePath, "chrome", "", "")
 	fs.DurationVar(&o.solveTimeout, "solve-timeout", defaultSolveTimeout, "")
 	fs.StringVar(&o.solveCache, "solve-cache", defaultSolveCachePath(), "")
 	fs.BoolVar(&o.solveRefresh, "solve-refresh", false, "")
@@ -344,6 +358,7 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.StringVar(&o.exitCheck, "solve-ip-check", defaultExitCheck, "")
 	fs.BoolVar(&o.solveIsolate, "solve-isolate", false, "")
 	fs.BoolVar(&o.solveAllCookies, "solve-all-cookies", false, "")
+	fs.BoolVar(&o.solveReplay, "solve-replay", false, "")
 
 	// Proxy
 	fs.StringVar(&o.proxy, "proxy", "", "")

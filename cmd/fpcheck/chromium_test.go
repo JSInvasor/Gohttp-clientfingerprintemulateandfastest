@@ -1,89 +1,52 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
 )
 
-// stubSolverDir writes a fingerprint.js that prints out verbatim, plus the
-// node_modules directory runChromiumProbe checks for.
+// chromeProbe builds the probe result runChromiumProbe would hand back, around
+// the committed Chrome device capture.
 //
-// Stubbing the script rather than launching a real browser is deliberate: this
-// exercises the part that can actually be wrong in CI — process invocation,
-// output parsing, error propagation and the comparison logic — without needing
-// Chromium, a display, or network. Whether Chromium itself launches is what the
-// command reports at runtime.
-func stubSolverDir(t *testing.T, out string) string {
-	t.Helper()
-	dir := t.TempDir()
-
-	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
-		t.Fatalf("mkdir node_modules: %v", err)
-	}
-
-	script := "process.stdout.write(" + goStringToJS(out) + ");\n"
-	if err := os.WriteFile(filepath.Join(dir, "fingerprint.js"), []byte(script), 0o644); err != nil {
-		t.Fatalf("write fingerprint.js: %v", err)
-	}
-	return dir
-}
-
-// goStringToJS renders s as a JavaScript string literal.
-func goStringToJS(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `'`, `\'`, "\n", `\n`, "\r", `\r`)
-	return "'" + r.Replace(s) + "'"
-}
-
-// chromeProbeJSON wraps the committed Chrome device capture in the envelope
-// solver/fingerprint.js emits, so the stub returns a realistic payload.
-func chromeProbeJSON(t *testing.T, version string, major int, solverUA string) string {
+// Building the value rather than driving a browser is deliberate: what these
+// tests exercise is checkChromiumProbe, the comparison that decides whether the
+// browser earning cf_clearance is the browser this client emulates. That is pure
+// logic over a capture, and it needs no Chromium, no display and no network.
+// Whether the browser launches at all is what the command reports at runtime,
+// and internal/cdp covers it against a real one.
+//
+// It used to be a stub fingerprint.js the probe was pointed at, back when the
+// probe was a Node process. The parsing that scaffolding tested — a preamble
+// from some dependency, a status field, a stray JSON line — went away with the
+// pipe it was parsing.
+func chromeProbe(t *testing.T, version string, major int, solverUA string) *chromiumProbe {
 	t.Helper()
 	raw, err := os.ReadFile("testdata/chrome151-windows.json")
 	if err != nil {
 		t.Fatalf("read capture: %v", err)
 	}
-	// fingerprint.js emits JSON.stringify output — one line — so compact the
-	// pretty-printed fixture to match what the parser really sees.
-	var compact bytes.Buffer
-	if err := json.Compact(&compact, raw); err != nil {
-		t.Fatalf("compact capture: %v", err)
+	probe := &chromiumProbe{
+		Status:          "ok",
+		Version:         version,
+		Major:           major,
+		NativeUserAgent: gofire.Chrome151UserAgent,
+		SolverUserAgent: solverUA,
 	}
-	raw = compact.Bytes()
-
-	return `{"status":"ok",` +
-		`"chromium_version":` + quote(version) + `,` +
-		`"chromium_major":` + itoa(major) + `,` +
-		`"native_user_agent":` + quote(gofire.Chrome151UserAgent) + `,` +
-		`"solver_user_agent":` + quote(solverUA) + `,` +
-		`"capture":` + string(raw) + `}`
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
+	if err := json.Unmarshal(raw, &probe.Capture); err != nil {
+		t.Fatalf("decode capture: %v", err)
 	}
-	var b []byte
-	for n > 0 {
-		b = append([]byte{byte('0' + n%10)}, b...)
-		n /= 10
-	}
-	return string(b)
+	return probe
 }
 
 func TestChromiumProbeAgreesWithProfile(t *testing.T) {
-	dir := stubSolverDir(t, chromeProbeJSON(t, "HeadlessChrome/151.0.7204.50", 151, gofire.Chrome151UserAgent))
-
-	probe, err := runChromiumProbe(context.Background(), dir, "https://tls.peet.ws/api/all", 30)
-	if err != nil {
-		t.Fatalf("runChromiumProbe: %v", err)
-	}
+	probe := chromeProbe(t, "HeadlessChrome/151.0.7204.50", 151, gofire.Chrome151UserAgent)
 	if probe.Major != 151 {
 		t.Errorf("chromium major = %d, want 151", probe.Major)
 	}
@@ -108,12 +71,7 @@ func TestChromiumProbeAgreesWithProfile(t *testing.T) {
 // then dies under load, and looks like a solver bug rather than a version pin.
 func TestChromiumProbeCatchesUADrift(t *testing.T) {
 	const staleUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
-	dir := stubSolverDir(t, chromeProbeJSON(t, "HeadlessChrome/151.0.7204.50", 151, staleUA))
-
-	probe, err := runChromiumProbe(context.Background(), dir, "https://example.com", 30)
-	if err != nil {
-		t.Fatalf("runChromiumProbe: %v", err)
-	}
+	probe := chromeProbe(t, "HeadlessChrome/151.0.7204.50", 151, staleUA)
 
 	var found bool
 	for _, c := range checkChromiumProbe(gofire.ReferenceFor(gofire.Chrome151), probe) {
@@ -135,17 +93,12 @@ func TestChromiumProbeCatchesUADrift(t *testing.T) {
 // the JA4 too, so this kills it just as surely as a UA mismatch — but the fix is
 // re-pinning the Go profile, not editing a string.
 func TestChromiumProbeCatchesJA4Drift(t *testing.T) {
-	payload := chromeProbeJSON(t, "HeadlessChrome/146.0.7000.10", 146, gofire.Chrome151UserAgent)
+	probe := chromeProbe(t, "HeadlessChrome/146.0.7000.10", 146, gofire.Chrome151UserAgent)
 	// Chrome 146 predates the ML-DSA signature algorithms, which moved JA4_c.
-	payload = mustReplace(t, payload,
-		`"ja4":"t13d1516h2_8daaf6152771_806a8c22fdea"`,
-		`"ja4":"t13d1516h2_8daaf6152771_d8a2da3f94cd"`)
-	dir := stubSolverDir(t, payload)
-
-	probe, err := runChromiumProbe(context.Background(), dir, "https://example.com", 30)
-	if err != nil {
-		t.Fatalf("runChromiumProbe: %v", err)
+	if probe.Capture.TLS.JA4 == "" {
+		t.Fatal("the capture carries no JA4 to move")
 	}
+	probe.Capture.TLS.JA4 = "t13d1516h2_8daaf6152771_d8a2da3f94cd"
 
 	var found bool
 	for _, c := range checkChromiumProbe(gofire.ReferenceFor(gofire.Chrome151), probe) {
@@ -167,46 +120,17 @@ func TestChromiumProbeCatchesJA4Drift(t *testing.T) {
 	}
 }
 
-func TestChromiumProbeReportsScriptError(t *testing.T) {
-	dir := stubSolverDir(t, `{"status":"error","error":"could not find Chrome binary"}`)
+// The missing-browser path has to name the prerequisite. Without it the failure
+// is whatever exec reports about a path that is not there.
+func TestChromiumProbeRequiresABrowser(t *testing.T) {
+	t.Setenv("SOLVER_CHROME", filepath.Join(t.TempDir(), "no-such-browser"))
 
-	_, err := runChromiumProbe(context.Background(), dir, "https://example.com", 30)
+	_, err := runChromiumProbe(context.Background(), "", "https://example.com", 30*time.Second)
 	if err == nil {
-		t.Fatal("expected an error from a failing probe")
+		t.Fatal("expected an error when no browser is installed")
 	}
-	if !strings.Contains(err.Error(), "could not find Chrome binary") {
-		t.Errorf("error %q does not carry the script's message", err)
-	}
-}
-
-// TestChromiumProbeRequiresInstall checks the missing-dependency path names the
-// fix. Without it the failure is a Node module-resolution stack trace.
-func TestChromiumProbeRequiresInstall(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "fingerprint.js"), []byte("//"), 0o644); err != nil {
-		t.Fatalf("write fingerprint.js: %v", err)
-	}
-
-	_, err := runChromiumProbe(context.Background(), dir, "https://example.com", 30)
-	if err == nil {
-		t.Fatal("expected an error when node_modules is absent")
-	}
-	if !strings.Contains(err.Error(), "npm install") {
-		t.Errorf("error %q does not tell the operator to run npm install", err)
-	}
-}
-
-func TestChromiumProbeIgnoresStrayOutput(t *testing.T) {
-	payload := "some dependency logged this\n" +
-		chromeProbeJSON(t, "HeadlessChrome/151.0.7204.50", 151, gofire.Chrome151UserAgent) + "\n"
-	dir := stubSolverDir(t, payload)
-
-	probe, err := runChromiumProbe(context.Background(), dir, "https://example.com", 30)
-	if err != nil {
-		t.Fatalf("runChromiumProbe: %v", err)
-	}
-	if probe.Major != 151 {
-		t.Errorf("chromium major = %d, want 151", probe.Major)
+	if !strings.Contains(err.Error(), "needs a browser to drive") {
+		t.Errorf("error %q does not name the prerequisite", err)
 	}
 }
 

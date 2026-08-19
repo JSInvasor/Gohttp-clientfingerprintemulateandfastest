@@ -2,14 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,6 +13,7 @@ import (
 	"time"
 
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
+	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/solver"
 )
 
 // -solve earns a cf_clearance with the real browser in solver/ and seeds it
@@ -279,98 +276,117 @@ func (r *solveResult) clearance() (solvedCookie, bool) {
 	return solvedCookie{}, false
 }
 
-// runSolver shells out to solver/index.js and returns what it solved.
+// solverOptions builds the solve from this run's flags.
 //
-// It is a separate process rather than a library call because the solve needs a
-// real browser: the whole point is that a genuine Chromium TLS handshake and JS
-// runtime answer the challenge, which is precisely what this client cannot do.
+// The identity is passed rather than exported. The solver used to be a Node
+// process configured through SOLVER_PROXY and SOLVER_LANG, and an exported
+// SOLVER_PROXY reached the browser on its own — so a solve this run believed was
+// direct went out through an exit it never asked for, and the cookie was cached
+// under "direct" and replayed from this box. That is the silent 403 all of this
+// exists to prevent, and it is not reachable from here any more: the proxy is an
+// argument.
+func solverOptions(o *options, target string) solver.Options {
+	profile := solver.DefaultProfile()
+	// The language the run will replay with, so the solve cannot advertise a
+	// different one from the session that presents its cookie.
+	profile.Language = acceptLanguage(o)
+	// The timezone follows the language unless the operator pinned one, for the
+	// same reason: they are claims about the same imagined user.
+	if tz := os.Getenv("SOLVER_TZ"); tz == "" {
+		if derived := solver.TimezoneForLanguage(profile.Language); derived != "" {
+			profile.Timezone = derived
+		}
+	}
+	return solver.Options{
+		Target:   target,
+		Timeout:  o.solveTimeout,
+		Profile:  &profile,
+		ExecPath: o.chromePath,
+		// The browser's own diagnostics are worth seeing when a launch fails.
+		Stderr: os.Stderr,
+	}
+}
+
+// runSolver drives a real Chromium through the challenge and returns what it
+// solved.
+//
+// It is in-process rather than a subprocess. The solve still needs a real
+// browser — a genuine Chromium TLS handshake and JS runtime answer the
+// challenge, which is precisely what this client cannot do — but driving it over
+// CDP is something Go can do directly, and the process boundary was carrying
+// real cost: a JSON-over-pipe contract, a watchdog racing the parent's timeout,
+// an exit that could truncate the answer on a pipe, and a Node install plus an
+// npm tree as prerequisites for a static binary.
 //
 // The exit is a parameter rather than a field of o because a -proxy-file run
-// calls this once per proxy, concurrently. One process solves through one exit;
-// the browser has a single --proxy-server and there is nothing to rotate inside
-// it.
-func runSolver(ctx context.Context, o *options, target, proxy string) (*solveResult, error) {
-	script := filepath.Join(o.solverDir, "index.js")
+// calls this once per proxy, concurrently. One browser solves through one exit;
+// it has a single --proxy-server and there is nothing to rotate inside it.
+//
+// runSolver is a variable rather than a plain function because everything above
+// it — the cache, the seeding, the per-exit pairing, the drift reports — is
+// worth testing without a browser, and this is the seam. It used to be a stub
+// script the Node solver was pointed at, which tested the same pipeline through
+// a process boundary that no longer exists.
+var runSolver = solveWithBrowser
+
+func solveWithBrowser(ctx context.Context, o *options, target, proxy string) (*solveResult, error) {
 	if err := checkSolverDir(o); err != nil {
 		return nil, err
 	}
 
-	// The solver gets its own budget plus a margin: it has its own watchdog at
-	// timeout+30s, and killing it from here first would leave the Chromium tree
-	// to its exit handlers rather than letting it report what it found.
+	// A margin over the budget, so the solve reports what it found rather than
+	// being cancelled mid-sentence: it sizes its own attempts against
+	// o.solveTimeout and needs a moment past that to tear the browser down.
 	solveCtx, cancel := context.WithTimeout(ctx, o.solveTimeout+45*time.Second)
 	defer cancel()
 
-	seconds := int(o.solveTimeout.Seconds())
-	if seconds < 1 {
-		seconds = 1
+	res, err := solver.Solve(solveCtx, solverOptions(o, target), proxy)
+	if err != nil {
+		return nil, fmt.Errorf("solver: %w", err)
 	}
-	cmd := exec.CommandContext(solveCtx, "node", script, target, strconv.Itoa(seconds))
-	cmd.Stderr = os.Stderr // puppeteer's launch diagnostics are worth seeing
-
-	// The solver's identity is set rather than inherited — see solverEnv.
-	cmd.Env = solverEnv(proxy, acceptLanguage(o))
-
-	out, err := cmd.Output()
-	if err != nil && len(out) == 0 {
-		if errors.Is(err, exec.ErrNotFound) {
-			return nil, errors.New("node not found in PATH; -solve needs Node.js")
-		}
-		return nil, fmt.Errorf("run %s: %w", script, err)
-	}
-
-	res, perr := parseSolveOutput(out)
-	if perr != nil {
-		return nil, fmt.Errorf("parse %s output: %w", script, perr)
-	}
-	if res.Status == "error" {
+	if res.Status == solver.StatusError {
 		msg := res.Error
 		if msg == "" {
 			msg = "solve failed"
 		}
 		return nil, fmt.Errorf("solver: %s", msg)
 	}
-	return res, nil
+	return fromSolverResult(res), nil
 }
 
-// parseSolveOutput extracts the result object from the script's stdout.
+// fromSolverResult converts a library result into the shape this command caches
+// and reports.
 //
-// index.js prints one JSON object and nothing else, so the whole output
-// normally parses directly. The line fallback exists because a dependency deep
-// in puppeteer's tree can print a banner first, and a solve that worked should
-// not be thrown away over a warning. Scanning backwards means the result —
-// always last — wins over any preamble.
-func parseSolveOutput(out []byte) (*solveResult, error) {
-	if res, err := decodeSolve(out); err == nil {
-		return res, nil
+// The two are deliberately the same JSON: an existing solve cache stays readable
+// across this change, and everything downstream — the drift reports, the seed,
+// splitSolvedCookies — keeps working against the type it already knew.
+func fromSolverResult(r *solver.Result) *solveResult {
+	if r == nil {
+		return nil
 	}
-	lines := strings.Split(string(out), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if !strings.HasPrefix(line, "{") {
-			continue
-		}
-		if res, err := decodeSolve([]byte(line)); err == nil {
-			return res, nil
-		}
+	out := &solveResult{
+		Status:         r.Status,
+		Error:          r.Error,
+		URL:            r.URL,
+		UserAgent:      r.UserAgent,
+		AcceptLanguage: r.AcceptLanguage,
+		PageLanguages:  r.PageLanguages,
+		Timezone:       r.Timezone,
+		Cookies:        r.Cookies,
+		DurationMS:     r.DurationMS,
+		Attempts:       r.Attempts,
+		Exit:           r.Exit,
+		Chromium:       r.ChromiumVer,
+		ChromiumMajor:  r.ChromiumMajor,
+		Proxy:          r.Proxy,
+		LaunchMS:       r.LaunchMS,
 	}
-	if len(strings.TrimSpace(string(out))) == 0 {
-		return nil, errors.New("the solver produced no output")
+	for _, c := range r.CookieList {
+		out.CookieList = append(out.CookieList, solvedCookie{
+			Name: c.Name, Value: c.Value, Domain: c.Domain, Expires: c.Expires,
+		})
 	}
-	return nil, fmt.Errorf("no JSON object in %q", truncate(strings.TrimSpace(string(out)), 200))
-}
-
-// decodeSolve unmarshals one result object, rejecting anything without a status
-// so a stray JSON line from a dependency is not mistaken for the result.
-func decodeSolve(b []byte) (*solveResult, error) {
-	var res solveResult
-	if err := json.Unmarshal(b, &res); err != nil {
-		return nil, err
-	}
-	if res.Status == "" {
-		return nil, errors.New("JSON object has no status field")
-	}
-	return &res, nil
+	return out
 }
 
 // solveAndSeed earns one identity for the whole run and folds it into the
@@ -440,8 +456,9 @@ func solveOne(ctx context.Context, o *options, target string, e exit) (*solveSee
 	if proxy != "" {
 		where = "via " + e.label()
 	}
-	logSolve(proxy, "solving %s with the browser in %s/ (%s, up to %s)",
-		target, o.solverDir, where, o.solveTimeout)
+	browser, _ := solver.CheckBrowser(o.chromePath)
+	logSolve(proxy, "solving %s with %s (%s, up to %s)",
+		target, browser, where, o.solveTimeout)
 
 	res, err := runSolver(ctx, o, target, proxy)
 	if err != nil {
@@ -786,10 +803,10 @@ clearance is refused for reasons one response cannot distinguish:
 
 To find out which, ask the browser that earned it:
 
-  node %s %s
+  send -solve-replay %s
 
 That replays the same cookie in a fresh context of the same browser, from this
 same address. If it is challenged too, nothing on this side would have helped
 and the answer is a different exit — try -proxy or -proxy-file.
-`, why, filepath.Join(o.solverDir, "replay.js"), target)
+`, why, target)
 }

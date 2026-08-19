@@ -3,20 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
+	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/solver"
 )
 
-// chromiumProbe is what solver/fingerprint.js prints: the identity of the real
-// Chromium this repo drives, plus the fingerprint endpoint's view of it.
+// chromiumProbe is the identity of the real Chromium this repo drives, plus the
+// fingerprint endpoint's view of it.
 type chromiumProbe struct {
 	Status          string  `json:"status"`
 	Error           string  `json:"error"`
@@ -29,88 +27,42 @@ type chromiumProbe struct {
 
 // runChromiumProbe launches the solver's Chromium and captures its fingerprint.
 //
-// It shells out to solver/fingerprint.js rather than driving a browser from Go
-// so the measured browser is the one the solver actually launches — same
-// puppeteer-real-browser build, same flags, same stealth patches. A separately
-// configured browser would answer a different question, and the question here
-// is exactly "is the browser that earns cf_clearance the browser we emulate".
-func runChromiumProbe(ctx context.Context, solverDir, url string, timeoutSec int) (*chromiumProbe, error) {
-	script := filepath.Join(solverDir, "fingerprint.js")
-	if _, err := os.Stat(script); err != nil {
-		return nil, fmt.Errorf("%s not found: %w", script, err)
-	}
-	// The probe imports puppeteer-real-browser, so a missing install fails with
-	// a Node module-resolution error that says nothing about how to fix it.
-	if _, err := os.Stat(filepath.Join(solverDir, "node_modules")); err != nil {
-		return nil, fmt.Errorf("%s/node_modules not found — run `npm install` in %s first",
-			solverDir, solverDir)
+// It drives the browser through the same internal/solver code the solve uses, so
+// the measured browser is the one that actually earns cf_clearance — same
+// discovery, same launch flags, same CDP driver. A separately configured browser
+// would answer a different question, and the question here is exactly "is the
+// browser that earns cf_clearance the browser we emulate".
+//
+// It used to shell out to solver/fingerprint.js for that same reason, back when
+// the solver was a Node process. The reason has not changed; the solver has.
+func runChromiumProbe(ctx context.Context, chromePath, url string, timeout time.Duration) (*chromiumProbe, error) {
+	if _, err := solver.CheckBrowser(chromePath); err != nil {
+		return nil, fmt.Errorf("the Chromium probe needs a browser to drive: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "node", script, url, strconv.Itoa(timeoutSec))
-	cmd.Dir = "."
-	cmd.Stderr = os.Stderr // puppeteer's launch diagnostics are worth seeing
-
-	out, err := cmd.Output()
-	if err != nil && len(out) == 0 {
-		if errors.Is(err, exec.ErrNotFound) {
-			return nil, errors.New("node not found in PATH; the Chromium probe needs Node.js")
-		}
-		return nil, fmt.Errorf("run %s: %w", script, err)
+	p := solver.DefaultProfile()
+	res, err := solver.Fingerprint(ctx, solver.Options{
+		Target:   url,
+		Timeout:  timeout,
+		Profile:  &p,
+		ExecPath: chromePath,
+		Stderr:   os.Stderr, // the browser's launch diagnostics are worth seeing
+	}, os.Getenv("SOLVER_PROXY"))
+	if err != nil {
+		return nil, fmt.Errorf("chromium probe failed: %w", err)
 	}
 
-	probe, perr := parseProbeOutput(out)
-	if perr != nil {
-		return nil, fmt.Errorf("parse %s output: %w", script, perr)
+	probe := &chromiumProbe{
+		Status:          "ok",
+		Version:         res.ChromiumVersion,
+		Major:           res.ChromiumMajor,
+		NativeUserAgent: res.NativeUserAgent,
+		SolverUserAgent: res.SolverUserAgent,
 	}
-	if probe.Status != "ok" {
-		msg := probe.Error
-		if msg == "" {
-			msg = "status " + probe.Status
-		}
-		return nil, fmt.Errorf("chromium probe failed: %s", msg)
+	if err := json.Unmarshal(res.Capture, &probe.Capture); err != nil {
+		return nil, fmt.Errorf("the endpoint's JSON is not a fingerprint capture: %w", err)
 	}
 	return probe, nil
-}
-
-// parseProbeOutput extracts the probe result from the script's stdout.
-//
-// fingerprint.js prints one JSON object and nothing else, so the whole output
-// normally parses directly. The line fallback exists because a dependency deep
-// in puppeteer's tree can print a deprecation banner first, and a run that
-// worked should not be reported as a parse failure over a warning. Scanning
-// backwards means the probe result — always last — wins over any preamble.
-func parseProbeOutput(out []byte) (*chromiumProbe, error) {
-	if probe, err := decodeProbe(out); err == nil {
-		return probe, nil
-	}
-
-	lines := strings.Split(string(out), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if !strings.HasPrefix(line, "{") {
-			continue
-		}
-		if probe, err := decodeProbe([]byte(line)); err == nil {
-			return probe, nil
-		}
-	}
-	if len(strings.TrimSpace(string(out))) == 0 {
-		return nil, errors.New("the script produced no output")
-	}
-	return nil, fmt.Errorf("no JSON object in %q", truncate(strings.TrimSpace(string(out)), 200))
-}
-
-// decodeProbe unmarshals one probe object, rejecting anything without a status
-// so a stray JSON line from a dependency is not mistaken for the result.
-func decodeProbe(b []byte) (*chromiumProbe, error) {
-	var probe chromiumProbe
-	if err := json.Unmarshal(b, &probe); err != nil {
-		return nil, err
-	}
-	if probe.Status == "" {
-		return nil, errors.New("JSON object has no status field")
-	}
-	return &probe, nil
 }
 
 // checkChromiumProbe compares the real browser against the profile gofire
@@ -236,13 +188,13 @@ func majorFromUA(ua string) int {
 // Cloudflare binds cf_clearance to the issuing session's (UA, JA3/JA4, IP). A
 // mismatch here does not fail loudly at runtime; it produces a cookie that
 // works once, dies in seconds under load, and looks exactly like a solver bug.
-func runViaChromium(ctx context.Context, profile gofire.BrowserProfile, url, proxy, save, solverDir string, timeout time.Duration) error {
+func runViaChromium(ctx context.Context, profile gofire.BrowserProfile, url, proxy, save, chromePath string, timeout time.Duration) error {
 	ref := gofire.ReferenceFor(profile)
 
 	fmt.Printf("launching the solver's Chromium against %s\n", url)
 	fmt.Println("(this opens a real browser and takes ~10-30s)")
 
-	probe, err := runChromiumProbe(ctx, solverDir, url, int(timeout.Seconds()))
+	probe, err := runChromiumProbe(ctx, chromePath, url, timeout)
 	if err != nil {
 		return err
 	}

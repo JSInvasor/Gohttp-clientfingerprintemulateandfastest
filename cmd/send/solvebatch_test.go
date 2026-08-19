@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -9,30 +10,55 @@ import (
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
 )
 
-// batchStubJS is a solver that speaks the batch protocol: it reads the job list
-// from stdin and answers one NDJSON line per exit, naming the proxy it was given
-// so a test can check the pairing survived the round trip.
+// stubSolverBatch replaces the batch solve for the length of one test.
 //
-// A line per exit rather than one object at the end is the contract that lets
-// the Go side report as results land, so the stub has to stream too.
-const batchStubJS = `let raw = "";
-process.stdin.on("data", (d) => (raw += d));
-process.stdin.on("end", () => {
-  const job = JSON.parse(raw);
-  for (const e of job.exits) {
-    process.stdout.write(JSON.stringify({
-      exit: e.id, status: "ok", url: process.argv[2], user_agent: "UA-151",
-      proxy: e.proxy, duration_ms: 10, attempts: 1,
-      chromium_version: "Chrome/151.0.0.0", chromium_major: 151,
-      cookie_list: [{name: "cf_clearance", value: "for-" + e.id, domain: "site.test"}],
-    }) + "\n");
-  }
-});
-`
-
-func batchOptions(t *testing.T, script string, sessions int, proxies ...string) *options {
+// The batch used to be a Node process reading a job list from stdin and writing
+// one NDJSON line per exit, and the stubs here spoke that protocol. In-process
+// there is no protocol — the pairing this exercises is a callback — so the stub
+// is a function that answers per exit.
+func stubSolverBatch(t *testing.T, fn func(o *options, target string, e exit) (*solveResult, error)) {
 	t.Helper()
-	o := fleetOptions(t, script, sessions, proxies...)
+	previous := runSolverBatch
+	runSolverBatch = func(_ context.Context, o *options, target string, exits []exit,
+		onResult func(exit, *solveResult, error)) error {
+		for _, e := range exits {
+			res, err := fn(o, target, e)
+			onResult(e, res, err)
+		}
+		return nil
+	}
+	t.Cleanup(func() { runSolverBatch = previous })
+}
+
+// batchSolvesEveryExit answers every exit with a cookie naming it, so a test can
+// check the pairing survived the round trip.
+func batchSolvesEveryExit(o *options, target string, e exit) (*solveResult, error) {
+	return &solveResult{
+		Exit:          e.identity(),
+		Status:        "ok",
+		URL:           target,
+		UserAgent:     "UA-151",
+		Proxy:         e.proxy,
+		DurationMS:    10,
+		Attempts:      1,
+		Chromium:      "Chrome/151.0.0.0",
+		ChromiumMajor: 151,
+		CookieList: []solvedCookie{
+			{Name: "cf_clearance", Value: "for-" + e.identity(), Domain: "site.test"},
+		},
+	}, nil
+}
+
+func batchOptions(t *testing.T, solve func(o *options, target string, e exit) (*solveResult, error),
+	sessions int, proxies ...string) *options {
+	t.Helper()
+	// The per-browser stub is installed too: solveAcrossProxies falls back to it
+	// for a single pending exit, so a batch test that ends up there must not
+	// reach a real browser either.
+	o := fleetOptions(t, func(*options, string, string) (*solveResult, error) {
+		return nil, errors.New("solver: the batch path was expected")
+	}, sessions, proxies...)
+	stubSolverBatch(t, solve)
 	o.solveIsolate = false // the shared-browser path, which is the default
 	return o
 }
@@ -42,7 +68,7 @@ func batchOptions(t *testing.T, script string, sessions int, proxies ...string) 
 // is where a shared cookie jar would show up as one exit holding another's
 // clearance.
 func TestBatchPairsSeedsWithExits(t *testing.T) {
-	o := batchOptions(t, batchStubJS, 3, "http://a.test:1", "http://b.test:2", "http://c.test:3")
+	o := batchOptions(t, batchSolvesEveryExit, 3, "http://a.test:1", "http://b.test:2", "http://c.test:3")
 
 	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAcrossProxies: %v", err)
@@ -66,20 +92,13 @@ func TestBatchPairsSeedsWithExits(t *testing.T) {
 // An exit the batch reports an error for is dropped, exactly as it is on the
 // per-browser path — one browser must not mean one verdict for the whole list.
 func TestBatchDropsExitsThatFailed(t *testing.T) {
-	const script = `let raw = "";
-process.stdin.on("data", (d) => (raw += d));
-process.stdin.on("end", () => {
-  const job = JSON.parse(raw);
-  for (const e of job.exits) {
-    const bad = e.proxy.includes("b.test");
-    process.stdout.write(JSON.stringify(bad
-      ? {exit: e.id, status: "error", error: "challenge not solved"}
-      : {exit: e.id, status: "ok", user_agent: "UA-151", proxy: e.proxy,
-         cookie_list: [{name: "cf_clearance", value: "for-" + e.id, domain: "site.test"}]}) + "\n");
-  }
-});
-`
-	o := batchOptions(t, script, 3, "http://a.test:1", "http://b.test:2", "http://c.test:3")
+	failOnB := func(o *options, target string, e exit) (*solveResult, error) {
+		if strings.Contains(e.proxy, "b.test") {
+			return nil, errors.New("solver: challenge not solved")
+		}
+		return batchSolvesEveryExit(o, target, e)
+	}
+	o := batchOptions(t, failOnB, 3, "http://a.test:1", "http://b.test:2", "http://c.test:3")
 
 	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAcrossProxies: %v", err)
@@ -101,17 +120,21 @@ process.stdin.on("end", () => {
 // solver killed at exit 3 of 5 leaves two with no line at all, and inferring
 // success from silence would pair a session with no cookie.
 func TestBatchTreatsMissingExitsAsFailures(t *testing.T) {
-	// Answers for the first exit only, then exits cleanly.
-	const script = `let raw = "";
-process.stdin.on("data", (d) => (raw += d));
-process.stdin.on("end", () => {
-  const job = JSON.parse(raw);
-  const e = job.exits[0];
-  process.stdout.write(JSON.stringify({exit: e.id, status: "ok", user_agent: "UA-151",
-    proxy: e.proxy, cookie_list: [{name: "cf_clearance", value: "for-" + e.id, domain: "site.test"}]}) + "\n");
-});
-`
-	o := batchOptions(t, script, 3, "http://a.test:1", "http://b.test:2", "http://c.test:3")
+	// Answers for the first exit only, then stops — the shape a batch that dies
+	// partway leaves behind.
+	o := batchOptions(t, nil, 3, "http://a.test:1", "http://b.test:2", "http://c.test:3")
+	previous := runSolverBatch
+	t.Cleanup(func() { runSolverBatch = previous })
+	runSolverBatch = func(_ context.Context, opts *options, target string, exits []exit,
+		onResult func(exit, *solveResult, error)) error {
+		first := exits[0]
+		res, _ := batchSolvesEveryExit(opts, target, first)
+		onResult(first, res, nil)
+		for _, e := range exits[1:] {
+			onResult(e, nil, errors.New("the batch ended without reporting this exit"))
+		}
+		return nil
+	}
 
 	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAcrossProxies: %v", err)
@@ -124,27 +147,31 @@ process.stdin.on("end", () => {
 // A solver that dies before saying anything fails every exit with its own
 // message rather than a generic one.
 func TestBatchReportsAFailedSolverForEveryExit(t *testing.T) {
-	o := batchOptions(t, `process.exit(3);`, 2, "http://a.test:1", "http://b.test:2")
+	o := batchOptions(t, func(*options, string, exit) (*solveResult, error) {
+		return nil, errors.New("the batch ended before reporting this exit: browser did not start")
+	}, 2, "http://a.test:1", "http://b.test:2")
 
 	err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/")
 	if err == nil {
 		t.Fatal("a batch that never ran was allowed to start a run")
 	}
-	if !strings.Contains(err.Error(), "exited") {
-		t.Errorf("error %q does not say the solver exited", err)
+	if !strings.Contains(err.Error(), "did not start") {
+		t.Errorf("error %q does not carry the reason the batch failed", err)
 	}
 }
 
 // The cache is consulted before anything is launched, so a fully cached list
 // never starts a browser. Without that, a warm cache would still pay a launch.
 func TestBatchSkipsTheBrowserWhenEverythingIsCached(t *testing.T) {
-	o := batchOptions(t, batchStubJS, 2, "http://a.test:1", "http://b.test:2")
+	o := batchOptions(t, batchSolvesEveryExit, 2, "http://a.test:1", "http://b.test:2")
 	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("first solve: %v", err)
 	}
 
 	// Second run over the same cache, with a solver that fails if it runs at all.
-	again := batchOptions(t, `process.exit(3);`, 2, "http://a.test:1", "http://b.test:2")
+	again := batchOptions(t, func(*options, string, exit) (*solveResult, error) {
+		return nil, errors.New("solver: should not have run")
+	}, 2, "http://a.test:1", "http://b.test:2")
 	again.solveCache = o.solveCache
 
 	if err := solveAcrossProxies(context.Background(), again, gofire.Chrome151, "https://site.test/"); err != nil {
@@ -155,46 +182,49 @@ func TestBatchSkipsTheBrowserWhenEverythingIsCached(t *testing.T) {
 	}
 }
 
-// The job list goes over stdin because it carries proxy credentials, and argv is
-// world-readable in /proc for as long as the solve runs.
-func TestBatchKeepsCredentialsOutOfArgv(t *testing.T) {
-	const script = `let raw = "";
-process.stdin.on("data", (d) => (raw += d));
-process.stdin.on("end", () => {
-  const job = JSON.parse(raw);
-  for (const e of job.exits) {
-    process.stdout.write(JSON.stringify({exit: e.id, status: "ok", user_agent: "UA-151",
-      // argv is echoed back so the test can assert the secret is not in it.
-      url: process.argv.join(" "), proxy: e.proxy,
-      cookie_list: [{name: "cf_clearance", value: "v", domain: "site.test"}]}) + "\n");
-  }
-});
-`
-	o := batchOptions(t, script, 2,
-		"http://user:hunter2@a.test:1", "http://user:hunter2@b.test:2")
+// Proxy credentials used to be the reason the job list went over stdin rather
+// than argv: /proc/<pid>/cmdline is world-readable for as long as the solve runs,
+// and a solve runs for minutes.
+//
+// There is no second process any more, so there is no argv and no pipe — the
+// credentials never leave this address space. What is still worth pinning is the
+// half that remains observable: the exit reaches the solve with its credentials
+// intact, because the browser needs them to authenticate, while everything that
+// gets printed carries the redacted label instead.
+func TestBatchKeepsCredentialsOutOfWhatItPrints(t *testing.T) {
+	const withSecret = "http://user:hunter2@a.test:1"
 
-	var argv string
-	exits := []exit{{proxy: "http://user:hunter2@a.test:1", ip: "203.0.113.1"},
-		{proxy: "http://user:hunter2@b.test:2", ip: "203.0.113.2"}}
+	var given string
+	o := batchOptions(t, func(_ *options, target string, e exit) (*solveResult, error) {
+		given = e.proxy
+		return &solveResult{
+			Exit: e.identity(), Status: "ok", UserAgent: "UA-151",
+			// Proxy is what a result line reports, and it is the label rather
+			// than the URL for exactly this reason.
+			Proxy:      e.label(),
+			CookieList: []solvedCookie{{Name: "cf_clearance", Value: "v", Domain: "site.test"}},
+		}, nil
+	}, 2, withSecret, "http://user:hunter2@b.test:2")
+
+	var reported string
+	exits := []exit{{proxy: withSecret, ip: "203.0.113.1"}}
 	err := runSolverBatch(context.Background(), o, "https://site.test/", exits,
 		func(_ exit, res *solveResult, err error) {
 			if err == nil && res != nil {
-				argv = res.URL
+				reported = res.Proxy
 			}
 		})
 	if err != nil {
 		t.Fatalf("runSolverBatch: %v", err)
 	}
-	if argv == "" {
-		t.Fatal("the stub reported no argv")
+	if given != withSecret {
+		t.Errorf("the solve was given %q, want the credentials it needs to authenticate", given)
 	}
-	if strings.Contains(argv, "hunter2") {
-		t.Errorf("the proxy password reached argv: %q", argv)
+	if strings.Contains(reported, "hunter2") {
+		t.Errorf("the reported exit carries the password: %q", reported)
 	}
-	// The batch flag has to be there, or the solver would read the job list as
-	// a single-exit run and hang on stdin nobody drains.
-	if !strings.Contains(argv, "--batch") {
-		t.Errorf("argv %q does not carry --batch", argv)
+	if strings.Contains(redactProxy(withSecret), "hunter2") {
+		t.Errorf("redactProxy leaked the password: %q", redactProxy(withSecret))
 	}
 }
 
@@ -218,7 +248,7 @@ func TestSolveIsolateParses(t *testing.T) {
 // killed every batch at the first round boundary.
 func TestBatchBudgetScalesWithRounds(t *testing.T) {
 	// Six exits, two at a time, is three rounds — so three budgets, not one.
-	o := batchOptions(t, batchStubJS, 6,
+	o := batchOptions(t, batchSolvesEveryExit, 6,
 		"http://a:1", "http://b:2", "http://c:3", "http://d:4", "http://e:5", "http://f:6")
 	o.solveParallel = 2
 	o.solveTimeout = 30 * time.Second

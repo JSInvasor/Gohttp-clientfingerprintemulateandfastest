@@ -58,7 +58,8 @@ func main() {
 
 		viaChromium = flag.Bool("via-chromium", false,
 			"also measure the real Chromium the solver drives, and diff this client against it")
-		solverDir = flag.String("solver-dir", "solver", "directory holding fingerprint.js and node_modules")
+		chromePath = flag.String("chrome", "",
+			"path to the browser to measure (default: discovered, or $SOLVER_CHROME)")
 	)
 	flag.Parse()
 
@@ -86,7 +87,7 @@ func main() {
 	defer cancel()
 
 	if *viaChromium {
-		if err := runViaChromium(ctx, profiles[0], *url, *proxy, *save, *solverDir, *timeout); err != nil {
+		if err := runViaChromium(ctx, profiles[0], *url, *proxy, *save, *chromePath, *timeout); err != nil {
 			fmt.Fprintln(os.Stderr, "fpcheck:", err)
 			os.Exit(1)
 		}

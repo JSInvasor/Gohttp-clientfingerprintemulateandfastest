@@ -1,18 +1,13 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"slices"
-	"strconv"
-	"strings"
+	"sync"
 	"time"
+
+	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/solver"
 )
 
 // One browser for the whole list instead of one per exit.
@@ -34,185 +29,125 @@ import (
 // Chromiums resident at once, which is what kept the default at 2; four contexts
 // in one browser is four tabs.
 //
-// Results stream back as NDJSON, one line per exit as it finishes, so a batch
-// that runs for minutes reports as it goes rather than at the end — and a batch
-// that dies halfway has already handed over the exits that solved.
-
-// solverJob is the batch the solver reads from stdin.
-//
-// stdin rather than argv or the environment because these carry proxy
-// credentials, and /proc/<pid>/cmdline is world-readable for as long as the
-// solve runs. See solver/jobs.js.
-type solverJob struct {
-	Exits    []solverJobExit `json:"exits"`
-	Parallel int             `json:"parallel"`
-}
-
-type solverJobExit struct {
-	ID    string `json:"id"`
-	Proxy string `json:"proxy"`
-}
+// Results come back as each exit finishes rather than at the end, so a batch
+// that runs for minutes reports as it goes — and a batch that dies halfway has
+// already handed over the exits that solved. That used to be NDJSON on a pipe;
+// in-process it is a callback, and the exit-that-was-never-reported case it
+// guarded is now only reachable through cancellation.
 
 // runSolverBatch solves every exit in one browser, calling onResult as each
 // finishes.
 //
-// onResult is called from this goroutine, in completion order, so it is free to
-// print. An exit the solver never reported comes back as an error rather than
-// as silence: the caller pairs cookies with proxies, and a missing pairing has
-// to be a dropped exit rather than an absent one.
-func runSolverBatch(ctx context.Context, o *options, target string, exits []exit,
+// onResult is called in completion order and serialised, so it is free to print.
+// An exit the solver never reported comes back as an error rather than as
+// silence: the caller pairs cookies with proxies, and a missing pairing has to be
+// a dropped exit rather than an absent one.
+//
+// A variable for the same reason runSolver is: the pairing this feeds is the
+// part worth testing, and it does not need a browser to be wrong.
+var runSolverBatch = solveBatchWithBrowser
+
+func solveBatchWithBrowser(ctx context.Context, o *options, target string, exits []exit,
 	onResult func(e exit, res *solveResult, err error)) error {
 
-	script := filepath.Join(o.solverDir, "index.js")
 	if err := checkSolverDir(o); err != nil {
 		return err
 	}
 
-	parallel := min(o.solveParallel, len(exits))
-	if parallel < 1 {
-		parallel = 1
-	}
-	job := solverJob{Parallel: parallel}
+	jobs := make([]solver.Exit, 0, len(exits))
+	byID := make(map[string]exit, len(exits))
 	for _, e := range exits {
-		job.Exits = append(job.Exits, solverJobExit{ID: e.identity(), Proxy: e.proxy})
+		jobs = append(jobs, solver.Exit{ID: e.identity(), Proxy: e.proxy})
+		byID[e.identity()] = e
 	}
-	payload, err := json.Marshal(job)
+	batch, err := solver.NewBatch(jobs, o.solveParallel)
 	if err != nil {
-		return fmt.Errorf("encode job list: %w", err)
+		return err
 	}
 
 	// The budget is per exit, and the exits run in rounds of `parallel`, so the
 	// wall clock is that many budgets. Sizing this for a single one is how a
 	// batch of more than -solve-parallel exits would be killed at the first
 	// round boundary — and it would have looked like the target hanging. The
-	// solver arms its own watchdog the same way; the margin is so it reports
-	// first rather than being killed mid-sentence.
-	rounds := (len(exits) + parallel - 1) / parallel
+	// margin is so the last exit reports rather than being cancelled
+	// mid-teardown.
+	rounds := (len(exits) + batch.Parallel - 1) / batch.Parallel
 	budget := time.Duration(rounds)*o.solveTimeout + 45*time.Second
 	batchCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
-	seconds := max(int(o.solveTimeout.Seconds()), 1)
-	cmd := exec.CommandContext(batchCtx, "node", script, target, strconv.Itoa(seconds), "--batch")
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = strings.NewReader(string(payload))
-	cmd.Env = solverEnv("", acceptLanguage(o))
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("solver stdout: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			return errors.New("node not found in PATH; -solve needs Node.js")
-		}
-		return fmt.Errorf("run %s: %w", script, err)
-	}
-
-	byID := make(map[string]exit, len(exits))
-	for _, e := range exits {
-		byID[e.identity()] = e
-	}
+	// Results are delivered as each exit finishes rather than at the end. A
+	// batch runs for minutes and this is the only progress there is; it is also
+	// what keeps a batch that dies at exit 90 of 100 from taking the first 89
+	// with it.
 	seen := make(map[string]bool, len(exits))
+	var mu sync.Mutex
 
-	// Read as they land rather than after the process exits. A batch runs for
-	// minutes and this is the only progress there is; it is also what keeps a
-	// solver that dies at exit 90 of 100 from taking the first 89 with it.
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	var lastErr error
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "{") {
-			continue // a dependency's banner, not a result
+	err = solver.SolveBatch(batchCtx, solverOptions(o, target), batch, func(r solver.BatchResult) {
+		e, ok := byID[r.Exit.ID]
+		if !ok {
+			return
 		}
-		res, err := decodeSolve([]byte(line))
-		if err != nil {
-			continue
+		mu.Lock()
+		if seen[r.Exit.ID] {
+			mu.Unlock()
+			return
 		}
-		if res.Exit == "" {
-			// A statusful line with no exit is the solver reporting about the
-			// batch itself — a fatal error before any exit ran.
-			if res.Status == "error" && res.Error != "" {
-				lastErr = fmt.Errorf("solver: %s", res.Error)
-			}
-			continue
-		}
-		e, ok := byID[res.Exit]
-		if !ok || seen[res.Exit] {
-			continue
-		}
-		seen[res.Exit] = true
-		if res.Status == "error" {
-			msg := res.Error
-			if msg == "" {
-				msg = "solve failed"
+		seen[r.Exit.ID] = true
+		mu.Unlock()
+
+		if r.Result == nil || r.Result.Status == solver.StatusError {
+			msg := "solve failed"
+			if r.Result != nil && r.Result.Error != "" {
+				msg = r.Result.Error
 			}
 			onResult(e, nil, fmt.Errorf("solver: %s", msg))
-			continue
+			return
 		}
+		res := fromSolverResult(r.Result)
+		res.Exit = r.Exit.ID
 		onResult(e, res, nil)
-	}
+	})
 
-	waitErr := cmd.Wait()
-
-	// Anything the solver never reported on. A batch that was killed, or that
-	// died partway, leaves exits with no line at all — and the caller must hear
-	// about those as failures rather than infer them from a short list.
+	// Anything the batch never reported on. A run that was cancelled leaves
+	// exits with no result at all — and the caller must hear about those as
+	// failures rather than infer them from a short list.
 	for _, e := range exits {
 		if seen[e.identity()] {
 			continue
 		}
-		err := lastErr
-		if err == nil {
-			err = batchExitError(batchCtx, waitErr)
+		reason := err
+		if reason == nil {
+			reason = batchExitError(batchCtx, nil)
 		}
-		onResult(e, nil, err)
+		onResult(e, nil, reason)
 	}
 	return nil
 }
 
 // batchExitError explains an exit that produced no result at all.
-func batchExitError(ctx context.Context, waitErr error) error {
+func batchExitError(ctx context.Context, cause error) error {
 	switch {
 	case ctx.Err() != nil:
 		return errors.New("the batch ran out of time before this exit was reached")
-	case waitErr != nil:
-		return fmt.Errorf("the solver exited before reporting this exit: %w", waitErr)
+	case cause != nil:
+		return fmt.Errorf("the batch ended before reporting this exit: %w", cause)
 	default:
-		return errors.New("the solver exited without reporting this exit")
+		return errors.New("the batch ended without reporting this exit")
 	}
 }
 
-// checkSolverDir reports the two ways solver/ is usually not ready, in terms of
+// checkSolverDir reports the one way solving is usually not ready, in terms of
 // what to do about it.
+//
+// It used to check for solver/index.js and its node_modules, because the solve
+// was a Node process. There is no script and no npm tree any more — the solver
+// is compiled into this binary — so the only prerequisite left is a browser to
+// drive. The name is kept because -solve-isolate, the batch path and the tests
+// all call it, and what it means has not changed: "can this run solve at all".
 func checkSolverDir(o *options) error {
-	script := filepath.Join(o.solverDir, "index.js")
-	if _, err := os.Stat(script); err != nil {
-		return fmt.Errorf("%s not found: %w", script, err)
-	}
-	// index.js imports puppeteer-real-browser, so a missing install fails with a
-	// Node module-resolution error that says nothing about how to fix it.
-	if _, err := os.Stat(filepath.Join(o.solverDir, "node_modules")); err != nil {
-		return fmt.Errorf("%s/node_modules not found — run `npm install` in %s first",
-			o.solverDir, o.solverDir)
+	if _, err := solver.CheckBrowser(o.chromePath); err != nil {
+		return fmt.Errorf("-solve needs a browser to drive: %w", err)
 	}
 	return nil
-}
-
-// solverEnv builds the child environment, setting the solver's identity rather
-// than inheriting it.
-//
-// An exported SOLVER_PROXY used to reach the browser on its own, so a solve this
-// run believed was direct went out through an exit it never asked for — and the
-// cookie was cached under "direct" and replayed from this box, which is the
-// silent 403 all of this exists to prevent.
-func solverEnv(proxy, lang string) []string {
-	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		return strings.HasPrefix(kv, "SOLVER_PROXY=") || strings.HasPrefix(kv, "SOLVER_LANG=")
-	})
-	if proxy != "" {
-		env = append(env, "SOLVER_PROXY="+proxy)
-	}
-	return append(env, "SOLVER_LANG="+lang)
 }

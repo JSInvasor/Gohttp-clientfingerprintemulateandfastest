@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -13,96 +13,117 @@ import (
 	"time"
 
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
+	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/solver"
 )
 
-// stubSolverDir writes an index.js that prints script verbatim, plus the
-// node_modules directory runSolver checks for.
+// stubSolver replaces the solve with a canned answer for the length of one test.
 //
-// Stubbing the script rather than launching a real browser is deliberate: this
-// exercises the part that can actually be wrong in CI — process invocation,
-// environment passthrough, output parsing, error propagation and the seeding
-// that follows — without needing Chromium, a display, or network. Whether a
-// real challenge is solvable is not something a test can assert.
-func stubSolverDir(t *testing.T, script string) string {
+// Stubbing here rather than driving a real browser is deliberate: what this file
+// exercises is the part that can actually be wrong in CI — the option plumbing,
+// the per-exit pairing, the cache, the seeding and the drift reports — none of
+// which needs Chromium, a display or a network. Whether a real challenge is
+// solvable is not something a test can assert; internal/solver drives a real
+// browser against a fake edge for the half that can be.
+//
+// It used to be a stub index.js the Node solver was pointed at. Same seam, one
+// process boundary fewer.
+func stubSolver(t *testing.T, fn func(o *options, target, proxy string) (*solveResult, error)) {
 	t.Helper()
-	if _, err := exec.LookPath("node"); err != nil {
-		t.Skip("node not in PATH")
+	previous := runSolver
+	runSolver = func(_ context.Context, o *options, target, proxy string) (*solveResult, error) {
+		return fn(o, target, proxy)
 	}
-	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
-		t.Fatalf("mkdir node_modules: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte(script), 0o644); err != nil {
-		t.Fatalf("write index.js: %v", err)
-	}
-	return dir
+	t.Cleanup(func() { runSolver = previous })
 }
 
-// printJS is a stub body that writes out and nothing else.
-func printJS(out string) string {
-	r := strings.NewReplacer(`\`, `\\`, `'`, `\'`, "\n", `\n`, "\r", `\r`)
-	return "process.stdout.write('" + r.Replace(out) + "');\n"
+// stubSolveResult answers every solve with one canned result.
+func stubSolveResult(t *testing.T, res *solveResult, err error) {
+	t.Helper()
+	stubSolver(t, func(*options, string, string) (*solveResult, error) {
+		if err != nil {
+			return nil, err
+		}
+		clone := *res
+		return &clone, nil
+	})
 }
 
-// echoProxyJS reports the exit it was told to solve through, and seeds a cookie
-// naming it — which is what lets a fleet test assert that every session ended up
-// with the cookie its own proxy earned rather than a neighbour's.
-const echoProxyJS = `const p = process.env.SOLVER_PROXY || "";
-process.stdout.write(JSON.stringify({
-  status: "ok", url: "https://site.test/", user_agent: "UA-151", proxy: p,
-  cookie_list: [{name: "cf_clearance", value: "for-" + p, domain: "site.test"}],
-}));
-`
-
-func solveOptions(dir string) *options {
-	return &options{solverDir: dir, solveTimeout: 30 * time.Second}
+// echoProxySolve reports the exit it was told to solve through, and seeds a
+// cookie naming it — which is what lets a fleet test assert that every session
+// ended up with the cookie its own proxy earned rather than a neighbour's.
+func echoProxySolve(o *options, target, proxy string) (*solveResult, error) {
+	return &solveResult{
+		Status:    "ok",
+		URL:       "https://site.test/",
+		UserAgent: "UA-151",
+		Proxy:     proxy,
+		CookieList: []solvedCookie{
+			{Name: "cf_clearance", Value: "for-" + proxy, Domain: "site.test"},
+		},
+	}, nil
 }
 
-const okSolve = `{"status":"ok","url":"https://site.test/","user_agent":"UA-151",` +
-	`"cookies":"cf_clearance=abc; __cf_bm=xyz",` +
-	`"cookie_list":[{"name":"cf_clearance","value":"abc","domain":"site.test"},` +
-	`{"name":"__cf_bm","value":"xyz","domain":"site.test"}],` +
-	`"duration_ms":8500,"attempts":1,"chromium_version":"Chrome/151.0.0.0","chromium_major":151,"proxy":""}`
-
-func TestParseSolveOutputCleanLine(t *testing.T) {
-	res, err := parseSolveOutput([]byte(okSolve))
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if res.Status != "ok" || res.UserAgent != "UA-151" || len(res.CookieList) != 2 {
-		t.Fatalf("unexpected result: %+v", res)
-	}
+func solveOptions() *options {
+	return &options{solveTimeout: 30 * time.Second}
 }
 
-// A dependency in puppeteer's tree can print a deprecation banner before the
-// result. A solve that worked must not be discarded over a warning.
-func TestParseSolveOutputIgnoresPreamble(t *testing.T) {
-	noisy := "(node:1) Warning: something deprecated\n{\"not\":\"ours\"}\n" + okSolve + "\n"
-	res, err := parseSolveOutput([]byte(noisy))
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if res.Status != "ok" {
-		t.Fatalf("status = %q, want ok", res.Status)
+func okSolveResult() *solveResult {
+	return &solveResult{
+		Status:        "ok",
+		URL:           "https://site.test/",
+		UserAgent:     "UA-151",
+		Cookies:       "cf_clearance=abc; __cf_bm=xyz",
+		DurationMS:    8500,
+		Attempts:      1,
+		Chromium:      "Chrome/151.0.0.0",
+		ChromiumMajor: 151,
+		CookieList: []solvedCookie{
+			{Name: "cf_clearance", Value: "abc", Domain: "site.test"},
+			{Name: "__cf_bm", Value: "xyz", Domain: "site.test"},
+		},
 	}
 }
 
-func TestParseSolveOutputRejectsJunk(t *testing.T) {
-	if _, err := parseSolveOutput(nil); err == nil {
-		t.Error("empty output parsed without error")
+// The library result and the shape this command caches are deliberately the same
+// JSON, so an existing solve cache stays readable across the move off Node.
+func TestFromSolverResultKeepsTheCacheFormat(t *testing.T) {
+	in := &solver.Result{
+		Status:         solver.StatusOK,
+		URL:            "https://site.test/",
+		UserAgent:      "UA-151",
+		AcceptLanguage: "en-US,en;q=0.9",
+		PageLanguages:  []string{"en-US", "en"},
+		Timezone:       "America/New_York",
+		Cookies:        "cf_clearance=abc",
+		CookieList:     []solver.Cookie{{Name: "cf_clearance", Value: "abc", Domain: "site.test", Expires: 123}},
+		DurationMS:     8500,
+		Attempts:       1,
+		ChromiumVer:    "Chrome/151.0.0.0",
+		ChromiumMajor:  151,
+		LaunchMS:       600,
 	}
-	if _, err := parseSolveOutput([]byte("chromium failed to start\n")); err == nil {
-		t.Error("non-JSON output parsed without error")
+	got := fromSolverResult(in)
+	if got.Status != "ok" || got.UserAgent != "UA-151" || got.Chromium != "Chrome/151.0.0.0" {
+		t.Fatalf("converted result lost fields: %+v", got)
 	}
-	// A JSON object with no status is a stray line from a dependency, not a result.
-	if _, err := parseSolveOutput([]byte(`{"hello":"world"}`)); err == nil {
-		t.Error("statusless JSON parsed without error")
+	if got.AcceptLanguage != in.AcceptLanguage || got.Timezone != in.Timezone {
+		t.Errorf("the identity read back from the page did not survive: %+v", got)
+	}
+	if len(got.CookieList) != 1 || got.CookieList[0].Expires != 123 {
+		t.Fatalf("cookie list = %+v", got.CookieList)
+	}
+	cf, ok := got.clearance()
+	if !ok || cf.Value != "abc" {
+		t.Errorf("clearance() = %+v, %v", cf, ok)
+	}
+	if fromSolverResult(nil) != nil {
+		t.Error("fromSolverResult(nil) invented a result")
 	}
 }
 
 func TestRunSolverOK(t *testing.T) {
-	o := solveOptions(stubSolverDir(t, printJS(okSolve)))
-	res, err := runSolver(context.Background(), o, "https://site.test/", "")
+	stubSolveResult(t, okSolveResult(), nil)
+	res, err := runSolver(context.Background(), solveOptions(), "https://site.test/", "")
 	if err != nil {
 		t.Fatalf("runSolver: %v", err)
 	}
@@ -111,11 +132,11 @@ func TestRunSolverOK(t *testing.T) {
 	}
 }
 
-// A solver that reports an error must fail the run rather than letting it start
+// A solve that reports an error must fail the run rather than letting it start
 // against a target it never got past.
 func TestRunSolverPropagatesError(t *testing.T) {
-	o := solveOptions(stubSolverDir(t, printJS(`{"status":"error","error":"watchdog timeout"}`)))
-	_, err := runSolver(context.Background(), o, "https://site.test/", "")
+	stubSolveResult(t, nil, errors.New("solver: watchdog timeout"))
+	_, err := runSolver(context.Background(), solveOptions(), "https://site.test/", "")
 	if err == nil {
 		t.Fatal("a solver error did not fail the run")
 	}
@@ -124,81 +145,92 @@ func TestRunSolverPropagatesError(t *testing.T) {
 	}
 }
 
-// The missing-install case is the one a first-time user hits, and Node's own
-// module-resolution error says nothing about how to fix it.
-func TestRunSolverMissingNodeModules(t *testing.T) {
-	if _, err := exec.LookPath("node"); err != nil {
-		t.Skip("node not in PATH")
+// The missing-browser case is the one a first-time user hits, and it has to say
+// what to do rather than fail somewhere deeper. It replaced the missing
+// node_modules check, which was the same message for the same reason.
+func TestSolveNeedsABrowser(t *testing.T) {
+	t.Setenv("SOLVER_CHROME", filepath.Join(t.TempDir(), "no-such-browser"))
+	err := checkSolverDir(&options{})
+	if err == nil {
+		t.Fatal("a missing browser was accepted")
 	}
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("//\n"), 0o644); err != nil {
-		t.Fatalf("write index.js: %v", err)
-	}
-	_, err := runSolver(context.Background(), solveOptions(dir), "https://site.test/", "")
-	if err == nil || !strings.Contains(err.Error(), "npm install") {
-		t.Fatalf("error = %v, want a message pointing at npm install", err)
+	if !strings.Contains(err.Error(), "-solve needs a browser") {
+		t.Errorf("error = %v, want it to name the prerequisite", err)
 	}
 }
 
 // cf_clearance is bound to the IP that earned it, so the exit has to reach the
 // browser. Nothing else in the pipeline would notice if it stopped doing so.
 func TestRunSolverPassesProxyThrough(t *testing.T) {
-	o := solveOptions(stubSolverDir(t, echoProxyJS))
+	stubSolver(t, echoProxySolve)
 	const proxy = "http://user:pass@exit.test:8080"
 
-	res, err := runSolver(context.Background(), o, "https://site.test/", proxy)
+	res, err := runSolver(context.Background(), solveOptions(), "https://site.test/", proxy)
 	if err != nil {
 		t.Fatalf("runSolver: %v", err)
 	}
 	if res.Proxy != proxy {
-		t.Errorf("solver saw SOLVER_PROXY=%q, want %q", res.Proxy, proxy)
+		t.Errorf("the solve was given proxy %q, want %q", res.Proxy, proxy)
+	}
+}
+
+// The solve and the replay have to ask for the same language. The solve has no
+// way of its own to know what the run will advertise, so it is told.
+func TestSolverOptionsCarryTheRunsLanguage(t *testing.T) {
+	// Unset, the run replays the library's default, so that is what the solve
+	// has to advertise.
+	got := solverOptions(&options{solveTimeout: time.Minute}, "https://site.test/")
+	if got.Profile.Language != gofire.DefaultAcceptLanguage {
+		t.Errorf("solve language = %q, want the library default %q",
+			got.Profile.Language, gofire.DefaultAcceptLanguage)
+	}
+
+	// -lang moves both halves together.
+	got = solverOptions(&options{lang: "tr-TR,tr;q=0.9", solveTimeout: time.Minute}, "https://site.test/")
+	if got.Profile.Language != "tr-TR,tr;q=0.9" {
+		t.Errorf("solve language = %q, want -lang", got.Profile.Language)
+	}
+	// The timezone follows the language: they are claims about the same imagined
+	// user, and a browser asking for tr-TR from America/New_York is a
+	// combination worth not producing when the alternative costs nothing.
+	if got.Profile.Timezone != "Europe/Istanbul" {
+		t.Errorf("solve timezone = %q, want the zone derived from the language",
+			got.Profile.Timezone)
+	}
+	if got.Target != "https://site.test/" || got.Timeout != time.Minute {
+		t.Errorf("solve options = %+v", got)
+	}
+}
+
+// SOLVER_TZ is the operator saying where their exit actually is, which is the
+// answer nothing here can compute.
+func TestSolverOptionsHonourAPinnedTimezone(t *testing.T) {
+	t.Setenv("SOLVER_TZ", "America/Denver")
+	got := solverOptions(&options{lang: "tr-TR"}, "https://site.test/")
+	if got.Profile.Timezone != "America/Denver" {
+		t.Errorf("solve timezone = %q, want SOLVER_TZ", got.Profile.Timezone)
 	}
 }
 
 // A solve without a proxy must not inherit one from the environment: an exported
 // SOLVER_PROXY would send a direct run through an exit it never asked for, and
 // cache the cookie under the wrong key.
-func TestRunSolverNoProxyMeansDirect(t *testing.T) {
+//
+// It cannot any more — the proxy is an argument rather than an environment
+// variable — and this is the assertion that keeps it that way.
+func TestSolveDoesNotReadTheProxyFromTheEnvironment(t *testing.T) {
 	t.Setenv("SOLVER_PROXY", "http://stale.test:8080")
-	o := solveOptions(stubSolverDir(t, echoProxyJS))
 
-	res, err := runSolver(context.Background(), o, "https://site.test/", "")
-	if err != nil {
+	var seen string
+	stubSolver(t, func(o *options, target, proxy string) (*solveResult, error) {
+		seen = proxy
+		return okSolveResult(), nil
+	})
+	if _, err := runSolver(context.Background(), solveOptions(), "https://site.test/", ""); err != nil {
 		t.Fatalf("runSolver: %v", err)
 	}
-	if res.Proxy != "" {
-		t.Errorf("solver saw SOLVER_PROXY=%q, want it unset", res.Proxy)
-	}
-}
-
-// The solve and the replay have to ask for the same language. The solver had no
-// way to know what the run would advertise, so it used whatever the box's locale
-// produced — which on a localised image is not what gofire replays with.
-func TestRunSolverPassesLanguageThrough(t *testing.T) {
-	const stub = `process.stdout.write(JSON.stringify({status: "ok", user_agent: "UA-151",
-  cookie_list: [], url: process.env.SOLVER_LANG || ""}));
-`
-	o := solveOptions(stubSolverDir(t, stub))
-
-	// Unset, the run replays the library's default, so that is what the solve
-	// has to advertise.
-	res, err := runSolver(context.Background(), o, "https://site.test/", "")
-	if err != nil {
-		t.Fatalf("runSolver: %v", err)
-	}
-	if res.URL != gofire.DefaultAcceptLanguage {
-		t.Errorf("solver saw SOLVER_LANG=%q, want the library default %q",
-			res.URL, gofire.DefaultAcceptLanguage)
-	}
-
-	// -lang moves both halves together.
-	o.lang = "tr-TR,tr;q=0.9"
-	res, err = runSolver(context.Background(), o, "https://site.test/", "")
-	if err != nil {
-		t.Fatalf("runSolver: %v", err)
-	}
-	if res.URL != o.lang {
-		t.Errorf("solver saw SOLVER_LANG=%q, want -lang %q", res.URL, o.lang)
+	if seen != "" {
+		t.Errorf("the solve was given proxy %q, want none", seen)
 	}
 }
 
@@ -214,7 +246,8 @@ func TestChromiumDriftIsReported(t *testing.T) {
 
 	// The solver's own output has to reach the seed, or there is nothing to
 	// compare in the first place.
-	o := solveOptions(stubSolverDir(t, printJS(okSolve)))
+	stubSolveResult(t, okSolveResult(), nil)
+	o := solveOptions()
 	seed, err := solveOne(context.Background(), o, "https://site.test/", exit{})
 	if err != nil {
 		t.Fatalf("solveOne: %v", err)
@@ -294,7 +327,8 @@ func TestRedactProxy(t *testing.T) {
 // the edge on the next request, so replaying it from this client hands the edge
 // a token describing a session this connection is not.
 func TestSolveAndSeedSeedsCookiesAndUA(t *testing.T) {
-	o := solveOptions(stubSolverDir(t, printJS(okSolve)))
+	stubSolveResult(t, okSolveResult(), nil)
+	o := solveOptions()
 	if err := solveAndSeed(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAndSeed: %v", err)
 	}
@@ -316,7 +350,8 @@ func TestSolveAndSeedSeedsCookiesAndUA(t *testing.T) {
 // An explicit -ua is a deliberate choice. Overwriting it would hide the
 // mismatch instead of surfacing it.
 func TestSolveAndSeedKeepsExplicitUA(t *testing.T) {
-	o := solveOptions(stubSolverDir(t, printJS(okSolve)))
+	stubSolveResult(t, okSolveResult(), nil)
+	o := solveOptions()
 	o.userAgent = "mine"
 	if err := solveAndSeed(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAndSeed: %v", err)
@@ -329,9 +364,14 @@ func TestSolveAndSeedKeepsExplicitUA(t *testing.T) {
 // Base64 cookie values contain '=' and padding. newSession splits on the first
 // one, so the value has to survive the round trip intact.
 func TestSolveAndSeedPreservesValuesContainingEquals(t *testing.T) {
-	const padded = `{"status":"ok","user_agent":"UA-151","cookie_list":` +
-		`[{"name":"cf_clearance","value":"a=b==","domain":"site.test"}]}`
-	o := solveOptions(stubSolverDir(t, printJS(padded)))
+	stubSolveResult(t, &solveResult{
+		Status:    "ok",
+		UserAgent: "UA-151",
+		CookieList: []solvedCookie{
+			{Name: "cf_clearance", Value: "a=b==", Domain: "site.test"},
+		},
+	}, nil)
+	o := solveOptions()
 	if err := solveAndSeed(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAndSeed: %v", err)
 	}
@@ -347,9 +387,14 @@ func TestSolveAndSeedPreservesValuesContainingEquals(t *testing.T) {
 // Bot Fight Mode never issues a clearance cookie, so a solve without one still
 // carries a usable __cf_bm and must not abort the run.
 func TestSolveAndSeedContinuesWithoutClearance(t *testing.T) {
-	const noClearance = `{"status":"no_clearance","user_agent":"UA-151","cookie_list":` +
-		`[{"name":"__cf_bm","value":"xyz","domain":"site.test"}]}`
-	o := solveOptions(stubSolverDir(t, printJS(noClearance)))
+	stubSolveResult(t, &solveResult{
+		Status:    "no_clearance",
+		UserAgent: "UA-151",
+		CookieList: []solvedCookie{
+			{Name: "__cf_bm", Value: "xyz", Domain: "site.test"},
+		},
+	}, nil)
+	o := solveOptions()
 	if err := solveAndSeed(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("no_clearance aborted the run: %v", err)
 	}
@@ -482,7 +527,7 @@ func TestRejectedClearanceIsExplained(t *testing.T) {
 
 	stderr := captureStderr(t, func() {
 		reportRejectedClearance(
-			&options{solve: true, solverDir: "solver"},
+			&options{solve: true},
 			"https://site.test",
 			http.StatusForbidden,
 			http.Header{"Cf-Mitigated": []string{"challenge"}},
@@ -493,7 +538,7 @@ func TestRejectedClearanceIsExplained(t *testing.T) {
 	for _, want := range []string{
 		"earned a cf_clearance", // says the solve worked
 		"not a failed solve",    // and that this is not that
-		"replay.js",             // names the one command that decides
+		"-solve-replay",         // names the one command that decides
 		"https://site.test",     // with the target filled in
 		"-proxy",                // and the answer when it is the address
 	} {
@@ -518,7 +563,7 @@ func TestRejectedClearanceIsQuietWhenNothingWasRejected(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stderr := captureStderr(t, func() {
-				reportRejectedClearance(&options{solve: true, solverDir: "solver"},
+				reportRejectedClearance(&options{solve: true},
 					"https://site.test", tc.status, http.Header{}, []byte(tc.body))
 			})
 			if stderr != "" {

@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,9 +23,11 @@ func proxyFile(t *testing.T, proxies ...string) string {
 	return path
 }
 
-func fleetOptions(t *testing.T, script string, sessions int, proxies ...string) *options {
+func fleetOptions(t *testing.T, solve func(o *options, target, proxy string) (*solveResult, error),
+	sessions int, proxies ...string) *options {
 	t.Helper()
-	o := solveOptions(stubSolverDir(t, script))
+	stubSolver(t, solve)
+	o := solveOptions()
 	o.solve = true
 	o.solveParallel = 2
 	o.solveCache = t.TempDir()
@@ -42,12 +45,20 @@ func fleetOptions(t *testing.T, script string, sessions int, proxies ...string) 
 	return o
 }
 
+// alwaysFails is a solve that never succeeds, for the cases where running at all
+// is the failure being asserted.
+func alwaysFails(msg string) func(*options, string, string) (*solveResult, error) {
+	return func(*options, string, string) (*solveResult, error) {
+		return nil, errors.New("solver: " + msg)
+	}
+}
+
 // The whole point of the fleet: session i replays the cookie exit i earned, and
 // not one its neighbour earned. A cookie on the wrong exit is a 403 that looks
 // exactly like the target blocking the client, so this is the invariant worth
 // pinning.
 func TestSolveAcrossProxiesPairsSeedsWithExits(t *testing.T) {
-	o := fleetOptions(t, echoProxyJS, 3, "http://a.test:1", "http://b.test:2", "http://c.test:3")
+	o := fleetOptions(t, echoProxySolve, 3, "http://a.test:1", "http://b.test:2", "http://c.test:3")
 
 	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAcrossProxies: %v", err)
@@ -95,7 +106,7 @@ func TestSeedForWrapsWithTheProxyPinning(t *testing.T) {
 // Only the exits a session actually pins are worth a browser launch and a
 // challenge. Solving the rest buys cookies nothing replays.
 func TestSolveAcrossProxiesSolvesOnlyWhatSessionsPin(t *testing.T) {
-	o := fleetOptions(t, echoProxyJS, 2, "http://a.test:1", "http://b.test:2", "http://c.test:3")
+	o := fleetOptions(t, echoProxySolve, 2, "http://a.test:1", "http://b.test:2", "http://c.test:3")
 
 	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAcrossProxies: %v", err)
@@ -113,13 +124,13 @@ func TestSolveAcrossProxiesSolvesOnlyWhatSessionsPin(t *testing.T) {
 // share of the run on 403s, so it comes out of the list the pool is built from.
 func TestSolveAcrossProxiesDropsExitsThatFailed(t *testing.T) {
 	// b.test reports an error; everything else solves.
-	script := `const p = process.env.SOLVER_PROXY || "";
-if (p.includes("b.test")) {
-  process.stdout.write(JSON.stringify({status: "error", error: "challenge not solved"}));
-} else {
-` + echoProxyJS + `}
-`
-	o := fleetOptions(t, script, 3, "http://a.test:1", "http://b.test:2", "http://c.test:3")
+	failOnB := func(o *options, target, proxy string) (*solveResult, error) {
+		if strings.Contains(proxy, "b.test") {
+			return nil, errors.New("solver: challenge not solved")
+		}
+		return echoProxySolve(o, target, proxy)
+	}
+	o := fleetOptions(t, failOnB, 3, "http://a.test:1", "http://b.test:2", "http://c.test:3")
 
 	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("solveAcrossProxies: %v", err)
@@ -144,7 +155,7 @@ if (p.includes("b.test")) {
 // Every exit failing is not a run worth starting: every session would replay
 // nothing at a target that demanded a cookie.
 func TestSolveAcrossProxiesFailsWhenNoExitSolved(t *testing.T) {
-	o := fleetOptions(t, printJS(`{"status":"error","error":"challenge not solved"}`), 2,
+	o := fleetOptions(t, alwaysFails("challenge not solved"), 2,
 		"http://a.test:1", "http://b.test:2")
 
 	err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/")
@@ -160,13 +171,13 @@ func TestSolveAcrossProxiesFailsWhenNoExitSolved(t *testing.T) {
 // already has. Without that, a fleet solve would be unusable: it is one
 // challenge per exit.
 func TestSolveAcrossProxiesReusesThePerExitCache(t *testing.T) {
-	o := fleetOptions(t, echoProxyJS, 2, "http://a.test:1", "http://b.test:2")
+	o := fleetOptions(t, echoProxySolve, 2, "http://a.test:1", "http://b.test:2")
 	if err := solveAcrossProxies(context.Background(), o, gofire.Chrome151, "https://site.test/"); err != nil {
 		t.Fatalf("first solve: %v", err)
 	}
 
 	// Second run, same cache, a solver that would fail if it ran at all.
-	again := fleetOptions(t, printJS(`{"status":"error","error":"should not have run"}`), 2,
+	again := fleetOptions(t, alwaysFails("should not have run"), 2,
 		"http://a.test:1", "http://b.test:2")
 	again.solveCache = o.solveCache
 
@@ -186,18 +197,23 @@ func TestSolveAcrossProxiesReusesThePerExitCache(t *testing.T) {
 func TestSolveFleetHonoursTheParallelCeiling(t *testing.T) {
 	// Each stub records its own start and end, so the test can count how many
 	// were alive at once without depending on timing.
-	dir := t.TempDir()
-	script := fmt.Sprintf(`const fs = require("fs");
-const p = process.env.SOLVER_PROXY || "";
-fs.appendFileSync(%q, "start\n");
-setTimeout(() => {
-  fs.appendFileSync(%q, "end\n");
-  process.stdout.write(JSON.stringify({status: "ok", user_agent: "UA-151", proxy: p,
-    cookie_list: [{name: "cf_clearance", value: "for-" + p, domain: "site.test"}]}));
-}, 150);
-`, filepath.Join(dir, "log"), filepath.Join(dir, "log"))
+	var mu sync.Mutex
+	live, peak := 0, 0
+	counting := func(o *options, target, proxy string) (*solveResult, error) {
+		mu.Lock()
+		live++
+		peak = max(peak, live)
+		mu.Unlock()
 
-	o := fleetOptions(t, script, 6,
+		time.Sleep(150 * time.Millisecond)
+
+		mu.Lock()
+		live--
+		mu.Unlock()
+		return echoProxySolve(o, target, proxy)
+	}
+
+	o := fleetOptions(t, counting, 6,
 		"http://a.test:1", "http://b.test:2", "http://c.test:3",
 		"http://d.test:4", "http://e.test:5", "http://f.test:6")
 	o.solveParallel = 2
@@ -209,19 +225,8 @@ setTimeout(() => {
 		t.Fatalf("%d seeds, want all 6 exits solved", len(o.solveSeeds))
 	}
 
-	raw, err := os.ReadFile(filepath.Join(dir, "log"))
-	if err != nil {
-		t.Fatalf("read log: %v", err)
-	}
-	live, peak := 0, 0
-	for _, line := range strings.Fields(string(raw)) {
-		if line == "start" {
-			live++
-			peak = max(peak, live)
-			continue
-		}
-		live--
-	}
+	mu.Lock()
+	defer mu.Unlock()
 	if peak > o.solveParallel {
 		t.Errorf("%d solvers ran at once, want at most %d", peak, o.solveParallel)
 	}
@@ -233,7 +238,7 @@ setTimeout(() => {
 // An interrupt during a solve is not a partial success to carry into a run: the
 // sessions whose exits had not been reached yet would have no cookie at all.
 func TestSolveAcrossProxiesStopsOnCancel(t *testing.T) {
-	o := fleetOptions(t, echoProxyJS, 2, "http://a.test:1", "http://b.test:2")
+	o := fleetOptions(t, echoProxySolve, 2, "http://a.test:1", "http://b.test:2")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
