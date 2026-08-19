@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"testing"
 	"time"
+
+	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/cdp"
 )
 
 // The configuration that actually ships: headful, under a virtual display.
@@ -184,4 +186,67 @@ func TestHeadfulBatchKeepsExitsApart(t *testing.T) {
 			t.Errorf("exit %s reported no chromium version", id)
 		}
 	}
+}
+
+// The browser the solver drives has to have a WebGL context.
+//
+// Not a good one — a VPS has no GPU and software rendering is what any VM or
+// RDP session looks like, which is fine. What is not fine is having none at
+// all: a challenge reads the renderer, and every real Chrome answers. Chrome
+// has deprecated the silent fallback to software WebGL and warns about it on
+// every page load, so the launch args carry --enable-unsafe-swiftshader to opt
+// back in. When that flag is no longer enough, this fails here rather than as a
+// solve that earns a clearance the edge then refuses for reasons nothing prints.
+func TestLaunchArgsKeepAWebGLContext(t *testing.T) {
+	if _, err := cdp.Find(); err != nil {
+		t.Skip("no browser:", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	b, err := cdp.Launch(ctx, cdp.LaunchConfig{
+		Args:     DefaultProfile().LaunchArgs(),
+		Headless: true, // the renderer question is the same either way
+	})
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	defer b.Close()
+
+	tab, err := b.DefaultContext().NewTab(ctx)
+	if err != nil {
+		t.Fatalf("tab: %v", err)
+	}
+	defer tab.Close(ctx)
+
+	var out struct {
+		Context  bool   `json:"context"`
+		Renderer string `json:"renderer"`
+		Error    string `json:"error"`
+	}
+	err = tab.Evaluate(ctx, `(() => {
+		const out = {context: false, renderer: "", error: ""};
+		try {
+			const c = document.createElement("canvas");
+			const g = c.getContext("webgl") || c.getContext("experimental-webgl");
+			if (!g) { out.error = "no webgl context"; return out; }
+			out.context = true;
+			const ext = g.getExtension("WEBGL_debug_renderer_info");
+			out.renderer = String((ext && g.getParameter(ext.UNMASKED_RENDERER_WEBGL)) ||
+				g.getParameter(g.RENDERER) || "");
+		} catch (e) { out.error = String(e); }
+		return out;
+	})()`, &out)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	if !out.Context {
+		t.Fatalf("the solver's browser has no WebGL context (%s) — every real Chrome has one, "+
+			"and a challenge that reads the renderer sees the difference", out.Error)
+	}
+	if out.Renderer == "" {
+		t.Errorf("WebGL context reports an empty renderer; a real browser names one")
+	}
+	t.Logf("renderer %q", out.Renderer)
 }

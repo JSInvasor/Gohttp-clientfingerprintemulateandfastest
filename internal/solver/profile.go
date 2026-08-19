@@ -448,6 +448,22 @@ func (p Profile) LaunchArgs() []string {
 		// two to disagree.
 		"--use-gl=angle",
 		"--use-angle=swiftshader",
+		// The opt-in the two flags above now need. Chrome deprecated the silent
+		// fallback to software WebGL and says so on every page load:
+		//
+		//   Automatic fallback to software WebGL has been deprecated.
+		//   Please use the --enable-unsafe-swiftshader flag to opt in to
+		//   lower security guarantees for trusted content.
+		//
+		// Deprecated is the step before removed, and what removal costs here is
+		// the whole point of the block above: a browser with no WebGL context at
+		// all is a far stronger signal than one rendering in software. Measured
+		// on Chromium 141, which still falls back on its own, this flag changes
+		// nothing — same context, same UNMASKED_RENDERER_WEBGL string — so it is
+		// free where it is not yet needed. Whether Chrome 151 has already
+		// stopped falling back was not measurable from where this was written;
+		// the flag removes the question either way.
+		"--enable-unsafe-swiftshader",
 		// The browser-level language, beside the per-tab override every prepared
 		// tab also carries. It is here so that a request made before a tab is
 		// prepared — or by anything in the browser that is not a tab we drive —
