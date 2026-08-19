@@ -808,8 +808,20 @@ func parseServerHelloShell(data []byte) (*serverHelloShell, error) {
 		// §4.1.3 again: the suite has to be one the ClientHello offered. Every
 		// suite this stack can key is a TLS 1.3 one, so anything else is both
 		// unusable and out of contract.
+		//
+		// Naming the version is the whole of this message's job, and it used to
+		// name only the number. A TLS 1.2 server always trips this check rather
+		// than the supported_versions one below — the suite is read first — so
+		// the one failure mode a user actually meets was reported as "unsupported
+		// cipher suite 0xc030" with no mention of a version anywhere. That is a
+		// diagnosis nobody arrives at from the text: it reads like a missing
+		// algorithm, sends the reader looking for a cipher list, and the answer
+		// is that the connection is not TLS 1.3 at all.
 		return nil, alertErrf(alertIllegalParameter,
-			"server selected unsupported cipher suite 0x%04x", sh.suite)
+			"server selected cipher suite 0x%04x, which is not one of the three TLS 1.3 suites — "+
+				"this client speaks TLS 1.3 only, so the peer has negotiated TLS 1.2 or earlier. "+
+				"Either the server does not offer TLS 1.3, or something between here and it is "+
+				"terminating the connection", sh.suite)
 	}
 
 	// Extensions. TLS 1.3 is signalled by supported_versions, so a ServerHello

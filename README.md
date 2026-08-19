@@ -343,7 +343,13 @@ Verified against a real iPhone 13 on iOS 26.5.2 via tls.peet.ws, and pinned by
 
 Structure:
 
-- TLS 1.3 with TLS 1.2 fallback (TLS 1.0/1.1 removed — Apple dropped them in iOS 13)
+- `supported_versions` advertises TLS 1.3 and TLS 1.2 (TLS 1.0/1.1 removed — Apple
+  dropped them in iOS 13). That is what goes on the wire, not what this client can
+  speak: **the handshake is TLS 1.3 only, there is no 1.2 code path.** Advertising a
+  version it cannot complete is deliberate — the offer is half the fingerprint, and a
+  client offering 1.3 alone does not look like any shipping browser. The cost is that
+  a server entitled to pick 1.2 will, and the connection then fails by design. See
+  "A server that only speaks TLS 1.2" below.
 - 20 cipher suites + GREASE prefix (includes 3DES legacy ciphers). The TLS 1.3
   suites lead with AES-256-GCM (`0x1302`), not AES-128-GCM — JA3 is order-sensitive
 - GREASE values at 6 positions: ciphers, first/last extension, key_share, supported_groups, supported_versions
@@ -568,6 +574,43 @@ latency  min 80µs   p50 2.3ms   p90 4ms   p99 5.9ms   max 35.2ms
 `-rps N` holds the run at a fixed rate instead of going flat out, `-json` prints
 the summary — per-second series included — as JSON, and `send -h` lists the
 transport knobs (`-max-streams`, `-idle-conns`, `-sockbuf`, `-tfo`, …).
+
+### A server that only speaks TLS 1.2
+
+```
+send: Get "https://site.com/": tls handshake: parse server hello: server selected
+cipher suite 0xc030, which is not one of the three TLS 1.3 suites — this client
+speaks TLS 1.3 only, ...
+```
+
+This is not a missing algorithm and there is no flag for it. The handshake in
+`internal/ctls` implements TLS 1.3 and nothing else, while the ClientHello
+advertises 1.2 as well because every browser it emulates does. A server is
+therefore entitled to pick 1.2, and when it does the connection ends there.
+
+Two very different things produce it, and the fix differs:
+
+- **The origin really is TLS 1.2 only.** Common on older nginx/IIS and on
+  appliances. Confirm with `openssl s_client -connect host:443 -tls1_3`; no
+  `Protocol : TLSv1.3` in the output means the origin.
+- **Something in the path is terminating TLS.** A corporate proxy, an antivirus
+  doing SSL inspection, a hosting provider's transparent proxy. These usually
+  negotiate 1.2, and they also hand the browser a certificate it does not trust —
+  so `ERR_CERT_AUTHORITY_INVALID` in Chrome against the same host, from the same
+  box, is the tell that the two symptoms have one cause. Check the issuer:
+
+  ```bash
+  openssl s_client -connect host:443 -servername host </dev/null 2>&1 \
+    | grep -E "Protocol|Cipher|issuer"
+  ```
+
+  An issuer that is not a public CA is the interception, and no change here
+  routes around it.
+
+Adding a 1.2 handshake would fix the first case and cost the thing this library
+exists for: a TLS 1.2 negotiation produces an entirely different JA3, so a client
+that falls back is a client whose fingerprint changes under exactly the
+conditions a WAF is watching for.
 
 ### Getting past a JS challenge
 
