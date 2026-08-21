@@ -9,7 +9,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
-	"crypto/hmac"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/binary"
@@ -370,16 +369,14 @@ func (hs *handshakeState) run() (*Conn, error) {
 	hs.clientHSER = newEncryptedRecord(clientHSAEAD, clientHSIV)
 
 	// Read encrypted handshake messages: EncryptedExtensions, Certificate,
-	// CertificateVerify, Finished.
-	var serverCerts []*x509.Certificate
-	var sawCertVerify bool
-	var sawCertRequest bool
-	var certReqContext []byte
-	var finished bool
+	// CertificateVerify, Finished. What they accumulate lives in flightState so
+	// that the QUIC driver, which reads the same messages out of CRYPTO frames,
+	// can share the handling — see flight.go.
+	var st flightState
 	var hr handshakeReader
 
 	idleRecords := 0
-	for !finished {
+	for !st.finished {
 		rec, err := readRawRecord(hs.br)
 		if err != nil {
 			return nil, fmt.Errorf("read handshake: %w", err)
@@ -443,7 +440,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 			return nil, withAlert(alertRecordOverflow, err)
 		}
 
-		for !finished {
+		for !st.finished {
 			msg, err := hr.next()
 			if err != nil {
 				return nil, withAlert(alertDecodeError, err)
@@ -451,99 +448,8 @@ func (hs *handshakeState) run() (*Conn, error) {
 			if msg == nil {
 				break
 			}
-			body := msg[4:]
-
-			switch msg[0] {
-			case handshakeTypeEncryptedExtensions:
-				// In TLS 1.3 ALPN is delivered here, not in ServerHello.
-				// parseServerHello leaves negotiatedALPN empty for 1.3, so
-				// extracting it now is what lets the caller route h1-only
-				// servers to the HTTP/1.1 transport instead of pumping the
-				// h2 preface into them.
-				alpn, err := parseEncryptedExtensionsALPN(body)
-				if err != nil {
-					return nil, err
-				}
-				if alpn != "" {
-					if err := hs.checkNegotiatedALPN(alpn); err != nil {
-						return nil, err
-					}
-					hs.negotiatedALPN = alpn
-				}
-				hs.transcript.Write(msg)
-
-			case handshakeTypeCertificate:
-				hs.transcript.Write(msg)
-				certs, err := parseCertificate(body)
-				if err != nil {
-					return nil, withAlert(alertDecodeError, fmt.Errorf("parse certificate: %w", err))
-				}
-				serverCerts = certs
-				if err := hs.verifyChain(serverCerts); err != nil {
-					return nil, err
-				}
-
-			case handshakeTypeCompressedCertificate:
-				// RFC 8879: CompressedCertificate replaces Certificate in transcript
-				hs.transcript.Write(msg)
-				certs, err := parseCompressedCertificate(body)
-				if err != nil {
-					return nil, withAlert(alertDecodeError, fmt.Errorf("parse compressed certificate: %w", err))
-				}
-				serverCerts = certs
-				if err := hs.verifyChain(serverCerts); err != nil {
-					return nil, err
-				}
-
-			case handshakeTypeCertificateVerify:
-				// RFC 8446 §4.4.3: the signature covers the transcript up to
-				// and including Certificate, so the hash must be taken before
-				// this message is folded in.
-				if !hs.skipVerify {
-					if len(serverCerts) == 0 {
-						return nil, alertErrf(alertUnexpectedMessage, "certificate_verify before certificate")
-					}
-					if err := verifyCertificateVerify(body, serverCerts[0], hs.transcript.Sum(nil)); err != nil {
-						return nil, alertErrf(alertDecryptError, "certificate_verify: %v", err)
-					}
-				}
-				hs.transcript.Write(msg)
-				sawCertVerify = true
-
-			case handshakeTypeCertificateRequest:
-				// The server is asking for a client certificate. We have none
-				// to give, but silence is not a legal answer: §4.4.2 requires a
-				// Certificate message either way, and a server that asked and
-				// got nothing fails the handshake. Sites with optional mTLS —
-				// which accept anonymous clients perfectly well once the empty
-				// Certificate arrives — used to break here.
-				//
-				// The context has to be echoed verbatim, so it is kept rather
-				// than assumed empty.
-				ctx, err := parseCertificateRequestContext(body)
-				if err != nil {
-					return nil, err
-				}
-				certReqContext = ctx
-				sawCertRequest = true
-				hs.transcript.Write(msg)
-
-			case handshakeTypeFinished:
-				// DO NOT update transcript yet - verify first
-				finishedKey := hs.ks.finishedKey(hs.ks.serverHSTraffic)
-				expectedMAC := computeFinishedMAC(hs.ks.h, finishedKey, hs.transcript.Sum(nil))
-				if !hmac.Equal(expectedMAC, body) {
-					return nil, alertErrf(alertDecryptError, "server finished MAC mismatch")
-				}
-				// Now update transcript
-				hs.transcript.Write(msg)
-				finished = true
-
-			default:
-				// Unknown or unhandled messages still belong in the transcript.
-				// Dropping one would desynchronise the Finished MAC and turn a
-				// benign extension into a handshake failure.
-				hs.transcript.Write(msg)
+			if err := hs.handleFlightMessage(msg, &st); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -558,10 +464,10 @@ func (hs *handshakeState) run() (*Conn, error) {
 	// client already verified. Demanding a chain there would reject every
 	// successful resumption as a protocol violation.
 	if !hs.skipVerify && !hs.resumed {
-		if len(serverCerts) == 0 {
+		if len(st.serverCerts) == 0 {
 			return nil, alertErrf(alertCertificateRequired, "server sent no certificate")
 		}
-		if !sawCertVerify {
+		if !st.sawCertVerify {
 			return nil, alertErrf(alertUnexpectedMessage, "server sent no certificate_verify")
 		}
 	}
@@ -577,8 +483,8 @@ func (hs *handshakeState) run() (*Conn, error) {
 	// then Finished. Both go in a single record, which is what a real client
 	// emits and keeps the flight to one write.
 	var flight []byte
-	if sawCertRequest {
-		flight = append(flight, emptyCertificateMessage(certReqContext)...)
+	if st.sawCertRequest {
+		flight = append(flight, emptyCertificateMessage(st.certReqContext)...)
 		hs.transcript.Write(flight)
 		// No CertificateVerify follows: §4.4.2 forbids one when the Certificate
 		// carried no certificates, since there is no key to prove possession of.
@@ -641,7 +547,7 @@ func (hs *handshakeState) run() (*Conn, error) {
 		negotiatedALPN:  hs.negotiatedALPN,
 		suite:           hs.suite,
 		didResume:       hs.resumed,
-		peerCerts:       serverCerts,
+		peerCerts:       st.serverCerts,
 		ks:              hs.ks,
 		serverAppSecret: hs.ks.serverAppTraffic,
 		clientAppSecret: hs.ks.clientAppTraffic,
