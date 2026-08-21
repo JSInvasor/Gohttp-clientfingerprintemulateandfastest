@@ -95,6 +95,7 @@ func decodeCapture(t *testing.T, path string) (*Packet, []byte, *Frames) {
 		total.PadRuns += f.PadRuns
 		total.CryptoLen += f.CryptoLen
 		total.Types = append(total.Types, f.Types...)
+		total.CryptoOrder = append(total.CryptoOrder, f.CryptoOrder...)
 	}
 
 	stream, err := Assemble(frags)
@@ -214,6 +215,13 @@ func TestChaosProtection(t *testing.T) {
 			slices.Sort(offs)
 			if len(offs) > 0 && offs[0] != 0 {
 				t.Errorf("lowest CRYPTO fragment is at offset %d, want 0", offs[0])
+			}
+
+			// Shuffled, not merely fragmented. This is the claim the builder in
+			// chaos.go is written against, so it has to be true of Chrome's own
+			// flights or the builder is reproducing something imagined.
+			if !frames.CryptoOutOfOrder() {
+				t.Error("Chrome's CRYPTO fragments arrived in ascending offset order")
 			}
 		})
 	}

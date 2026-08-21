@@ -283,11 +283,30 @@ func Unprotect(datagram []byte, origDCID []byte) (*Packet, error) {
 // fragmentation happens at all is itself part of the profile: a client that
 // sends one tidy CRYPTO frame does not look like Chrome.
 type Frames struct {
-	Types     []string          // in wire order, PADDING runs collapsed
-	Crypto    map[uint64][]byte // fragment by stream offset
+	Types  []string          // in wire order, PADDING runs collapsed
+	Crypto map[uint64][]byte // fragment by stream offset
+
+	// CryptoOrder is the stream offset of each CRYPTO frame in the order the
+	// frames appeared on the wire. Kept separately from Crypto because a map
+	// cannot hold it, and the order is the whole point: fragments arriving
+	// sorted would mean the shuffle did not happen.
+	CryptoOrder []uint64
+
 	Pings     int
 	PadRuns   int
 	CryptoLen int // total fragment bytes in this packet
+}
+
+// CryptoOutOfOrder reports whether any CRYPTO fragment arrived before one with
+// a lower stream offset — that is, whether the flight was shuffled rather than
+// merely fragmented.
+func (f *Frames) CryptoOutOfOrder() bool {
+	for i := 1; i < len(f.CryptoOrder); i++ {
+		if f.CryptoOrder[i] < f.CryptoOrder[i-1] {
+			return true
+		}
+	}
+	return false
 }
 
 // ParseFrames walks one decrypted payload.
@@ -347,6 +366,7 @@ func ParseFrames(b []byte) (*Frames, error) {
 				return f, errors.New("quic: CRYPTO frame overruns payload")
 			}
 			f.Crypto[off] = append([]byte(nil), b[i:i+int(ln)]...)
+			f.CryptoOrder = append(f.CryptoOrder, off)
 			f.CryptoLen += int(ln)
 			i += int(ln)
 			f.Types = append(f.Types, "CRYPTO")
