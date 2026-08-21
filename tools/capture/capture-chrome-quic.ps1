@@ -43,7 +43,7 @@ param(
     [string]   $Out         = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'quic-capture'),
     [int]      $Seconds     = 25,
     [string]   $ChromePath  = '',
-    [int]      $MaxInitials = 8,
+    [int]      $MaxInitials = 16,
     [switch]   $NoZip
 )
 
@@ -486,27 +486,42 @@ function Read-NetLog {
 
     $sr = $null
     try {
-        $sr = New-Object System.IO.StreamReader($Path)
+        # The constants block has to come out before any event can be named,
+        # because an event carries only a numeric type id.
+        #
+        # It is NOT safe to look for a line that begins with "events": Chrome
+        # writes the whole constants object and the opening of the events array
+        # on one line, so a line-oriented search walks past it and swallows the
+        # entire log. Read a bounded prefix and cut on the substring instead.
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        $cap = 32MB
+        if ($fs.Length -lt $cap) { $cap = [int]$fs.Length }
+        $buf = New-Object byte[] $cap
+        $got = $fs.Read($buf, 0, $cap)
+        $fs.Close()
+        $head = [System.Text.Encoding]::UTF8.GetString($buf, 0, $got)
 
-        $head = New-Object System.Text.StringBuilder
-        $guard = 0
-        $line = $sr.ReadLine()
-        while ($null -ne $line -and $guard -lt 500) {
-            if ($line -match '^\s*"events"\s*:\s*\[') { break }
-            [void]$head.Append($line)
-            $line = $sr.ReadLine()
-            $guard++
+        $cut = $head.IndexOf('"events"')
+        if ($cut -lt 0) {
+            $res.Note = 'net-log icinde "events" bulunamadi (dosya bos ya da kirpilmis)'
+            return $res
         }
-        $json = $head.ToString().TrimEnd()
-        $json = $json.TrimEnd(',')
+        $json = $head.Substring(0, $cut).TrimEnd().TrimEnd(',')
         if (-not $json.EndsWith('}')) { $json = $json + '}' }
 
         $constants = $null
-        try { $constants = (ConvertFrom-Json $json).constants } catch { }
-        if (-not $constants -or -not $constants.logEventTypes) {
-            $res.Note = 'net-log sabitleri okunamadi (dosya kirpilmis olabilir)'
+        try { $constants = (ConvertFrom-Json $json).constants } catch {
+            $res.Note = "net-log sabitleri cozulemedi: $($_.Exception.Message)"
             return $res
         }
+        if (-not $constants -or -not $constants.logEventTypes) {
+            $res.Note = 'net-log sabitleri okundu ama logEventTypes yok'
+            return $res
+        }
+
+        # Events are one per line from here on, so the rest streams. The
+        # constants line itself will not parse as a single event and is skipped.
+        $sr = New-Object System.IO.StreamReader($Path)
 
         $idToName = @{}
         $wantIds  = @{}
@@ -620,6 +635,11 @@ $chromeLine = @(
     ('--origin-to-force-quic-on=' + $forceArg),
     '--log-net-log=' + (Q $netlog),
     '--net-log-capture-mode=IncludeSensitive',
+    # Both, deliberately. The SSLKEYLOGFILE environment variable is the
+    # documented way and is set above, but it went unwritten on the first
+    # capture from a Windows 10 box; the command-line flag is honoured by the
+    # same code path and does not depend on the environment reaching the child.
+    '--ssl-key-log-file=' + (Q $keylog),
     '--new-window',
     (Q $Target[0])
 ) -join ' '
@@ -752,6 +772,10 @@ if ((Test-Path $keylog) -and ((Get-Item $keylog).Length -gt 0)) {
 }
 
 WH 'client Initial datagramlari (ham hex, UDP payload)'
+W 'NOT: yakalama makine genelindedir. Bu listede bu script in actigi Chrome in'
+W 'yani sira o sirada calisan baska uygulamalarin QUIC baglantilari da olabilir.'
+W 'Her kaydin SNI si cozuldugunde hangisinin hangisi oldugu belli olur.'
+W ''
 W 'Initial paket korumasi sabit bir salt + DCID ile yapilir, yani asagidaki'
 W 'hex tek basina sunlari verir: QUIC surumu, DCID/SCID, token, frame sirasi,'
 W 'padding stratejisi, CRYPTO frame icindeki ClientHello ve onun icindeki'
