@@ -120,6 +120,11 @@ type QUICHandshake struct {
 	sawServerHello bool
 
 	peerParams []byte
+
+	// ticketsSeen counts the NewSessionTickets the server offered. Nothing
+	// consumes them yet; the count is here so that the resumption work has a
+	// way to tell "the server offers none" from "we throw them away".
+	ticketsSeen int
 }
 
 // NewQUICClient prepares a handshake. Nothing is sent until Start.
@@ -142,8 +147,9 @@ func NewQUICClient(cfg QUICConfig) (*QUICHandshake, error) {
 			km:         km,
 		},
 		reader: map[QUICEncryptionLevel]*handshakeReader{
-			QUICEncryptionLevelInitial:   {},
-			QUICEncryptionLevelHandshake: {},
+			QUICEncryptionLevelInitial:     {},
+			QUICEncryptionLevelHandshake:   {},
+			QUICEncryptionLevelApplication: {},
 		},
 	}, nil
 }
@@ -220,6 +226,10 @@ func (q *QUICHandshake) PeerCertificates() []*x509.Certificate { return q.flight
 // Done reports whether the handshake has completed.
 func (q *QUICHandshake) Done() bool { return q.done }
 
+// SessionTicketsOffered reports how many NewSessionTickets the server sent
+// after the handshake. They are not stored yet.
+func (q *QUICHandshake) SessionTicketsOffered() int { return q.ticketsSeen }
+
 func (q *QUICHandshake) emit(e QUICEvent) { q.events = append(q.events, e) }
 
 // handle routes one complete handshake message.
@@ -235,6 +245,9 @@ func (q *QUICHandshake) handle(level QUICEncryptionLevel, msg []byte) error {
 		}
 		q.sawServerHello = true
 		return q.handleServerHello(msg)
+
+	case QUICEncryptionLevelApplication:
+		return q.handlePostHandshake(msg)
 
 	case QUICEncryptionLevelHandshake:
 		if !q.sawServerHello {
@@ -261,6 +274,43 @@ func (q *QUICHandshake) handle(level QUICEncryptionLevel, msg []byte) error {
 		return nil
 	}
 	return fmt.Errorf("ctls: unexpected handshake data at level %s", level)
+}
+
+// handlePostHandshake processes a message arriving at the application level,
+// which is where TLS 1.3 puts everything sent after the handshake finishes.
+//
+// In practice that means NewSessionTicket, and a server sends one or two of
+// them immediately — which is how this case was found: the first end-to-end run
+// against a quic-go server completed the handshake, read the echo back, and
+// died on "no handshake data expected at level Application". A driver that
+// refuses the level cannot hold a connection open past its first second.
+func (q *QUICHandshake) handlePostHandshake(msg []byte) error {
+	if !q.done {
+		return alertErrf(alertUnexpectedMessage,
+			"application-level handshake data before the handshake finished")
+	}
+	switch msg[0] {
+	case handshakeTypeNewSessionTicket:
+		// Accepted and dropped. internal/ctls has a ticket store for the TCP
+		// path (ticket.go) and none for QUIC, so there is nothing to put this
+		// in yet; refusing it would close a connection over an offer this
+		// client simply has no use for. Resumption is the work that changes
+		// this — see quic_hello.go.
+		q.ticketsSeen++
+		return nil
+
+	case handshakeTypeKeyUpdate:
+		// RFC 9001 section 6 removes TLS KeyUpdate from QUIC entirely: QUIC
+		// rekeys with its own Key Phase bit, and a peer sending this one has
+		// either confused the two or is probing to see whether we know the
+		// difference.
+		return alertErrf(alertUnexpectedMessage,
+			"TLS key_update is not used over QUIC (RFC 9001 section 6)")
+
+	default:
+		return alertErrf(alertUnexpectedMessage,
+			"unexpected post-handshake message type %d", msg[0])
+	}
 }
 
 // handleServerHello sets up the key schedule and publishes the handshake

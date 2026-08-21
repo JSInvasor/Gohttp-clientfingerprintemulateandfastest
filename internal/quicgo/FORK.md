@@ -65,9 +65,56 @@ Every `github.com/quic-go/quic-go` import is rewritten to
 `github.com/JSInvasor/.../internal/quicgo`. Mechanical, applies to every file,
 and reversed by the check above.
 
-*(Nothing else yet. The TLS substitution described below is the next commit;
-this file exists from the vendoring commit so that the first real delta has
-somewhere to be written down.)*
+### 2. The TLS stack, on the client side only
+
+Two files added and one changed, out of 173.
+
+**`internal/handshake/ctls_adapter.go` (new).** quic-go talks to `crypto/tls`
+through eight methods on `*tls.QUICConn`. This names them as an interface —
+which `*tls.QUICConn` satisfies as written — and adds one implementation beside
+it that drives `internal/ctls`. The translation is nearly one to one because
+`internal/ctls`'s QUIC API was written against `crypto/tls`'s on purpose.
+
+Two places where the two lifecycles genuinely differ, and both are handled here
+rather than by bending either side:
+
+- `crypto/tls` takes its transport parameters after construction and
+  `internal/ctls` takes them at construction, so they are held until `Start`.
+- The peer's transport parameters arrive in EncryptedExtensions.
+  `internal/ctls` exposes them as state; quic-go expects an event. The
+  transition is synthesised once, ahead of the next write, because quic-go
+  needs them before it can use the connection.
+
+**`internal/handshake/crypto_setup.go` (changed).** Two edits: the `conn` field
+becomes the interface instead of `*tls.QUICConn`, and the client constructor
+calls `newCTLSClient` instead of `tls.QUICClient`. Nothing else in the file
+moves.
+
+**`ctls_adapter_test.go` (new).** A whole connection over a real UDP socket
+against an upstream quic-go server on `crypto/tls`, plus a test that records
+the datagrams leaving the machine and decodes them with `internal/quic` to
+confirm the ClientHello on the wire carries Chrome's JA4.
+
+The server path is untouched and still runs on `crypto/tls`. This is a client
+library; a server here has no fingerprint to emulate, and forking a second code
+path to gain nothing would pay the rebase cost twice.
+
+### Not yet delta'd
+
+quic-go still builds the Initial packets: it pads to the RFC's 1200 bytes and
+sends the ClientHello as a single CRYPTO frame. Chrome pads to 1250 and cuts the
+message into shuffled fragments interleaved with PING and PADDING.
+`internal/quic/packet.go` and `internal/quic/chaos.go` produce that shape
+already and are tested against the captures; wiring them in is the next delta.
+`ctls_adapter_test.go` says so where it asserts the JA4 and stops short of the
+datagram shape.
+
+Likewise the transport parameters still go out in quic-go's own encoding.
+`internal/quic/transportparams.go` has Chrome's — shuffled, with the reserved
+parameter and the reserved version. Moving to it means changing
+`wire.TransportParameters.Marshal` rather than replacing the values, so that
+what quic-go enforces internally and what the peer is told stay the same
+numbers.
 
 ## Why it is forked
 

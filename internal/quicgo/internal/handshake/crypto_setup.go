@@ -27,7 +27,10 @@ const clientSessionStateRevision = 5
 
 type cryptoSetup struct {
 	tlsConf *tls.Config
-	conn    *tls.QUICConn
+	// FORK DELTA: was *tls.QUICConn. The interface is satisfied by
+	// *tls.QUICConn as written and by ctlsConn, which drives internal/ctls so
+	// that the ClientHello is Chrome's rather than Go's. See ctls_adapter.go.
+	conn tlsConn
 
 	events []Event
 
@@ -92,10 +95,10 @@ func NewCryptoSetupClient(
 	cs.tlsConf = tlsConf
 	cs.allow0RTT = enable0RTT
 
-	cs.conn = tls.QUICClient(&tls.QUICConfig{
-		TLSConfig:           tlsConf,
-		EnableSessionEvents: true,
-	})
+	// FORK DELTA: was tls.QUICClient. internal/ctls emits the QUIC ClientHello
+	// this repository exists to emit; crypto/tls emits Go's, which is a
+	// different message in six visible ways (internal/ctls/quic_hello.go).
+	cs.conn = newCTLSClient(tlsConf)
 	cs.conn.SetTransportParameters(cs.ourParams.Marshal(protocol.PerspectiveClient))
 
 	return cs
