@@ -1,0 +1,106 @@
+# internal/quicgo — vendored fork of github.com/quic-go/quic-go
+
+## Base
+
+- **Upstream:** `github.com/quic-go/quic-go`
+- **Version:** `v0.59.1`
+- **Licence:** MIT, carried verbatim in `LICENSE`
+
+As with `internal/http2`, the version is recorded here because nothing else
+records it: the code is vendored, so `go.mod` says nothing about which release
+this came from.
+
+### Why v0.59.1 rather than the latest
+
+v0.60.0 and v0.61.0 declare `go 1.25.0`. This repository is on `go 1.24`, and
+bumping the language version to pick up a dependency is a change to everything
+in the tree rather than to this fork. v0.59.1 is the newest release that
+declares `go 1.24`, so it is the base until the repository moves.
+
+That is the whole reason. If the repository goes to 1.25, rebasing onto v0.61
+or later is a mechanical step, and the delta this fork carries is small enough
+(see below) that it should stay mechanical.
+
+## What was vendored, and what was left behind
+
+Kept: the root package, `internal/`, `quicvarint/`, `http3/`, `qlog/`,
+`qlogwriter/` and `metrics/`.
+
+Dropped:
+
+- `example/`, `fuzzing/`, `integrationtests/`, `interop/`, `testutils/` — none
+  of it is reachable from the client, and all of it pulls in dependencies this
+  repository does not otherwise carry.
+- Every `_test.go` file, and the generated `mock_*.go` files beside them. They
+  need `testify` and `go.uber.org/mock`; the tests that matter here are the
+  ones in `internal/quic` and `internal/ctls`, which exercise this fork through
+  the client rather than in isolation.
+- `internal/synctest`. It is test-only scaffolding around `testing/synctest`,
+  which is a Go 1.25 package: keeping it would have reintroduced the version
+  constraint that chose v0.59.1 in the first place.
+
+## Verifying it is still a clean copy
+
+Every vendored file is byte-identical to upstream once the import path rewrite
+is undone. At the vendoring commit that was 173 files and zero differences, and
+it is worth re-checking after any change:
+
+```sh
+Q=$(go env GOMODCACHE)/github.com/quic-go/quic-go@v0.59.1
+M=github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest
+for f in $(find internal/quicgo -name '*.go'); do
+  rel=${f#internal/quicgo/}
+  diff <(sed "s|$M/internal/quicgo|github.com/quic-go/quic-go|g" "$f") "$Q/$rel" \
+    >/dev/null || echo "DIFFERS: $rel"
+done
+```
+
+Anything that prints is a delta, and every delta belongs in the list below.
+
+## Deltas
+
+### 1. Import paths
+
+Every `github.com/quic-go/quic-go` import is rewritten to
+`github.com/JSInvasor/.../internal/quicgo`. Mechanical, applies to every file,
+and reversed by the check above.
+
+*(Nothing else yet. The TLS substitution described below is the next commit;
+this file exists from the vendoring commit so that the first real delta has
+somewhere to be written down.)*
+
+## Why it is forked
+
+The same reason `internal/http2` is: the QUIC and HTTP/3 fingerprints are made
+of things the library does not expose, and cannot be made to expose without
+being a different library.
+
+The TLS ClientHello is the sharp end of it. quic-go drives `crypto/tls`'s QUIC
+API, and `tls.QUICConn` is a concrete type rather than an interface — there is
+no seam to pass a different TLS implementation through. The call sites are all
+in `internal/handshake/crypto_setup.go`, which is under `internal/` and so
+unreachable from outside the module even if there were.
+
+That was measured rather than assumed before any of this was copied: across the
+whole tree, `tls.QUICClient`, `tls.QUICConn` and `tls.QUICEvent` appear in
+exactly one non-test file. The fork is 33,000 lines so that one file can change.
+
+What the fork is for, in the order the work goes:
+
+- **The TLS layer.** `internal/ctls` replaces `crypto/tls`, so the ClientHello
+  is Chrome's rather than Go's. The two disagree about almost everything
+  visible — see `internal/ctls/quic_hello.go` for the six differences and
+  `internal/quic/reference.go` for what they are checked against.
+- **Initial packet construction.** Chrome pads to 1250 bytes where the RFC
+  requires 1200, and it does not send its ClientHello as one CRYPTO frame:
+  Google's chaos protector cuts it into shuffled fragments interleaved with
+  PING and PADDING. `internal/quic/chaos.go` reproduces that shape.
+- **Transport parameter encoding.** The set, the values, the reserved
+  parameter, and the fact that the order is shuffled per connection.
+  `internal/quic/transportparams.go`.
+
+Deliberately not changed, for now: ACK policy, pacing and congestion control.
+These are observable — a stack that acknowledges on a schedule Chrome does not
+use is distinguishable to anyone looking closely — but they are second-order
+next to the ClientHello and the first flight, and keeping them upstream is what
+makes the rebase story above credible.

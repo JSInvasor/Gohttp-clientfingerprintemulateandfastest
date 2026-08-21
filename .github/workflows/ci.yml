@@ -30,12 +30,15 @@ jobs:
             || sudo apt-get install -y --no-install-recommends chromium xvfb
           command -v chromium-browser || command -v chromium
 
-      # internal/http2 is a vendored fork of golang.org/x/net/http2 and is kept
-      # byte-comparable with upstream, so it is excluded from formatting checks
-      # (see internal/http2/FORK.md).
+      # internal/http2 and internal/quicgo are vendored forks kept byte-comparable
+      # with upstream, so they are excluded from formatting checks: reformatting
+      # them would destroy the property their FORK.md files are built on, which
+      # is that a diff against the upstream tree shows only the deltas this
+      # repository intends. Five of quic-go's own files are not gofmt-clean
+      # upstream, and that is upstream's business.
       - name: gofmt
         run: |
-          unformatted=$(gofmt -l . | grep -v '^internal/http2/' || true)
+          unformatted=$(gofmt -l . | grep -vE '^internal/(http2|quicgo)/' || true)
           if [ -n "$unformatted" ]; then
             echo "These files need gofmt:"
             echo "$unformatted"
