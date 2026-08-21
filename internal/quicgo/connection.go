@@ -27,6 +27,22 @@ import (
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/qlogwriter"
 )
 
+// FORK DELTA: Chrome 151's transport parameter values, from the captures under
+// internal/quic/testdata.
+//
+// Named here rather than written inline so the client block below reads as a
+// profile rather than as a set of magic numbers, and so that a drift in any one
+// of them shows up as a change to a named constant.
+const (
+	chromeInitialStreamReceiveWindow     = protocol.ByteCount(6291456)  // 6 MiB
+	chromeInitialConnectionReceiveWindow = protocol.ByteCount(15728640) // 15 MiB
+	chromeMaxUDPPayloadSize              = protocol.ByteCount(1472)
+	chromeMaxBidiStreams                 = protocol.StreamNum(100)
+	chromeMaxUniStreams                  = protocol.StreamNum(103)
+	chromeMaxIdleTimeout                 = 30 * time.Second
+)
+
+
 type unpacker interface {
 	UnpackLongHeader(hdr *wire.Header, data []byte) (*unpackedPacket, error)
 	UnpackShortHeader(rcvTime monotime.Time, data []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error)
@@ -453,31 +469,40 @@ var newClientConnection = func(
 	)
 	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
 	oneRTTStream := newCryptoStream()
+	// FORK DELTA: the client's limits are Chrome's, not quic-go's defaults.
+	//
+	// They are set here rather than only in the encoder on purpose. A transport
+	// parameter is a promise about what this endpoint will accept, and quic-go
+	// enforces these same fields internally for flow control; advertising
+	// Chrome's numbers while keeping its own would mean telling the peer one
+	// thing and doing another. Changing the values makes the two agree.
+	//
+	// Measured from Chrome 151 — see internal/quic/reference.go and the captures
+	// beside it. The encoding, which differs as much as the values do, is in
+	// internal/wire/chrome_transport_parameters.go.
 	params := &wire.TransportParameters{
-		InitialMaxStreamDataBidiRemote: protocol.ByteCount(s.config.InitialStreamReceiveWindow),
-		InitialMaxStreamDataBidiLocal:  protocol.ByteCount(s.config.InitialStreamReceiveWindow),
-		InitialMaxStreamDataUni:        protocol.ByteCount(s.config.InitialStreamReceiveWindow),
-		InitialMaxData:                 protocol.ByteCount(s.config.InitialConnectionReceiveWindow),
-		MaxIdleTimeout:                 s.config.MaxIdleTimeout,
-		MaxBidiStreamNum:               protocol.StreamNum(s.config.MaxIncomingStreams),
-		MaxUniStreamNum:                protocol.StreamNum(s.config.MaxIncomingUniStreams),
-		MaxAckDelay:                    protocol.MaxAckDelayInclGranularity,
-		MaxUDPPayloadSize:              protocol.MaxPacketBufferSize,
-		AckDelayExponent:               protocol.AckDelayExponent,
-		// For interoperability with quic-go versions before May 2023, this value must be set to a value
-		// different from protocol.DefaultActiveConnectionIDLimit.
-		// If set to the default value, it will be omitted from the transport parameters, which will make
-		// old quic-go versions interpret it as 0, instead of the default value of 2.
-		// See https://github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/pull/3806.
-		ActiveConnectionIDLimit:   protocol.MaxActiveConnectionIDs,
+		InitialMaxStreamDataBidiRemote: chromeInitialStreamReceiveWindow,
+		InitialMaxStreamDataBidiLocal:  chromeInitialStreamReceiveWindow,
+		InitialMaxStreamDataUni:        chromeInitialStreamReceiveWindow,
+		InitialMaxData:                 chromeInitialConnectionReceiveWindow,
+		MaxIdleTimeout:                 chromeMaxIdleTimeout,
+		MaxBidiStreamNum:               chromeMaxBidiStreams,
+		MaxUniStreamNum:                chromeMaxUniStreams,
+		MaxUDPPayloadSize:              chromeMaxUDPPayloadSize,
+		// MaxAckDelay, AckDelayExponent, DisableActiveMigration and
+		// ActiveConnectionIDLimit are deliberately left at their zero values:
+		// Chrome sends none of the four, and the encoder omits them. Each falls
+		// back to the default RFC 9000 section 18.2 specifies, which is what a
+		// peer applies to Chrome today.
 		InitialSourceConnectionID: srcConnID,
 		EnableResetStreamAt:       conf.EnableStreamResetPartialDelivery,
 	}
-	if s.config.EnableDatagrams {
-		params.MaxDatagramFrameSize = wire.MaxDatagramSize
-	} else {
-		params.MaxDatagramFrameSize = protocol.InvalidByteCount
-	}
+	// FORK DELTA: the client always advertises max_datagram_frame_size, because
+	// Chrome always does. It is also the transport half of a pair: Chrome's
+	// HTTP/3 SETTINGS carry H3_DATAGRAM=1 (see internal/quic/http3.go), and a
+	// client that advertised one without the other would be announcing a
+	// capability at one layer and denying it at the next.
+	params.MaxDatagramFrameSize = wire.MaxDatagramSize
 	if s.qlogger != nil {
 		s.qlogTransportParameters(params, protocol.PerspectiveClient, false)
 	}

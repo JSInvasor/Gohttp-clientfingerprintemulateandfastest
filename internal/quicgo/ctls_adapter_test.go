@@ -227,23 +227,15 @@ func (c *recordingConn) datagrams() [][]byte {
 	return append([][]byte(nil), c.sent...)
 }
 
-// TestWireCarriesChromesHello reads the first packet off the socket
-// and decodes it with this repository's own QUIC decoder — the one that was
-// written against captures of Chrome and independently agreed with by
-// browserleaks. What comes back has to be Chrome's ClientHello.
+// dialAndDecodeHello opens one connection, records the datagrams that leave the
+// socket, and decodes the ClientHello out of them with internal/quic — the
+// decoder written against captures of Chrome and independently agreed with by
+// browserleaks.
 //
-// This is the end of the chain the other tests each cover a link of: the hello
-// is built by internal/ctls, handed to quic-go through the adapter, packed into
-// an Initial by quic-go, protected, and put on a UDP socket. Everything in
-// between has to be right for the JA4 at the far end to come out unchanged.
-//
-// What it deliberately does NOT assert yet is the shape of the datagram around
-// the hello. quic-go pads an Initial to the RFC's 1200 bytes and sends the
-// ClientHello as one CRYPTO frame; Chrome pads to 1250 and cuts the message
-// into shuffled fragments interleaved with PING and PADDING. internal/quic has
-// the builder for that (packet.go, chaos.go) and wiring it in is the next fork
-// delta, so the gap is named here rather than left for someone to discover.
-func TestWireCarriesChromesHello(t *testing.T) {
+// It is what makes these tests measurements rather than assertions about
+// intent: nothing here asks any layer what it meant to send.
+func dialAndDecodeHello(t *testing.T) *quicprofile.ClientHello {
+	t.Helper()
 	cert, pool := testCert(t)
 
 	ln, err := ListenAddr("127.0.0.1:0", &tls.Config{
@@ -322,6 +314,27 @@ func TestWireCarriesChromesHello(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse the hello we put on the wire: %v", err)
 	}
+	return ch
+}
+
+// TestWireCarriesChromesHello reads the first packet off the socket
+// and decodes it with this repository's own QUIC decoder — the one that was
+// written against captures of Chrome and independently agreed with by
+// browserleaks. What comes back has to be Chrome's ClientHello.
+//
+// This is the end of the chain the other tests each cover a link of: the hello
+// is built by internal/ctls, handed to quic-go through the adapter, packed into
+// an Initial by quic-go, protected, and put on a UDP socket. Everything in
+// between has to be right for the JA4 at the far end to come out unchanged.
+//
+// What it deliberately does NOT assert yet is the shape of the datagram around
+// the hello. quic-go pads an Initial to the RFC's 1200 bytes and sends the
+// ClientHello as one CRYPTO frame; Chrome pads to 1250 and cuts the message
+// into shuffled fragments interleaved with PING and PADDING. internal/quic has
+// the builder for that (packet.go, chaos.go) and wiring it in is the next fork
+// delta, so the gap is named here rather than left for someone to discover.
+func TestWireCarriesChromesHello(t *testing.T) {
+	ch := dialAndDecodeHello(t)
 
 	ja4, _ := ch.JA4()
 	if ja4 != quicprofile.Chrome151QUIC.JA4 {
@@ -334,4 +347,104 @@ func TestWireCarriesChromesHello(t *testing.T) {
 	if !slices.Equal(ch.ALPN, []string{"h3"}) {
 		t.Errorf("ALPN = %v, want [h3]", ch.ALPN)
 	}
+}
+
+// TestWireCarriesChromesTransportParameters reads extension 0x0039 back off the
+// socket and holds it to the same reference the captures produced.
+//
+// The values are checked as well as the set, because the two halves of this
+// delta have to agree: connection.go sets the limits quic-go enforces and
+// wire/chrome_transport_parameters.go encodes them. Advertising Chrome's
+// numbers while keeping quic-go's internally would tell the peer one thing and
+// do another, and only a test that reads the wire can tell the difference.
+func TestWireCarriesChromesTransportParameters(t *testing.T) {
+	ch := dialAndDecodeHello(t)
+	ref := quicprofile.Chrome151QUIC
+
+	params, err := ch.TransportParams()
+	if err != nil {
+		t.Fatalf("transport parameters: %v", err)
+	}
+
+	got := map[uint64]uint64{}
+	var greased int
+	var sawSourceCID, sawVersionInfo bool
+	var connOpts string
+
+	for _, p := range params {
+		switch {
+		case quicprofile.IsGREASETransportParam(p.ID):
+			greased++
+			if n := len(p.Value); n < 11 || n > 15 {
+				t.Errorf("GREASE parameter value is %d bytes; Chrome's are 11 to 15", n)
+			}
+		case p.ID == quicprofile.TPInitialSourceConnectionID:
+			sawSourceCID = true
+		case p.ID == quicprofile.TPVersionInformation:
+			sawVersionInfo = true
+			if len(p.Value) != 12 {
+				t.Errorf("version_information is %d bytes, want 12", len(p.Value))
+			}
+		case p.ID == quicprofile.TPGoogleConnectionOptions:
+			connOpts = string(p.Value)
+		default:
+			if v, ok := p.Uint(); ok {
+				got[p.ID] = v
+			}
+		}
+	}
+
+	if !sawSourceCID {
+		t.Error("no initial_source_connection_id")
+	}
+	if !sawVersionInfo {
+		t.Error("no version_information; upstream quic-go does not send it")
+	}
+	if greased != 1 {
+		t.Errorf("GREASE parameters = %d, want exactly 1", greased)
+	}
+	if connOpts != ref.ConnectionOptions {
+		t.Errorf("google connection options = %q, want %q", connOpts, ref.ConnectionOptions)
+	}
+	for id, want := range ref.TransportParams {
+		if got[id] != want {
+			t.Errorf("transport parameter 0x%02x = %d, want %d", id, got[id], want)
+		}
+	}
+	for id, v := range got {
+		if _, known := ref.TransportParams[id]; !known {
+			t.Errorf("we send an unpinned transport parameter 0x%02x = %d; "+
+				"Chrome sends neither ack_delay_exponent, max_ack_delay, "+
+				"disable_active_migration nor active_connection_id_limit", id, v)
+		}
+	}
+}
+
+// TestWireTransportParameterOrderMoves is the negative half. Upstream quic-go
+// emits a fixed order with its greased value always first, which is a constant
+// on the wire; Chrome shuffles. If this ever stops varying, the fixed order
+// belongs in the reference and this delta was unnecessary.
+func TestWireTransportParameterOrderMoves(t *testing.T) {
+	ids := func() []uint64 {
+		ch := dialAndDecodeHello(t)
+		params, err := ch.TransportParams()
+		if err != nil {
+			t.Fatalf("transport parameters: %v", err)
+		}
+		out := make([]uint64, 0, len(params))
+		for _, p := range params {
+			if quicprofile.IsGREASETransportParam(p.ID) {
+				continue // its id is random, so it would prove nothing
+			}
+			out = append(out, p.ID)
+		}
+		return out
+	}
+	first := ids()
+	for i := 0; i < 8; i++ {
+		if !slices.Equal(ids(), first) {
+			return
+		}
+	}
+	t.Error("eight connections put the transport parameters in the same order")
 }

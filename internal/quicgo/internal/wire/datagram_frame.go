@@ -11,7 +11,18 @@ import (
 // By setting it to a large value, we allow all datagrams that fit into a QUIC packet.
 // The value is chosen such that it can still be encoded as a 2 byte varint.
 // This is a var and not a const so it can be set in tests.
-var MaxDatagramSize protocol.ByteCount = 16383
+// FORK DELTA: 65536, which is what Chrome advertises in
+// max_datagram_frame_size. Upstream's 16383 is its own choice, not a limit from
+// RFC 9221.
+//
+// This value is enforced in both directions, and raising it keeps the two
+// honest. Conn.handleDatagramFrame closes the connection on anything larger, so
+// leaving it at 16383 while advertising 65536 would promise the peer a size
+// this endpoint then treats as a protocol violation. The send side is bounded
+// separately by the peer's own advertised limit and by the path MTU
+// (Conn.SendDatagram), so raising it here does not make this client send larger
+// datagrams than a peer asked for.
+var MaxDatagramSize protocol.ByteCount = 65536
 
 // A DatagramFrame is a DATAGRAM frame
 type DatagramFrame struct {

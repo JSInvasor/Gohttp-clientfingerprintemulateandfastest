@@ -352,6 +352,14 @@ func (p *TransportParameters) readNumericTransportParameter(b []byte, paramID tr
 
 // Marshal the transport parameters
 func (p *TransportParameters) Marshal(pers protocol.Perspective) []byte {
+	// FORK DELTA: the client encodes Chrome's shape — shuffled, with
+	// version_information and google_connection_options, without the four
+	// parameters Chrome omits, and with a reserved parameter of Chrome's size.
+	// See chrome_transport_parameters.go. The server path below is upstream's.
+	if pers == protocol.PerspectiveClient {
+		return p.marshalChromeClient()
+	}
+
 	// Typical Transport Parameters consume around 110 bytes, depending on the exact values,
 	// especially the lengths of the Connection IDs.
 	// Allocate 256 bytes, so we won't have to grow the slice in any case.

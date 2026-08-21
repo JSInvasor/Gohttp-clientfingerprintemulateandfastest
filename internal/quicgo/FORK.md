@@ -99,6 +99,52 @@ The server path is untouched and still runs on `crypto/tls`. This is a client
 library; a server here has no fingerprint to emulate, and forking a second code
 path to gain nothing would pay the rebase cost twice.
 
+### 3. The client's transport parameters
+
+Both halves, because either alone would be incoherent: a transport parameter is
+a promise about what this endpoint accepts, and quic-go enforces the same fields
+internally for flow control. Advertising Chrome's numbers while keeping its own
+would tell the peer one thing and do another.
+
+**`internal/wire/chrome_transport_parameters.go` (new).** The encoding. Four
+things differ from upstream's `Marshal`, all measured against the captures:
+
+- The parameters are shuffled. Upstream emits a fixed order with its greased
+  value always first, which is a constant on the wire; three captures of Chrome
+  produced three unrelated orders.
+- `version_information` (0x11) is sent, with QUIC v1 and one reserved version in
+  an order that also moves. Upstream does not send it at all.
+- `google_connection_options` (0x3128) is sent, with the short `ORIG` value a
+  first connection carries.
+- Four parameters upstream sends are omitted because Chrome omits them:
+  `ack_delay_exponent`, `max_ack_delay`, `disable_active_migration` and
+  `active_connection_id_limit`. Each falls back to the RFC's default, which is
+  what a peer applies to Chrome today.
+
+The GREASE parameter stays but is reshaped: upstream's one-byte multiplier and
+sub-16 length give a short id and often an empty value, where Chrome's is an
+eight-byte varint id with eleven to fifteen bytes of value.
+
+**`internal/wire/transport_parameters.go` (changed).** One branch at the top of
+`Marshal`: the client goes to the above, the server stays upstream's.
+
+**`connection.go` (changed).** The client's limits become Chrome's — 6 MiB
+stream windows, 15 MiB connection window, 100 bidi and 103 uni streams, a 30
+second idle timeout, a 1472-byte max UDP payload — and the four parameters
+Chrome omits are left at their zero values so the encoder drops them. The
+datagram parameter is now sent unconditionally, because Chrome always sends it
+and because it is the transport half of a pair: Chrome's HTTP/3 SETTINGS carry
+`H3_DATAGRAM=1`, and advertising one without the other announces a capability at
+one layer and denies it at the next.
+
+**`internal/wire/datagram_frame.go` (changed).** `MaxDatagramSize` goes from
+upstream's 16383 to Chrome's 65536. The value is enforced in both directions and
+raising it keeps them honest: `Conn.handleDatagramFrame` closes the connection on
+anything larger, so advertising 65536 while accepting 16383 would promise a size
+this endpoint then treats as a protocol violation. The send side is bounded
+separately by the peer's own advertised limit and the path MTU, so this does not
+make the client send larger datagrams than a peer asked for.
+
 ### Not yet delta'd
 
 quic-go still builds the Initial packets: it pads to the RFC's 1200 bytes and
@@ -108,13 +154,6 @@ message into shuffled fragments interleaved with PING and PADDING.
 already and are tested against the captures; wiring them in is the next delta.
 `ctls_adapter_test.go` says so where it asserts the JA4 and stops short of the
 datagram shape.
-
-Likewise the transport parameters still go out in quic-go's own encoding.
-`internal/quic/transportparams.go` has Chrome's — shuffled, with the reserved
-parameter and the reserved version. Moving to it means changing
-`wire.TransportParameters.Marshal` rather than replacing the values, so that
-what quic-go enforces internally and what the peer is told stay the same
-numbers.
 
 ## Why it is forked
 
