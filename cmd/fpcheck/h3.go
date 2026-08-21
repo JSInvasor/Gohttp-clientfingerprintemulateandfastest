@@ -31,6 +31,17 @@ import (
 
 // defaultH3URL reports the QUIC and HTTP/3 view of a request, the way
 // tls.peet.ws reports the TLS and HTTP/2 one.
+//
+// NOT YET RUN AGAINST A LIVE SERVICE. The reference in internal/quic/http3.go
+// came from a browserleaks report that a person read and pasted in; this code
+// has never made the request itself, because the environment it was written in
+// has no egress. So the JSON field names below are read off that report's shape
+// and are the least certain thing in this file.
+//
+// That is why every check skips rather than passes when a field is missing: a
+// service naming things differently reports as "nobody looked", which is true,
+// instead of as a row of green ticks, which would not be. Point -h3-url at
+// whatever service you have and read the skips first.
 const defaultH3URL = "https://quic.browserleaks.com/json"
 
 // h3Capture is the subset of a QUIC fingerprinting response fpcheck reads.
@@ -190,14 +201,16 @@ func checkH3(got h3Capture) []check {
 	} else {
 		var pseudo, regular []string
 		for _, h := range got.Headers {
-			name := strings.ToLower(strings.TrimSpace(strings.SplitN(h, ":", 2)[0]))
+			// Each entry is "name: value". A pseudo-header starts with its own
+			// colon, so the split has to skip that one or every one of them
+			// comes back empty.
 			if strings.HasPrefix(h, ":") {
-				// A pseudo-header splits into an empty first field.
-				name = ":" + strings.ToLower(strings.TrimSpace(strings.SplitN(h[1:], ":", 2)[0]))
-				pseudo = append(pseudo, name)
+				name, _, _ := strings.Cut(h[1:], ":")
+				pseudo = append(pseudo, ":"+strings.ToLower(strings.TrimSpace(name)))
 				continue
 			}
-			regular = append(regular, name)
+			name, _, _ := strings.Cut(h, ":")
+			regular = append(regular, strings.ToLower(strings.TrimSpace(name)))
 		}
 		add("http3.pseudo_header_order",
 			strings.Join(h3.PseudoHeaderOrder, ","), strings.Join(pseudo, ","))

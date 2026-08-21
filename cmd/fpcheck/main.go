@@ -59,7 +59,9 @@ func main() {
 
 		h3 = flag.Bool("h3", false,
 			"measure the HTTP/3 path instead: QUIC JA4, the SETTINGS frame, "+
-				"the frames after it, and the request header order")
+				"the frames after it, and the request header order. Read the "+
+				"skipped checks first — see h3.go on why the field names are "+
+				"the least certain part")
 		h3URL = flag.String("h3-url", defaultH3URL, "QUIC fingerprinting endpoint returning JSON")
 
 		viaChromium = flag.Bool("via-chromium", false,
