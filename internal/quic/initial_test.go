@@ -121,10 +121,12 @@ var captures = []struct {
 	{"google-resumed", "testdata/chrome151-google-resumed.txt", Chrome151QUICResumed},
 }
 
-// TPGoogleQUICVersion is a second Google-specific parameter that appears on
-// some connections and not others, carrying a different value each time. It is
-// tolerated rather than pinned.
-const TPGoogleQUICVersion = 0x3127
+// TPGoogleInitialRTT is Google's initial_rtt parameter, in microseconds. It
+// appears on some connections and not others and carries a different value
+// every time, which is exactly right for what it is: a measurement of the path
+// rather than a property of the client. Tolerated, never pinned — a client
+// that sent a constant here would be claiming every network is the same.
+const TPGoogleInitialRTT = 0x3127
 
 const capturePath = "testdata/chrome151-cloudflare-quic.txt"
 
@@ -412,9 +414,8 @@ func TestTransportParametersMatchReference(t *testing.T) {
 					}
 				case p.ID == TPGoogleConnectionOptions:
 					connOpts = string(p.Value)
-				case p.ID == TPGoogleQUICVersion:
-					// Present on some connections, absent on others, and a
-					// different value each time. Tolerated, not pinned.
+				case p.ID == TPGoogleInitialRTT:
+					// A path measurement, so it differs every time by design.
 				default:
 					if v, ok := p.Uint(); ok {
 						got[p.ID] = v

@@ -37,16 +37,33 @@ comes back is in four places, and all four are ours to control byte for byte:
    connection, exactly as it shuffles the ClientHello extensions. Emitting a
    fixed order is the distinguishable behaviour. See `reference.go`.
 4. **HTTP/3 SETTINGS and QPACK.** The settings ids, their values, the order
-   they are sent in, the GREASE setting, and the order the control and QPACK
-   encoder/decoder streams are opened in. Then the request header order, and
-   QPACK's own indexing policy — which headers get inserted into the dynamic
-   table and which go literal. That last one is the QUIC analogue of the HPACK
-   policy leak on the h2 path: the library's default is not the browser's.
+   they are sent in, the reserved setting that rides along, and the reserved
+   *frame* that follows on the control stream before any request. Then the
+   pseudo-header order and the request header order, and QPACK's own indexing
+   policy — which headers get inserted into the dynamic table and which go
+   literal. That last one is the QUIC analogue of the HPACK policy leak on the
+   h2 path: the library's default is not the browser's.
+
+   All of it except the QPACK policy is now measured and pinned in `http3.go`.
+   The GREASE that the QUIC ClientHello does *not* carry reappears here, which
+   is the thing an implementation gets wrong by omission: a control stream that
+   sends a clean SETTINGS frame and then goes quiet is distinguishable from
+   Chrome before a single request byte is written.
 
 Numbers 1 through 3 come out of one artifact — the raw bytes of Chrome's first
 Initial datagram, which `tools/capture` collects from a real Windows machine.
-Number 4 comes from the same run's net-log, which reports SETTINGS and header
-order semantically, and from the pcapng + keylog when we want the bytes.
+
+Number 4 could not come from there: SETTINGS travels in 1-RTT packets and needs
+the traffic keys. It came instead from a server that reports what it received —
+`quic.browserleaks.com` — which turned out to be the better source anyway. A
+capture is the browser's own account of itself; a report from the far end is
+what the far end actually saw, and this project's whole argument is that the
+second kind of evidence is worth more.
+
+That source also settled something a single decoder cannot: it recomputed the
+QUIC JA4 independently and produced the same string this package derives from
+the raw bytes. A bug in the decoder would otherwise have been invisible, since
+`reference.go` and the tests both descend from it.
 
 Same rule as `internal/ctls/reference.go`: the values get pinned against a
 device capture and a test fails when they drift. Evidence, not assertion.
@@ -120,9 +137,15 @@ part of the fingerprint, so it has to be ours to pin.
 
 ## Order of work
 
-1. `tools/capture` output → decode the Initial, write `internal/quic/reference.go`
-   with the transport parameters, the H3 settings and the JA4 for `q13…`, and
-   the tests that pin them.
+1. ~~`tools/capture` output → decode the Initial, write
+   `internal/quic/reference.go` with the transport parameters, the H3 settings
+   and the JA4 for `q13…`, and the tests that pin them.~~ Done, across
+   `initial.go`, `clienthello.go`, `reference.go` and `http3.go`, with three
+   captures under `testdata` and 35 tests. Three corrections came out of it and
+   are recorded where they belong: the transport parameter order is shuffled
+   rather than stable, `0x3127` is `initial_rtt` and therefore a path
+   measurement that must never be pinned, and `google_connection_options` is
+   per-origin rather than per-client.
 2. `internal/ctls` QUIC handshake mode, tested offline against the captured
    ClientHello bytes before anything is dialled.
 3. Vendor quic-go + qpack, wire in `ctls`, get one handshake to complete
