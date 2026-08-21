@@ -172,6 +172,12 @@ type options struct {
 	proxyFails    int
 	proxyStats    bool
 
+	// proxyRotate drops the one-exit-per-session pinning: every session dials
+	// the whole list in round-robin, a fresh entry per connection. See
+	// newSession — it is the difference between a run using -s addresses and one
+	// using all of them.
+	proxyRotate bool
+
 	// proxyList narrows proxyFile to the exits a solve actually earned a cookie
 	// through. Empty means the file itself is the list.
 	proxyList []string
@@ -366,6 +372,7 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.DurationVar(&o.proxyCooldown, "proxy-cooldown", 0, "")
 	fs.IntVar(&o.proxyFails, "proxy-fails", 0, "")
 	fs.BoolVar(&o.proxyStats, "proxy-stats", false, "")
+	fs.BoolVar(&o.proxyRotate, "proxy-rotate", false, "")
 
 	// Network
 	fs.DurationVar(&o.timeout, "timeout", 30*time.Second, "")
@@ -478,6 +485,27 @@ func (o *options) normalize() error {
 		return fmt.Errorf("-rate cannot be negative, got %d", o.rate)
 	}
 
+	// A list wins at dial time — setProxyRotator replaces the proxy function
+	// -proxy installed — so the two together meant the single proxy was accepted
+	// and then dialled by nothing. A run that names one exit in its flags and
+	// leaves from another is not measuring what it says it is, so it is refused
+	// rather than quietly resolved.
+	if o.proxy != "" && o.proxyFile != "" {
+		msg := "-proxy or -proxy-file, not both: the list is what the sessions dial through, " +
+			"so -proxy would be ignored"
+		if o.solve {
+			msg += " — and a cookie solved through it would be replayed from an exit it was never issued to"
+		}
+		return errors.New(msg)
+	}
+
+	// Rotating means "take the next entry on every dial", so there has to be a
+	// list to take it from. With -proxy alone there is no rotator at all, and the
+	// flag would do nothing without saying so.
+	if o.proxyRotate && o.proxyFile == "" {
+		return errors.New("-proxy-rotate needs -proxy-file: there is no list to rotate over")
+	}
+
 	if o.solve {
 		// Launching Chromium under Xvfb costs several seconds before the first
 		// byte of the challenge is fetched, and the solver's own watchdog only
@@ -495,14 +523,14 @@ func (o *options) normalize() error {
 		if o.solveParallel < 1 {
 			return fmt.Errorf("-solve-parallel must be at least 1, got %d", o.solveParallel)
 		}
-		// The rotator wins at dial time, so -proxy would be solved through and
-		// then never used — every session replaying a cookie earned at an
-		// address it does not dial from. Ambiguity about which exit a cookie
-		// belongs to is the one thing this must not have.
-		if o.proxy != "" && o.proxyFile != "" {
-			return errors.New("-solve takes -proxy or -proxy-file, not both: the list is what " +
-				"the sessions dial through, so a cookie solved through -proxy would be replayed " +
-				"from an exit it was never issued to")
+		// Every session's cookie is bound to the address that earned it, which
+		// is what pinning exists to hold. Rotating over the list would replay
+		// each clearance from whichever exit came up next — the 403 that reads
+		// as the target blocking the client. See ProxyRotator.PinnedOnly.
+		if o.proxyRotate {
+			return errors.New("-proxy-rotate cannot be combined with -solve: a cf_clearance is bound " +
+				"to the address that earned it, and rotating would replay each one from an exit it " +
+				"was never issued to")
 		}
 		// The solver drives a real Chromium, so the cookie is issued to a Chrome
 		// TLS fingerprint. Replaying it from the Safari profile presents a JA4

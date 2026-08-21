@@ -241,7 +241,21 @@ func (pr *ProxyRotator) NextEntry() *proxyEntry {
 	return best
 }
 
-// MarkSuccess clears the failure count on a proxy.
+// MarkSuccess records that a connection through this proxy was actually usable,
+// clearing its failure count and any cooldown.
+//
+// "Usable" means the whole dial, not the tunnel. It used to be called the
+// moment CONNECT returned 200, which is a weaker claim than it looks: a proxy
+// that accepts the tunnel and then breaks the TLS handshake behind it — an
+// intercepting gateway, a dead upstream, a pool that answers for exits it can
+// no longer reach — was credited with a success on every attempt. Since a
+// success also clears deadUntilNs, that proxy could never accumulate the
+// consecutive failures needed to be benched: it was marked healthy, failed the
+// request, and was marked healthy again. Transport.dialTLS now scores it after
+// the handshake, so the counter reflects connections that carried something.
+//
+// One consequence worth knowing when reading -proxy-stats: Used counts
+// connections that worked, not attempts. Used+Failed is the attempt count.
 func (pr *ProxyRotator) MarkSuccess(e *proxyEntry) {
 	if e == nil {
 		return
@@ -369,10 +383,21 @@ func parseProxyString(s string) (*url.URL, error) {
 	case 2:
 		return url.Parse("http://" + s)
 	case 4:
-		host := parts[0] + ":" + parts[1]
-		user := url.QueryEscape(parts[2])
-		pass := url.QueryEscape(parts[3])
-		return url.Parse(fmt.Sprintf("http://%s:%s@%s", user, pass, host))
+		// url.Parse validates the port; the credentials are then attached as
+		// userinfo rather than pasted into the string.
+		//
+		// They used to be pasted in after url.QueryEscape, which is the wrong
+		// escaper for this position: QueryEscape encodes a space as '+', and '+'
+		// in userinfo is a literal '+'. A password with a space in it therefore
+		// authenticated as a different password, and the proxy answered 407 —
+		// which the rotator scores as a dead proxy. url.UserPassword uses the
+		// userinfo escaper, where a space is %20.
+		u, err := url.Parse("http://" + parts[0] + ":" + parts[1])
+		if err != nil {
+			return nil, err
+		}
+		u.User = url.UserPassword(parts[2], parts[3])
+		return u, nil
 	default:
 		return nil, fmt.Errorf("expected ip:port or ip:port:user:pass, got %q", s)
 	}

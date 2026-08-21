@@ -185,7 +185,14 @@ func printUsage(w io.Writer) {
 -d string       request body; @path reads it from a file`))
 
 	fmt.Fprint(w, p.section("proxy", `-proxy url            single proxy, http:// or socks5://
--proxy-file path      file of proxies to rotate, one per line
+-proxy-file path      file of proxies, one per line. By default a session pins
+                      one exit for the whole run, so the run leaves from -s
+                      addresses — not from every line in the file
+-proxy-rotate         take the next entry on every connection instead, so one
+                      session reaches the whole list. Pair with -no-keepalive
+                      (an exit per request) or -max-streams N, or HTTP/2 keeps
+                      one connection and rotates once. Not for -solve: a
+                      clearance is bound to the address that earned it
 -proxy-stats          per-proxy usage after the run — which exits carried the
                       run and which were benched`))
 

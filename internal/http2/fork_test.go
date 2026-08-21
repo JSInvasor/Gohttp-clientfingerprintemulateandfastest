@@ -104,3 +104,28 @@ func TestConnPoolDoesNotSerialiseDials(t *testing.T) {
 			"being de-duplicated, which caps pool growth at one connection at a time")
 	}
 }
+
+// DisableKeepAlives has to be readable off the Transport itself.
+//
+// Upstream only reads it from t1, the net/http Transport a ConfigureTransports
+// pairing supplies. The client builds this Transport standalone — there is no
+// t1 and never will be — so the setting had no way in, and
+// http.Transport.DisableKeepAlives applied to the HTTP/1.1 path alone. The
+// field is the fork's; an upstream re-apply that took transport.go wholesale
+// would drop it and the h2 half of the flag would go quiet again rather than
+// fail to compile.
+func TestDisableKeepAlivesIsReadableWithoutAT1(t *testing.T) {
+	if (&Transport{}).disableKeepAlives() {
+		t.Error("keep-alives are disabled by default")
+	}
+	if !(&Transport{DisableKeepAlives: true}).disableKeepAlives() {
+		t.Error("Transport.DisableKeepAlives did not reach disableKeepAlives, so a standalone " +
+			"Transport — which is the only kind this client builds — cannot be told to close " +
+			"its connections")
+	}
+	// The upstream path still works, so a Transport that does have a t1 is
+	// unaffected.
+	if !(&Transport{t1: &http.Transport{DisableKeepAlives: true}}).disableKeepAlives() {
+		t.Error("the t1 path stopped being consulted")
+	}
+}

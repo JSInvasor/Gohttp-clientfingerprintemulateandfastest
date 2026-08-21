@@ -103,10 +103,21 @@ func TestNoBoolFlagSwallowsTheNextArgument(t *testing.T) {
 		t.Fatalf("only found %d bool flags (%v) — the FlagSet is not being read", len(bools), bools)
 	}
 
+	// A flag that is only meaningful beside another one is given what it needs.
+	// The subject here is whether the URL survives the split, not whether the
+	// combination is valid — normalize's own checks are tested separately, and a
+	// flag that refuses to run alone must still not eat the argument after it.
+	needs := map[string][]string{
+		"proxy-rotate": {"-proxy-file", "p.txt"},
+	}
+
 	for _, name := range bools {
-		_, target, err := parseFlags([]string{"-" + name, "https://site.test"})
+		args := append([]string{"-" + name}, needs[name]...)
+		args = append(args, "https://site.test")
+
+		_, target, err := parseFlags(args)
 		if err != nil {
-			t.Errorf("-%s https://site.test: %v", name, err)
+			t.Errorf("%v: %v", args, err)
 			continue
 		}
 		if target != "https://site.test" {

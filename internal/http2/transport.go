@@ -212,6 +212,18 @@ type Transport struct {
 	// Zero (default) disables the cap and lets the conn run until MaxInt32 streams.
 	MaxStreamsPerConn uint32
 
+	// DisableKeepAlives closes each connection as soon as it goes idle, so every
+	// request that finds no live conn dials a new one.
+	//
+	// Upstream reads this off t1, the net/http Transport a ConfigureTransports
+	// pairing supplies. This fork's Transport is constructed standalone — there
+	// is no t1 — so the setting had no way in and http.Transport.DisableKeepAlives
+	// silently applied to the HTTP/1.1 path only. That is the wrong half: h2 is
+	// where a connection is long-lived enough for the difference to matter, and
+	// with a rotating proxy list it is what decides whether a run leaves from one
+	// address or from all of them.
+	DisableKeepAlives bool
+
 	// t1, if non-nil, is the standard library Transport using
 	// this transport. Its settings are used (but not its
 	// RoundTrip method, etc).
@@ -886,7 +898,13 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, tlsCfg *t
 
 // disableKeepAlives reports whether connections should be closed as
 // soon as possible after handling the first request.
+//
+// The field is consulted before t1 so a standalone Transport — which is how
+// this fork is built — can be told directly. See Transport.DisableKeepAlives.
 func (t *Transport) disableKeepAlives() bool {
+	if t.DisableKeepAlives {
+		return true
+	}
 	return t.t1 != nil && t.t1.DisableKeepAlives
 }
 

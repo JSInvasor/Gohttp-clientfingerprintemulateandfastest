@@ -23,6 +23,11 @@ func TestParseProxyString(t *testing.T) {
 		{"://nohost", "", true},
 		// Password containing ':' must survive shorthand parsing.
 		{"1.2.3.4:8080:user:p:a:s:s", "http://user:p%3Aa%3As%3As@1.2.3.4:8080", false},
+		// A space is %20 in userinfo. It used to go through url.QueryEscape,
+		// where a space is '+' — and '+' in userinfo is a literal '+', so the
+		// proxy was sent a different password than the one in the file and
+		// answered 407, which the rotator scores as a dead proxy.
+		{"1.2.3.4:8080:user:pass word", "http://user:pass%20word@1.2.3.4:8080", false},
 	}
 	for _, tc := range cases {
 		got, err := parseProxyString(tc.in)

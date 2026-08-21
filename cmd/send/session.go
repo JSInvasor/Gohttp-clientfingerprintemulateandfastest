@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -50,10 +51,41 @@ func newSessionPool(o *options, profile gofire.BrowserProfile, target string) (*
 	}
 
 	if pool.rotator != nil {
-		fmt.Fprintf(os.Stderr, "%d proxies loaded, %d sessions pinned across them\n",
-			pool.rotator.Count(), o.sessions)
+		describeExits(os.Stderr, o, pool.rotator.Count())
 	}
 	return pool, nil
+}
+
+// describeExits says how many of the loaded proxies the run will actually leave
+// from, which is not the same number as how many were loaded.
+//
+// It used to print "%d proxies loaded, %d sessions pinned across them", which
+// reads as though the list is in use. It is not: a pinned session dials one
+// exit for its whole life, so a hundred-entry file behind -s 2 is two addresses
+// and ninety-eight idle lines. That is the single most surprising thing about
+// this tool's proxying, and it was being reported as a success.
+func describeExits(w io.Writer, o *options, loaded int) {
+	if o.proxyRotate {
+		fmt.Fprintf(w, "%d proxies loaded, every session rotating over all of them "+
+			"(a fresh exit per connection)\n", loaded)
+		// Rotation is per dial, so a session that opens one connection and keeps
+		// it rotates exactly once. Worth saying while there is still time to add
+		// the flag that fixes it rather than after a run that used two addresses.
+		if !o.noKeepAlive && o.maxStreams == 0 {
+			fmt.Fprintf(w, "  note: the exit changes when a connection is opened, and HTTP/2 keeps "+
+				"one open — add -no-keepalive (an exit per request) or -max-streams N to keep it turning\n")
+		}
+		return
+	}
+
+	used := min(loaded, o.sessions)
+	fmt.Fprintf(w, "%d proxies loaded, %d session(s) pinned across them — this run leaves from %d of them\n",
+		loaded, o.sessions, used)
+	if used < loaded {
+		fmt.Fprintf(w, "  %d entries will never be dialled: a pinned session keeps one exit for the whole "+
+			"run. Raise -s (up to -c, currently %d) to use more, or -proxy-rotate to take the whole list\n",
+			loaded-used, o.concurrency)
+	}
 }
 
 // newRotator builds the proxy rotator every session shares, or nil when the run
@@ -120,6 +152,12 @@ func newSession(o *options, profile gofire.BrowserProfile, target string, index 
 			// IP, which the edge answers with 403s that read as the target
 			// blocking the client.
 			client.SetProxyRotator(rotator.PinnedOnly(index))
+		case o.proxyRotate:
+			// The bare rotator: NextEntry takes the next live entry on every
+			// dial, so one session reaches the whole list rather than one
+			// address of it. See newSessionPool for why that is a flag and not
+			// the default.
+			client.SetProxyRotator(rotator)
 		default:
 			// Pinned gives this session a primary proxy of its own while sharing
 			// health state with its siblings, so the list is covered evenly and a

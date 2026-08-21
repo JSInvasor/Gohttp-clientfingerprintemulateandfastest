@@ -292,9 +292,15 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 			// priority block at all. See H2Profile.PrioritySignals.
 			HeaderPriority:             headerPriorityFor(h2p),
 			StrictMaxConcurrentStreams: false,
-			ReadIdleTimeout:            15 * time.Second,
-			PingTimeout:                5 * time.Second,
-			WriteByteTimeout:           cfg.WriteByteTimeout,
+			// Reaches the h2 path only because the fork takes it as a field:
+			// upstream reads it off a paired net/http Transport, which this one
+			// does not have. Without it -no-keepalive was an h1-only flag, and
+			// the h2 run it was aimed at kept its connections — and, under a
+			// rotator, its single exit address.
+			DisableKeepAlives: cfg.DisableKeepAlives,
+			ReadIdleTimeout:   15 * time.Second,
+			PingTimeout:       5 * time.Second,
+			WriteByteTimeout:  cfg.WriteByteTimeout,
 			// Cycle the H2 conn after this many streams. Real browsers don't push
 			// 100k+ streams over a single connection; a long monotonic
 			// stream-ID sequence is a passive fingerprint signal. Configurable
@@ -347,10 +353,13 @@ func (t *Transport) dialWithDNSCache() func(ctx context.Context, network, addr s
 			host, port = addr, "80"
 		}
 
-		conn, _, err := t.dialRaw(ctx, network, host, port)
+		conn, _, entry, err := t.dialRaw(ctx, network, host, port)
 		if err != nil {
 			return nil, err
 		}
+		// Cleartext: the tunnel is the connection, so there is no later verdict
+		// to wait for the way the TLS path has one.
+		t.scoreProxy(entry, true)
 		return newH1OrderConn(conn, t.headerOrder), nil
 	}
 }
@@ -505,7 +514,7 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 			}
 		}
 
-		rawConn, exit, err := t.dialRaw(ctx, network, host, port)
+		rawConn, exit, entry, err := t.dialRaw(ctx, network, host, port)
 		if err != nil {
 			lastErr = err
 			if !isTransientDialErr(err) {
@@ -521,6 +530,11 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 			// WrapConn already prefixes "tls handshake:"; don't double-wrap.
 			// The underlying detail (e.g. "read server hello record: i/o
 			// timeout") is what makes proxy failures diagnosable, so keep it.
+			//
+			// The proxy is charged for this. A tunnel that comes up and then
+			// carries nothing is a dead proxy as far as the run is concerned,
+			// and it used to be scored as a success — see MarkSuccess.
+			t.scoreProxy(entry, false)
 			lastErr = err
 			if !isTransientDialErr(err) {
 				return nil, lastErr
@@ -528,6 +542,7 @@ func (t *Transport) dialTLS(ctx context.Context, network, addr string, alpn []st
 			continue
 		}
 
+		t.scoreProxy(entry, true)
 		t.connCount.Add(1)
 		return tlsConn, nil
 	}
@@ -622,10 +637,18 @@ func secureRandIntn(n int) int {
 // proxyDialAttempts times against different rotator entries before giving up.
 // This keeps a few dead members of a large proxy list from translating into
 // per-request failures.
+//
 // The second return value identifies the egress the connection left from — the
 // proxy's redacted URL, or "" for a direct dial. It exists so the TLS layer can
 // scope its session cache to the route: see sessionScope.
-func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (net.Conn, string, error) {
+//
+// The third is the rotator entry the connection left through, or nil for a
+// direct dial or a plain proxyFunc. A successful tunnel is deliberately NOT
+// scored here: CONNECT returning 200 says the proxy is reachable, not that
+// anything can be carried over it. The caller scores it once it knows —
+// immediately on the cleartext path, after the handshake on the TLS one. See
+// ProxyRotator.MarkSuccess and Transport.scoreProxy.
+func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (net.Conn, string, *proxyEntry, error) {
 	t.proxyMu.RLock()
 	proxyFunc := t.proxyFunc
 	rotator := t.proxyRotator
@@ -648,13 +671,12 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 			}
 			conn, err := t.dialViaProxy(ctx, network, targetAddr, proxyURL)
 			if err == nil {
-				rotator.MarkSuccess(entry)
-				return conn, proxyURL.Redacted(), nil
+				return conn, proxyURL.Redacted(), entry, nil
 			}
 			rotator.MarkFailure(entry)
 			lastErr = err
 			if ctx.Err() != nil {
-				return nil, "", ctx.Err()
+				return nil, "", nil, ctx.Err()
 			}
 		}
 		// A configured rotator MUST NOT silently fall through to a direct
@@ -662,21 +684,21 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 		// Surface the failure (or an explicit "no proxies" error if the rotator
 		// is empty) instead of leaking the client's real IP.
 		if lastErr != nil {
-			return nil, "", lastErr
+			return nil, "", nil, lastErr
 		}
-		return nil, "", fmt.Errorf("proxy rotator: no usable proxies")
+		return nil, "", nil, fmt.Errorf("proxy rotator: no usable proxies")
 	} else if proxyFunc != nil {
 		dummyReq := &http.Request{URL: &url.URL{Scheme: "https", Host: targetAddr}}
 		proxyURL, err := proxyFunc(dummyReq)
 		if err != nil {
-			return nil, "", fmt.Errorf("proxy func: %w", err)
+			return nil, "", nil, fmt.Errorf("proxy func: %w", err)
 		}
 		if proxyURL != nil {
 			conn, err := t.dialViaProxy(ctx, network, targetAddr, proxyURL)
 			if err != nil {
-				return nil, "", err
+				return nil, "", nil, err
 			}
-			return conn, proxyURL.Redacted(), nil
+			return conn, proxyURL.Redacted(), nil, nil
 		}
 	}
 
@@ -693,9 +715,32 @@ func (t *Transport) dialRaw(ctx context.Context, network, host, port string) (ne
 
 	conn, err := t.dialer.DialContext(ctx, network, dialAddr)
 	if err != nil {
-		return nil, "", fmt.Errorf("dial tcp: %w", err)
+		return nil, "", nil, fmt.Errorf("dial tcp: %w", err)
 	}
-	return conn, "", nil
+	return conn, "", nil, nil
+}
+
+// scoreProxy reports back what became of a connection dialRaw handed out, so a
+// proxy is credited for connections that carried something and benched for the
+// ones that did not.
+//
+// A nil entry — a direct dial, or a plain proxyFunc with no health tracking —
+// is a no-op, which is what makes it safe to call on every path.
+func (t *Transport) scoreProxy(e *proxyEntry, ok bool) {
+	if e == nil {
+		return
+	}
+	t.proxyMu.RLock()
+	rotator := t.proxyRotator
+	t.proxyMu.RUnlock()
+	if rotator == nil {
+		return
+	}
+	if ok {
+		rotator.MarkSuccess(e)
+		return
+	}
+	rotator.MarkFailure(e)
 }
 
 // dialViaProxy connects through a proxy. Supports HTTP CONNECT, HTTPS CONNECT
@@ -1222,8 +1267,12 @@ func (t *Transport) dialPreconnect(ctx context.Context, addr string, isTLS bool)
 	if err != nil {
 		return nil, err
 	}
-	conn, _, err := t.dialRaw(ctx, "tcp", host, port)
-	return conn, err
+	conn, _, entry, err := t.dialRaw(ctx, "tcp", host, port)
+	if err != nil {
+		return nil, err
+	}
+	t.scoreProxy(entry, true)
+	return conn, nil
 }
 
 // CloseIdleConnections closes all idle connections.
