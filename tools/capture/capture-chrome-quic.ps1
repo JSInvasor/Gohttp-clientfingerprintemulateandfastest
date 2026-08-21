@@ -486,50 +486,54 @@ function Read-NetLog {
 
     $sr = $null
     try {
-        # The constants block has to come out before any event can be named,
-        # because an event carries only a numeric type id.
+        # An event carries its type only as a number, so the logEventTypes map
+        # has to be read before any of them can be named.
         #
-        # It is NOT safe to look for a line that begins with "events": Chrome
-        # writes the whole constants object and the opening of the events array
-        # on one line, so a line-oriented search walks past it and swallows the
-        # entire log. Read a bounded prefix and cut on the substring instead.
+        # Cutting the constants object out of the text and parsing it as JSON
+        # does not work, and the first attempt at it failed in a way worth
+        # recording: "events" also occurs as a key INSIDE constants, so the cut
+        # landed mid-object and the parse died on a truncated one. Chrome also
+        # writes constants and the opening of the events array on a single line,
+        # so a line-oriented search is no better.
+        #
+        # logEventTypes is a flat name->number map. Read just that block and
+        # take the pairs out of it directly; nothing else in constants matters.
         $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
-        $cap = 32MB
+        $cap = 8MB
         if ($fs.Length -lt $cap) { $cap = [int]$fs.Length }
         $buf = New-Object byte[] $cap
         $got = $fs.Read($buf, 0, $cap)
         $fs.Close()
         $head = [System.Text.Encoding]::UTF8.GetString($buf, 0, $got)
 
-        $cut = $head.IndexOf('"events"')
-        if ($cut -lt 0) {
-            $res.Note = 'net-log icinde "events" bulunamadi (dosya bos ya da kirpilmis)'
+        $m = [regex]::Match($head, '"logEventTypes"\s*:\s*\{')
+        if (-not $m.Success) {
+            $res.Note = 'net-log icinde logEventTypes bulunamadi'
             return $res
         }
-        $json = $head.Substring(0, $cut).TrimEnd().TrimEnd(',')
-        if (-not $json.EndsWith('}')) { $json = $json + '}' }
-
-        $constants = $null
-        try { $constants = (ConvertFrom-Json $json).constants } catch {
-            $res.Note = "net-log sabitleri cozulemedi: $($_.Exception.Message)"
+        $from = $m.Index + $m.Length
+        $to = $head.IndexOf('}', $from)
+        if ($to -lt 0) {
+            $res.Note = 'logEventTypes blogu on-parca icinde kapanmiyor'
             return $res
         }
-        if (-not $constants -or -not $constants.logEventTypes) {
-            $res.Note = 'net-log sabitleri okundu ama logEventTypes yok'
-            return $res
-        }
-
-        # Events are one per line from here on, so the rest streams. The
-        # constants line itself will not parse as a single event and is skipped.
-        $sr = New-Object System.IO.StreamReader($Path)
+        $block = $head.Substring($from, $to - $from)
 
         $idToName = @{}
         $wantIds  = @{}
-        foreach ($prop in $constants.logEventTypes.PSObject.Properties) {
-            $id = [int]$prop.Value
-            $idToName[$id] = $prop.Name
-            if ($script:WantedNetLog -contains $prop.Name) { $wantIds[$id] = $true }
+        foreach ($mm in [regex]::Matches($block, '"([A-Za-z0-9_]+)"\s*:\s*(\d+)')) {
+            $id = [int]$mm.Groups[2].Value
+            $idToName[$id] = $mm.Groups[1].Value
+            if ($script:WantedNetLog -contains $mm.Groups[1].Value) { $wantIds[$id] = $true }
         }
+        if ($idToName.Count -eq 0) {
+            $res.Note = 'logEventTypes okundu ama icinde isim/sayi cifti yok'
+            return $res
+        }
+
+        # Events are one per line from here on. The constants line will not
+        # parse as a single event object and drops out on its own.
+        $sr = New-Object System.IO.StreamReader($Path)
 
         $kept = 0
         while ($null -ne ($line = $sr.ReadLine())) {

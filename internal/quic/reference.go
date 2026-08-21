@@ -84,8 +84,16 @@ type Reference struct {
 	// whose value is a varint. A map because the order is shuffled.
 	TransportParams map[uint64]uint64
 
-	// ConnectionOptions is Google's 0x3128 parameter, four ASCII bytes.
+	// ConnectionOptions is Google's 0x3128 parameter, an ASCII tag list. Its
+	// value is per-origin rather than per-client: "ORIG" to the Cloudflare
+	// hosts captured, "ORIGECCP" to Google's. Only its presence and its shape
+	// generalise; the exact tags do not, so this is checked per capture.
 	ConnectionOptions string
+
+	// Resumed marks a profile taken from a repeat connection rather than a
+	// fresh one. The two are genuinely different on the wire and neither is a
+	// superset of the other in the way that matters for a fingerprint.
+	Resumed bool
 
 	// ChosenVersion is the first field of version_information (0x11). The rest
 	// of that parameter is the available-versions list, which holds QUIC v1 and
@@ -181,5 +189,74 @@ var Chrome151QUIC = Reference{
 	},
 
 	ConnectionOptions: "ORIG",
+	ChosenVersion:     Version1,
+}
+
+// Chrome151QUICResumed is the same Chrome reconnecting to a host it has spoken
+// to before — here www.google.com — and it is a distinct profile, not a variant.
+//
+// Three things change and they change together, so producing one without the
+// others is its own signal:
+//
+//   - The Initial header carries a token, replayed from a NEW_TOKEN frame the
+//     server issued on the earlier connection. TokenLen is what this capture
+//     held; the length is the server's choice, so a checker should require a
+//     non-empty token rather than this exact number.
+//   - The ClientHello gains pre_shared_key and early_data, taking it from
+//     eleven extensions to thirteen and moving JA4's a-part and c-part.
+//   - early_data means Chrome offers 0-RTT. internal/ctls has the scaffolding
+//     for the receiving half already (see ticket.go's allowEarly) and none of
+//     the sending half; this is the measurement that says the sending half is
+//     needed rather than optional.
+//
+// Everything below the hello is unchanged: same ciphers, groups, key shares,
+// signature algorithms, same 1250-byte datagram.
+var Chrome151QUICResumed = Reference{
+	Device:  "Chrome 151.0.7922.77, Windows 10 (19045), AMD64",
+	Target:  "www.google.com",
+	Resumed: true,
+
+	JA4: "q13d0313h3_55b375c5d22e_226f3f127bbe",
+	JA4R: "q13d0313h3_" +
+		"1301,1302,1303_" +
+		"000a,000d,001b,0029,002a,002b,002d,0033,0039,44cd,fe0d_" +
+		"0403,0804,0401,0503,0805,0501,0806,0601,0201",
+
+	Ciphers:   []uint16{0x1301, 0x1302, 0x1303},
+	Groups:    []uint16{0x11ec, 0x001d, 0x0017, 0x0018},
+	KeyShares: []uint16{0x11ec, 0x001d},
+	SigAlgs: []uint16{
+		0x0403, 0x0804, 0x0401, 0x0503, 0x0805,
+		0x0501, 0x0806, 0x0601, 0x0201,
+	},
+	TLSVersions: []uint16{0x0304},
+
+	// The fresh set plus pre_shared_key (0x0029) and early_data (0x002a).
+	ExtensionSet: []uint16{
+		0x0000, 0x000a, 0x000d, 0x0010, 0x001b, 0x0029, 0x002a,
+		0x002b, 0x002d, 0x0033, 0x0039, 0x44cd, 0xfe0d,
+	},
+
+	SessionIDLen: 0,
+	ALPN:         []string{"h3"},
+
+	DCIDLen:      8,
+	SCIDLen:      0,
+	TokenLen:     70,
+	DatagramSize: 1250,
+
+	TransportParams: map[uint64]uint64{
+		TPMaxIdleTimeout:                 30000,
+		TPMaxUDPPayloadSize:              1472,
+		TPInitialMaxData:                 15728640,
+		TPInitialMaxStreamDataBidiLocal:  6291456,
+		TPInitialMaxStreamDataBidiRemote: 6291456,
+		TPInitialMaxStreamDataUni:        6291456,
+		TPInitialMaxStreamsBidi:          100,
+		TPInitialMaxStreamsUni:           103,
+		TPMaxDatagramFrameSize:           65536,
+	},
+
+	ConnectionOptions: "ORIGECCP",
 	ChosenVersion:     Version1,
 }
