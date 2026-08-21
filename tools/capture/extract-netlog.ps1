@@ -3,7 +3,7 @@
     extract-netlog.ps1 - Chrome net-log'undan HTTP/3 ve QUIC olaylarini cikarir.
 
     Zaten diskinde duran bir netlog.json uzerinde calisir; yeniden yakalama
-    GEREKMEZ.
+    GEREKMEZ. Yonetici hakki da gerekmez.
 
         .\extract-netlog.ps1
         .\extract-netlog.ps1 -Path 'C:\Users\HP\Desktop\quic-capture\netlog.json'
@@ -17,13 +17,16 @@
       - QUIC_SESSION_TRANSPORT_PARAMETERS_SENT / RECEIVED
       - QUIC_SESSION_VERSION_NEGOTIATED
 
-    Neden ayri bir script
-      Bir net-log olayi turunu sadece SAYI olarak tasir; adi dosyanin basindaki
-      "constants" blogundaki logEventTypes haritasindan cozulur. Bu blogu
-      metinden kesip JSON olarak ayristirmak kirilgan cikti: constants icinde
-      baska yerlerde de "events" gecen anahtarlar var ve kesme yanlis yerden
-      oluyordu. Burada sadece logEventTypes haritasi okunuyor - o duz bir
-      isim->sayi eslemesi, ve regex ile guvenle alinabiliyor.
+    Iki varsayimdan da vazgecildi
+      Bir onceki surum iki sey varsayiyordu ve ikisi de tutmadi: constants
+      blogunu metinden kesip JSON olarak ayristirmak (icinde baska "events"
+      anahtarlari var, kesme yanlis yere dusuyor) ve olaylarin satir basina bir
+      tane yazildigi (dosyanin tamami tek satir olabiliyor).
+
+      Bu surum satir yapisina hic bakmiyor: events dizisini bulup icindeki JSON
+      nesnelerini suslu parantez derinligiyle sayarak ayiriyor. Bir sey yine de
+      eslesmezse SEBEBI ciktinin basina yaziyor - hangi asamada, kac tanimla,
+      hangi isimler bulunamadi.
 #>
 
 [CmdletBinding()]
@@ -58,118 +61,197 @@ $wanted = @(
     'QUIC_SESSION_VERSION_NEGOTIATED'
 )
 
+$diag = New-Object System.Collections.ArrayList
+function D { param([string]$m) [void]$diag.Add($m); Write-Host "    $m" -ForegroundColor Gray }
+
 Write-Host ''
-Write-Host "  netlog : $Path" -ForegroundColor Gray
-Write-Host ("  boyut  : {0:N0} byte" -f (Get-Item $Path).Length) -ForegroundColor Gray
+Write-Host "  netlog : $Path" -ForegroundColor Cyan
+Write-Host '  (buyuk bir dosyada yarim dakika surebilir)' -ForegroundColor DarkGray
+$size = (Get-Item $Path).Length
+D ("dosya boyutu    : {0:N0} byte" -f $size)
 
-# --- 1. logEventTypes haritasi -------------------------------------------
+$text = [IO.File]::ReadAllText($Path)
+D ("okunan karakter : {0:N0}" -f $text.Length)
+D ("satir sayisi    : {0:N0}" -f ($text.Split("`n").Count))
+
+# --- 1. logEventTypes -----------------------------------------------------
 #
-# Dosyanin basindan sinirli bir on-parca okunur. logEventTypes duz bir
-# "AD":sayi eslemesidir, o yuzden acilis suslu parantezinden sonraki ilk
-# kapanisa kadar olan blok yeterli.
+# Duz bir "AD":sayi eslemesi. Sadece bu lazim; constants'in geri kalani hic
+# ayristirilmiyor.
 
-$fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
-$cap = 8MB
-if ($fs.Length -lt $cap) { $cap = [int]$fs.Length }
-$buf = New-Object byte[] $cap
-$got = $fs.Read($buf, 0, $cap)
-$fs.Close()
-$head = [System.Text.Encoding]::UTF8.GetString($buf, 0, $got)
-
-$m = [regex]::Match($head, '"logEventTypes"\s*:\s*\{')
+$m = [regex]::Match($text, '"logEventTypes"\s*:\s*\{')
 if (-not $m.Success) {
-    Write-Host '  x logEventTypes bulunamadi - dosya bir net-log gibi gorunmuyor.' -ForegroundColor Red
+    D 'x logEventTypes bulunamadi - bu dosya bir net-log gibi gorunmuyor'
+    [IO.File]::WriteAllText($Out, ($diag -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
     exit 1
 }
-$start = $m.Index + $m.Length
-$close = $head.IndexOf('}', $start)
+$from  = $m.Index + $m.Length
+$close = $text.IndexOf('}', $from)
 if ($close -lt 0) {
-    Write-Host '  x logEventTypes blogu kapanmadan on-parca bitti.' -ForegroundColor Red
+    D 'x logEventTypes blogu kapanmiyor'
+    [IO.File]::WriteAllText($Out, ($diag -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
     exit 1
 }
-$block = $head.Substring($start, $close - $start)
+$block = $text.Substring($from, $close - $from)
 
 $idToName = @{}
-$wantIds  = @{}
+$nameToId = @{}
 foreach ($mm in [regex]::Matches($block, '"([A-Za-z0-9_]+)"\s*:\s*(\d+)')) {
     $nm = $mm.Groups[1].Value
     $id = [int]$mm.Groups[2].Value
     $idToName[$id] = $nm
-    if ($wanted -contains $nm) { $wantIds[$id] = $true }
+    $nameToId[$nm] = $id
 }
-Write-Host ("  olay turu tanimi: {0}, aradigimiz: {1}" -f $idToName.Count, $wantIds.Count) -ForegroundColor Gray
+D ("olay turu tanimi: {0}" -f $idToName.Count)
 
-if ($wantIds.Count -eq 0) {
-    Write-Host '  ! Aradigimiz olay turlerinin hicbiri bu Chrome surumunde tanimli degil.' -ForegroundColor Yellow
-    Write-Host '    HTTP3_ ile baslayan tum turler yazilacak.' -ForegroundColor Yellow
-    foreach ($k in $idToName.Keys) {
-        if ($idToName[$k] -like 'HTTP3_*' -or $idToName[$k] -like 'QUIC_SESSION_TRANSPORT*') {
-            $wantIds[$k] = $true
-        }
+$wantIds = @{}
+$missing = New-Object System.Collections.ArrayList
+foreach ($w in $wanted) {
+    if ($nameToId.ContainsKey($w)) { $wantIds[$nameToId[$w]] = $true }
+    else { [void]$missing.Add($w) }
+}
+D ("aradigimiz tur  : {0} bulundu, {1} bulunamadi" -f $wantIds.Count, $missing.Count)
+if ($missing.Count -gt 0) { D ("bulunamayanlar  : " + ($missing -join ', ')) }
+
+# Bu Chrome'da gercekten hangi H3/QUIC turleri tanimli - isim degistiyse
+# gorulsun diye her halukarda yaziliyor.
+$h3Names = @()
+foreach ($k in $nameToId.Keys) {
+    if ($k -like 'HTTP3_*' -or $k -like 'QUIC_SESSION_TRANSPORT*' -or $k -like '*VERSION_NEGOTIATED*') {
+        $h3Names += $k
     }
 }
+$h3Names = $h3Names | Sort-Object
+D ("tanimli H3/QUIC : {0} tur" -f $h3Names.Count)
 
-# --- 2. olaylar ------------------------------------------------------------
-#
-# Buradan sonrasi satir basina bir olay. constants satirinin kendisi tek bir
-# olay olarak ayristirilamayacagi icin dogal olarak eleniyor.
+# Aradiklarimiz yoksa tanimli olan her H3 turunu al.
+if ($wantIds.Count -eq 0) {
+    D '! aradigimiz isimlerin hicbiri yok - tanimli tum H3/QUIC turleri alinacak'
+    foreach ($n in $h3Names) { $wantIds[$nameToId[$n]] = $true }
+}
+
+# --- 2. events dizisi -----------------------------------------------------
+
+$ev = [regex]::Match($text, '"events"\s*:\s*\[')
+if (-not $ev.Success) {
+    D 'x "events": [ bulunamadi'
+    [IO.File]::WriteAllText($Out, ($diag -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+    exit 1
+}
+$evStart = $ev.Index + $ev.Length
+D ("events dizisi   : karakter {0}" -f $evStart)
+
+# Nesneleri suslu parantez derinligiyle ayir. Satir yapisina bakilmiyor.
+# IndexOfAny ile yapisal karakterler arasinda atlanarak ilerleniyor, yoksa
+# 12 MB'lik bir dosyada karakter karakter dolasmak dakikalar surerdi.
+$structural = [char[]]@('{', '}', '"')
+$i = $evStart
+$depth = 0
+$objStart = -1
+$seen = 0
+$kept = 0
+$counts = @{}
+$allCounts = @{}
 
 $sb = New-Object System.Text.StringBuilder
-[void]$sb.AppendLine('######################################################################')
-[void]$sb.AppendLine('#  net-log: HTTP/3 SETTINGS, header sirasi, transport parameters')
-[void]$sb.AppendLine("#  $Path")
-[void]$sb.AppendLine('######################################################################')
-[void]$sb.AppendLine('')
 
-$counts = @{}
-$kept = 0
-$sr = New-Object System.IO.StreamReader($Path)
-try {
-    while ($null -ne ($line = $sr.ReadLine())) {
-        if ($kept -ge $Max) { break }
-        if ($line -notmatch '"type":\s*(\d+)') { continue }
-        $tid = [int]$Matches[1]
-        if (-not $wantIds.ContainsKey($tid)) { continue }
+while ($i -lt $text.Length) {
+    $j = $text.IndexOfAny($structural, $i)
+    if ($j -lt 0) { break }
+    $c = $text[$j]
 
-        $t = $line.Trim().TrimEnd(',')
-        if (-not $t.StartsWith('{')) { continue }
-        $ev = $null
-        try { $ev = ConvertFrom-Json $t } catch { continue }
-
-        $name = $idToName[$tid]
-        if ($counts.ContainsKey($name)) { $counts[$name]++ } else { $counts[$name] = 1 }
-
-        $src = ''
-        if ($ev.source) { $src = $ev.source.id }
-        $pj = ''
-        if ($null -ne $ev.params) {
-            try { $pj = ($ev.params | ConvertTo-Json -Depth 10 -Compress) } catch { $pj = '<?>' }
+    if ($c -eq '"') {
+        # Dizeyi atla. Kacisli tirnak, onundeki ters bolu sayisi tek ise gercek
+        # bir kacistir; cift ise ters bolunun kendisi kacilmistir.
+        $k = $j + 1
+        while ($true) {
+            $q = $text.IndexOf('"', $k)
+            if ($q -lt 0) { $k = $text.Length; break }
+            $b = 0
+            $z = $q - 1
+            while ($z -ge 0 -and $text[$z] -eq '\') { $b++; $z-- }
+            if ($b % 2 -eq 0) { $k = $q; break }
+            $k = $q + 1
         }
-        if ($pj.Length -gt 6000) { $pj = $pj.Substring(0, 6000) + ' ...[kirpildi]' }
-
-        [void]$sb.AppendLine(("[{0}]  src={1}  phase={2}" -f $name, $src, $ev.phase))
-        if ($pj) { [void]$sb.AppendLine('    ' + $pj) }
-        $kept++
+        $i = $k + 1
+        continue
     }
-} finally {
-    $sr.Dispose()
+
+    if ($c -eq '{') {
+        if ($depth -eq 0) { $objStart = $j }
+        $depth++
+        $i = $j + 1
+        continue
+    }
+
+    # '}'
+    $depth--
+    if ($depth -le 0) {
+        if ($objStart -ge 0) {
+            $obj = $text.Substring($objStart, $j - $objStart + 1)
+            $seen++
+            if ($obj -match '"type"\s*:\s*(\d+)') {
+                $tid = [int]$Matches[1]
+                $nm = 'type_' + $tid
+                if ($idToName.ContainsKey($tid)) { $nm = $idToName[$tid] }
+                if ($allCounts.ContainsKey($nm)) { $allCounts[$nm]++ } else { $allCounts[$nm] = 1 }
+
+                if ($wantIds.ContainsKey($tid) -and $kept -lt $Max) {
+                    if ($counts.ContainsKey($nm)) { $counts[$nm]++ } else { $counts[$nm] = 1 }
+                    $src = ''
+                    if ($obj -match '"source"\s*:\s*\{[^}]*"id"\s*:\s*(\d+)') { $src = $Matches[1] }
+                    $body = $obj
+                    if ($body.Length -gt 6000) { $body = $body.Substring(0, 6000) + ' ...[kirpildi]' }
+                    [void]$sb.AppendLine("[$nm]  src=$src")
+                    [void]$sb.AppendLine('    ' + $body)
+                    $kept++
+                }
+            }
+            $objStart = -1
+        }
+        $depth = 0
+    }
+    $i = $j + 1
 }
 
-[void]$sb.AppendLine('')
-[void]$sb.AppendLine('== ozet =============================================================')
-[void]$sb.AppendLine('')
-foreach ($k in ($counts.Keys | Sort-Object)) {
-    [void]$sb.AppendLine(('{0,-46} {1}' -f $k, $counts[$k]))
+D ("gorulen nesne   : {0}" -f $seen)
+D ("alinan olay     : {0}" -f $kept)
+
+# --- 3. yaz ---------------------------------------------------------------
+
+$head = New-Object System.Text.StringBuilder
+[void]$head.AppendLine('######################################################################')
+[void]$head.AppendLine('#  net-log: HTTP/3 SETTINGS, header sirasi, transport parameters')
+[void]$head.AppendLine("#  $Path")
+[void]$head.AppendLine('######################################################################')
+[void]$head.AppendLine('')
+[void]$head.AppendLine('== tani =============================================================')
+[void]$head.AppendLine('')
+foreach ($d in $diag) { [void]$head.AppendLine($d) }
+
+[void]$head.AppendLine('')
+[void]$head.AppendLine('tanimli H3/QUIC olay turleri:')
+foreach ($n in $h3Names) { [void]$head.AppendLine('  ' + $n) }
+
+[void]$head.AppendLine('')
+[void]$head.AppendLine('== dosyada gercekten gorulen olay turleri (ilk 40) ===================')
+[void]$head.AppendLine('')
+$top = $allCounts.GetEnumerator() | Sort-Object -Property Value -Descending | Select-Object -First 40
+foreach ($e in $top) { [void]$head.AppendLine(('{0,-52} {1}' -f $e.Key, $e.Value)) }
+
+[void]$head.AppendLine('')
+[void]$head.AppendLine('== aradigimiz olaylar ===============================================')
+[void]$head.AppendLine('')
+if ($kept -eq 0) {
+    [void]$head.AppendLine('(hicbiri eslesmedi - yukaridaki tani ve tur listesi sebebi soyluyor)')
 }
 
-[IO.File]::WriteAllText($Out, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+[IO.File]::WriteAllText($Out, ($head.ToString() + $sb.ToString()),
+    (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Host ''
 foreach ($k in ($counts.Keys | Sort-Object)) {
     Write-Host ("    {0,-46} {1}" -f $k, $counts[$k]) -ForegroundColor Green
-}
-if ($kept -eq 0) {
-    Write-Host '    (hicbir olay eslesmedi)' -ForegroundColor Yellow
 }
 Write-Host ''
 Write-Host '  Bana gonder:' -ForegroundColor Magenta
