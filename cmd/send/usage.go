@@ -203,10 +203,11 @@ func printUsage(w io.Writer) {
 -no-redirect          do not follow redirects
 -max-streams int      HTTP/2 streams per connection before it is cycled. A long
                       monotonic stream-id sequence is its own passive signal
--tls int              open this many TLS connections per session up front and
+-tls                  open as many TLS connections per session up front as this
+                      machine's fd limit allows (shared across -s sessions) and
                       run over them — the connection count as its own dial,
-                      apart from -c threads. HTTP/2 multiplexes across them;
-                      -http1 holds the pool at N and reuses them
+                      apart from -c threads. -tls=N pins an exact count. HTTP/2
+                      multiplexes across them; -http1 holds and reuses them
 -tls-resume           offer a cached TLS 1.3 ticket on repeat connections, as a
                       browser does. Off by default: the PSK moves JA4 to
                       t13d1517h2, so connections after the first differ`))

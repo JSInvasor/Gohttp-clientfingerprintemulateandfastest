@@ -11,11 +11,11 @@ import (
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
 )
 
-// -tls is the connection count as its own dial. It has to reach o.tlsConns
-// without disturbing the load-shape dials it sits beside — a run that meant
-// -c 100 and got 100 connections instead of 100 threads is the wrong shape.
-func TestTLSFlagParses(t *testing.T) {
-	o, target, err := parseFlags([]string{"-tls", "4", "https://site.com", "30s", "100"})
+// -tls=N pins an explicit connection count. It has to reach o.tlsConns without
+// disturbing the load-shape dials it sits beside — a run that meant -c 100 and
+// got 100 connections instead of 100 threads is the wrong shape.
+func TestTLSFlagPinsExplicitCount(t *testing.T) {
+	o, target, err := parseFlags([]string{"-tls=4", "https://site.com", "30s", "100"})
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
 	}
@@ -31,22 +31,47 @@ func TestTLSFlagParses(t *testing.T) {
 	}
 }
 
-// A negative count is nonsense, and the equals form is what reaches the check —
-// `-tls -1` is taken as the flag followed by another flag, the same quirk the
-// positional tests document for a bare negative.
-func TestTLSFlagRejectsNegative(t *testing.T) {
-	_, _, err := parseFlags([]string{"-tls=-1", "https://site.com"})
-	if err == nil {
-		t.Fatal("parseFlags accepted -tls=-1")
+// A bare -tls is the whole point of the flag: no number, "open as many as the
+// machine allows". It must set the auto sentinel and, because it stands alone,
+// must not swallow the URL or the dials that follow it.
+func TestTLSFlagBareMeansAuto(t *testing.T) {
+	o, target, err := parseFlags([]string{"-tls", "https://site.com", "30s", "100"})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
 	}
-	if !strings.Contains(err.Error(), "-tls") {
-		t.Errorf("error %q does not name -tls", err)
+	if target != "https://site.com" {
+		t.Errorf("target = %q, want the URL kept as a positional", target)
+	}
+	if o.tlsConns != tlsConnsAuto {
+		t.Errorf("bare -tls set tlsConns=%d, want auto (%d)", o.tlsConns, tlsConnsAuto)
+	}
+	if o.concurrency != 100 || o.duration != 30*time.Second {
+		t.Errorf("bare -tls swallowed a dial: c=%d t=%s", o.concurrency, o.duration)
+	}
+	// Auto resolves to a real, positive per-session count.
+	if got := o.tlsConnCount(); got < 1 {
+		t.Errorf("auto -tls resolved to %d connections, want >= 1", got)
 	}
 }
 
-// warmConns is the one number the run pre-opens, and it is the larger of the
-// two flags that ask for connections up front — so -tls alone stands up its
-// count, -warmup alone still works, and giving both does not warm twice.
+// -tls=N with a nonsense value is rejected at parse, naming the flag. A bare -tls
+// is the only way to the auto sentinel, so an explicit negative cannot reach it.
+func TestTLSFlagRejectsBadCount(t *testing.T) {
+	for _, bad := range []string{"-tls=-5", "-tls=0", "-tls=abc"} {
+		_, _, err := parseFlags([]string{bad, "https://site.com"})
+		if err == nil {
+			t.Errorf("parseFlags accepted %s", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "-tls") {
+			t.Errorf("%s: error %q does not name -tls", bad, err)
+		}
+	}
+}
+
+// warmConns is the one number the run pre-opens, and it is the larger of the two
+// flags that ask for connections up front — so -tls alone stands up its count,
+// -warmup alone still works, and giving both does not warm twice.
 func TestWarmConns(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -70,8 +95,22 @@ func TestWarmConns(t *testing.T) {
 	}
 }
 
+// A bare -tls shares one file-descriptor budget across the sessions, so more
+// sessions can only lower the per-session count, never raise it, and it never
+// drops below one.
+func TestAutoTLSConnsSharesBudgetAcrossSessions(t *testing.T) {
+	one := (&options{sessions: 1}).autoTLSConns()
+	many := (&options{sessions: 64}).autoTLSConns()
+	if one < 1 || many < 1 {
+		t.Fatalf("auto count fell below 1: one=%d many=%d", one, many)
+	}
+	if many > one {
+		t.Errorf("more sessions raised the per-session count: 1->%d, 64->%d", one, many)
+	}
+}
+
 // The dial has to actually open connections, not just park a number in the
-// options. With -tls N and nothing warming otherwise, the run stands up N TLS
+// options. With -tls=N and nothing warming otherwise, the run stands up N TLS
 // connections per session before the first request — the whole point of the
 // flag. If it were ignored, warmConns would be 0 and nothing would be dialled.
 func TestTLSFlagPreopensConnections(t *testing.T) {

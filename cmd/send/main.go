@@ -202,7 +202,8 @@ type options struct {
 	// tlsConns is the connection count as its own dial: how many TLS
 	// connections each session stands up to the target, apart from -c (how many
 	// requests are in flight). It pre-opens that many and holds the pool to
-	// them — see run and clientOptions. 0 leaves the library's own pooling.
+	// them — see run and clientOptions. 0 leaves the library's own pooling;
+	// tlsConnsAuto (a bare -tls) means "as many as this machine allows".
 	tlsConns  int
 	sockBuf   int
 	fastOpen  bool
@@ -306,6 +307,13 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// A bare -tls resolves to a machine-derived count, so say what it landed on
+	// before opening them — "as many as it can" is easier to reason about once
+	// the run prints the number it actually chose.
+	if o.tlsConns == tlsConnsAuto {
+		fmt.Fprintf(os.Stderr, "-tls: opening up to %d connection(s) per session (this machine's fd budget)\n",
+			o.autoTLSConns())
+	}
 	if warm := o.warmConns(); warm > 0 {
 		pool.warm(ctx, target, warm)
 	}
@@ -329,8 +337,93 @@ func (o *options) singleShot() bool {
 // is the dial the user is setting. They share the one PreConnect, so opening
 // the larger of the two gives each its count without warming twice.
 func (o *options) warmConns() int {
-	return max(o.warmup, o.tlsConns)
+	return max(o.warmup, o.tlsConnCount())
 }
+
+// tlsConnCount resolves -tls to a concrete per-session connection count: 0 when
+// the flag was not given, the explicit N for -tls=N, or the machine-derived
+// budget for a bare -tls.
+func (o *options) tlsConnCount() int {
+	if o.tlsConns == tlsConnsAuto {
+		return o.autoTLSConns()
+	}
+	return o.tlsConns
+}
+
+// autoTLSConns is what a bare -tls opens per session: as many connections as the
+// process's file-descriptor budget allows, split across the -s sessions that
+// share it. A bigger box lifts the ceiling and a small one lowers it — "as many
+// as the VPS allows" rather than a number picked in advance.
+func (o *options) autoTLSConns() int {
+	sessions := o.sessions
+	if sessions < 1 {
+		sessions = 1
+	}
+	per := fdConnBudget() / sessions
+	if per < 1 {
+		per = 1
+	}
+	return per
+}
+
+// tlsConnsAuto is the value a bare -tls (no =N) sets: open as many TLS
+// connections as the machine allows rather than a fixed count. See autoTLSConns.
+const tlsConnsAuto = -1
+
+// Budget knobs for a bare -tls. The count is derived from the file-descriptor
+// soft limit so it tracks the machine, with a slice held back for the sockets
+// the run itself needs — stdio, DNS, and the fds in-flight requests open.
+const (
+	// fdReserve is how many descriptors to keep free for everything that is not
+	// a pre-opened connection.
+	fdReserve = 128
+	// fallbackConnBudget stands in when the fd limit cannot be read (Windows, or
+	// a getrlimit error).
+	fallbackConnBudget = 1024
+	// maxAutoConns caps the auto count however high the fd limit runs: past this
+	// a single host's ephemeral ports run out before its descriptors do.
+	maxAutoConns = 60000
+)
+
+// tlsConnsValue backs -tls as a flag with an optional value: a bare -tls sets
+// tlsConnsAuto ("as many as the machine allows"), while -tls=N pins the count.
+// Reporting IsBoolFlag lets the bare form stand alone without swallowing the URL
+// after it — the same property splitArgs reads to leave positionals in place.
+type tlsConnsValue struct{ n *int }
+
+func (v tlsConnsValue) String() string {
+	if v.n == nil {
+		return ""
+	}
+	switch *v.n {
+	case tlsConnsAuto:
+		return "auto"
+	case 0:
+		return "off"
+	default:
+		return strconv.Itoa(*v.n)
+	}
+}
+
+func (v tlsConnsValue) Set(s string) error {
+	// A bare -tls arrives as "true" because IsBoolFlag reports true; an explicit
+	// -tls=N arrives as the number.
+	if s == "" || s == "true" {
+		*v.n = tlsConnsAuto
+		return nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return fmt.Errorf("-tls: %q is not a number (use a bare -tls, or -tls=N)", s)
+	}
+	if n < 1 {
+		return fmt.Errorf("-tls=%d is not a positive count (use a bare -tls to open as many as the machine allows)", n)
+	}
+	*v.n = n
+	return nil
+}
+
+func (tlsConnsValue) IsBoolFlag() bool { return true }
 
 // newFlagSet declares every flag send accepts.
 //
@@ -406,7 +499,7 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.IntVar(&o.idleConns, "idle-conns", 0, "")
 	fs.IntVar(&o.idlePerHost, "idle-per-host", 0, "")
 	fs.IntVar(&o.connsPerHost, "conns-per-host", 0, "")
-	fs.IntVar(&o.tlsConns, "tls", 0, "")
+	fs.Var(tlsConnsValue{n: &o.tlsConns}, "tls", "")
 	fs.IntVar(&o.sockBuf, "sockbuf", 0, "")
 	fs.BoolVar(&o.fastOpen, "tfo", false, "")
 	fs.BoolVar(&o.tlsResume, "tls-resume", false, "")
@@ -499,9 +592,6 @@ func (o *options) normalize() error {
 	}
 	if o.rate < 0 {
 		return fmt.Errorf("-rate cannot be negative, got %d", o.rate)
-	}
-	if o.tlsConns < 0 {
-		return fmt.Errorf("-tls cannot be negative, got %d", o.tlsConns)
 	}
 
 	// A list wins at dial time — setProxyRotator replaces the proxy function
