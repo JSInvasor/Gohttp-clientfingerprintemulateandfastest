@@ -38,7 +38,18 @@ type rawConn struct {
 	rcvdControlStr      atomic.Bool
 	rcvdQPACKEncoderStr atomic.Bool
 	rcvdQPACKDecoderStr atomic.Bool
-	controlStrHandler   func(*quic.ReceiveStream, *frameParser) // is called *after* the SETTINGS frame was parsed
+
+	// FORK DELTA: where the peer's two QPACK streams are fed.
+	//
+	// Upstream discards both, because its QPACK has no dynamic table and an
+	// insertion means nothing to it. This one has a table, so the peer's
+	// encoder stream is what fills it and the peer's decoder stream is what
+	// says which of this endpoint's insertions may be evicted. Both are set by
+	// the client before the accept loop starts; nil keeps upstream's behaviour,
+	// which is what the server path gets.
+	qpackEncoderSink  io.Writer
+	qpackDecoderSink  io.Writer
+	controlStrHandler func(*quic.ReceiveStream, *frameParser) // is called *after* the SETTINGS frame was parsed
 
 	onStreamsEmpty func()
 
@@ -89,7 +100,23 @@ func (c *rawConn) openControlStream(settings *settingsFrame) (*quic.SendStream, 
 	}
 	b := make([]byte, 0, 64)
 	b = quicvarint.Append(b, streamTypeControlStream)
-	b = settings.Append(b)
+	// FORK DELTA: on the client, the whole control stream preamble is Chrome's.
+	//
+	// Upstream's SETTINGS carry a Go map, so their order is randomised per
+	// connection; Chrome's does not move. And upstream stops after SETTINGS,
+	// where Chrome sends a reserved frame and a PRIORITY_UPDATE. Both of those
+	// are ignorable by any peer, so nothing ever fails for want of them, which
+	// is exactly why they are easy to leave out and worth putting in.
+	//
+	// See chrome_h3.go, which holds all of it, and internal/quic/http3.go for
+	// what it is measured against. The server path keeps upstream's encoder: a
+	// server here has no fingerprint to emulate.
+	if settings.chrome {
+		b = appendChromeSettings(b)
+		b = appendControlStreamTail(b)
+	} else {
+		b = settings.Append(b)
+	}
 	if c.qlogger != nil {
 		sf := qlog.SettingsFrame{
 			MaxFieldSectionSize: settings.MaxFieldSectionSize,
@@ -173,13 +200,19 @@ func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer b
 		if isFirst := c.rcvdQPACKEncoderStr.CompareAndSwap(false, true); !isFirst {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK encoder stream")
 		}
-		// Our QPACK implementation doesn't use the dynamic table yet.
+		// FORK DELTA: read it. Upstream's comment here said its QPACK does not
+		// use the dynamic table; this one does, and these are the insertions
+		// every dynamic reference in a response resolves against.
+		c.pumpQPACKStream(str, c.qpackEncoderSink)
 		return
 	case streamTypeQPACKDecoderStream:
 		if isFirst := c.rcvdQPACKDecoderStr.CompareAndSwap(false, true); !isFirst {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK decoder stream")
 		}
-		// Our QPACK implementation doesn't use the dynamic table yet.
+		// FORK DELTA: read it. This is the peer saying how far it has got
+		// through this endpoint's insertions, which is the only thing that ever
+		// releases an entry for eviction.
+		c.pumpQPACKStream(str, c.qpackDecoderSink)
 		return
 	case streamTypePushStream:
 		if isServer {
@@ -200,6 +233,27 @@ func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer b
 		return
 	}
 	c.handleControlStream(str)
+}
+
+// pumpQPACKStream copies one of the peer's QPACK streams into its handler until
+// the stream ends or the handler rejects what it is given.
+//
+// FORK DELTA. A malformed instruction is a connection error (RFC 9204 section
+// 2.2), not something to skip: everything after it would be indexed against a
+// table that had diverged, so carrying on would decode responses into
+// plausible-looking wrong headers rather than failing.
+func (c *rawConn) pumpQPACKStream(str *quic.ReceiveStream, sink io.Writer) {
+	if sink == nil {
+		// No dynamic table on this side, so an insertion means nothing. Upstream
+		// returns here too.
+		return
+	}
+	if _, err := io.Copy(sink, str); err != nil {
+		if c.logger != nil {
+			c.logger.Debug("QPACK stream failed", "stream ID", str.StreamID(), "error", err)
+		}
+		c.CloseWithError(quic.ApplicationErrorCode(ErrCodeQPACKDecompressionFailed), "")
+	}
 }
 
 func (c *rawConn) handleControlStream(str *quic.ReceiveStream) {

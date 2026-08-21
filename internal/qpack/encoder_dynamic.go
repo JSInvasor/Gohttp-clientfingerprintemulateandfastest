@@ -119,6 +119,31 @@ func NewEncoderTable(stream io.Writer, maxCapacity, maxBlocked uint64) *EncoderT
 	}
 }
 
+// SetPeerLimits records what the peer advertised in its SETTINGS.
+//
+// It exists because the two ends of a connection learn each other's limits at
+// different times: this endpoint's own limits are known before it says anything,
+// but the peer's arrive in a SETTINGS frame on a stream that opens after the
+// handshake. An encoder built before then has to start with a capacity of zero —
+// which is correct, not a placeholder, since a peer that has said nothing has
+// promised nothing.
+//
+// It has no effect once the capacity has been announced on the encoder stream.
+// Lowering a capacity the peer has already been told about would mean evicting
+// on this side entries the peer still holds, and raising it would exceed what it
+// agreed to; either way the two tables would part company.
+func (t *EncoderTable) SetPeerLimits(maxCapacity, maxBlocked uint64) {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.announced {
+		return
+	}
+	t.maxCapacity = maxCapacity
+	t.maxBlocked = maxBlocked
+}
+
 // DecoderStream returns the writer to feed the peer's decoder stream into.
 //
 // What arrives there is the peer saying how far it has read this endpoint's

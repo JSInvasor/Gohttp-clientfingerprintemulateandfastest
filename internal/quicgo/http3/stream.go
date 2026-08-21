@@ -13,7 +13,7 @@ import (
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/http3/qlog"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/qlogwriter"
 
-	"github.com/quic-go/qpack"
+	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/qpack"
 )
 
 type datagramStream interface {
@@ -345,7 +345,16 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
 		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
 		return nil, fmt.Errorf("http3: failed to read response headers: %w", err)
 	}
-	decodeFn := s.decoder.Decode(headerBlock)
+	// FORK DELTA: DecodeForStream rather than Decode, because the block may
+	// reference dynamic table entries whose insertions are still in flight, and
+	// because the peer needs to hear when this block is done with them. See
+	// chrome_h3.go.
+	decodeFn, err := decodeBlock(s.str.Context(), s.decoder, uint64(s.str.StreamID()), headerBlock)
+	if err != nil {
+		s.str.CancelRead(quic.StreamErrorCode(ErrCodeQPACKDecompressionFailed))
+		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeQPACKDecompressionFailed))
+		return nil, fmt.Errorf("http3: decoding response headers: %w", err)
+	}
 	var hfs []qpack.HeaderField
 	if s.str.qlogger != nil {
 		hfs = make([]qpack.HeaderField, 0, 16)

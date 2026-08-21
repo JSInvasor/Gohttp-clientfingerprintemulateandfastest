@@ -192,6 +192,44 @@ quic-go did not create is one it cannot retransmit. The fragments are real
 `wire.CryptoFrame`s with the packer's own handler, so a lost Initial is
 recovered the way upstream recovers it.
 
+### 5. The HTTP/3 layer
+
+**`http3/chrome_h3.go` (new).** All of it, so the eight files it changes carry a
+few lines each. What differs, measured against `internal/quic/http3.go`:
+
+- **SETTINGS.** Upstream's entries come out of a Go map, so their order is
+  randomised per connection; the profile's does not move. The reserved entry
+  rides along, and its shape is derived rather than guessed: the report gave the
+  frame body as 31 bytes, the four pinned entries account for 15, and the only
+  way to spend the remaining 16 is an eight-byte identifier with an eight-byte
+  value.
+- **What follows SETTINGS.** A reserved frame and then a PRIORITY_UPDATE, before
+  any request. Upstream sends nothing. Both are ignorable by any peer, so
+  nothing ever fails for want of them — which is why they are easy to leave out
+  and worth putting in.
+- **Header order.** Upstream iterates an `http.Header` map, so its order is
+  randomised per request. `Transport.PseudoHeaderOrder` and
+  `Transport.HeaderOrder` name the order, defaulting to the profile's, and the
+  field names match `internal/http2`'s for the same purpose.
+- **QPACK.** The two unidirectional streams are opened right behind the control
+  stream and wired to `internal/qpack`, which has a dynamic table. Upstream
+  opens neither and discards both of the peer's, because its QPACK has no table
+  — which is a correctness problem here, not a fidelity one, since this
+  profile's SETTINGS promise a 64 KiB table. See `internal/qpack/FORK.md`.
+
+The changed files: `client.go` builds the QPACK halves and opens the streams,
+`conn.go` reads the peer's, `frames.go` gains one flag, `request_writer.go`
+collects and orders the fields instead of writing them one at a time,
+`stream.go` and `headers.go` decode through the waiting-and-acknowledging path,
+`transport.go` carries the two order fields, and `server_conn.go` passes a
+context. The server path still runs upstream's SETTINGS encoder and upstream's
+static-only QPACK: a server here has no fingerprint to emulate.
+
+`http3/chrome_h3_test.go` runs a whole HTTP/3 request over a real UDP socket
+against an upstream quic-go server, thirty requests on one connection, and reads
+the header order back off the encoded block — a handler cannot see it, because
+`net/http` gives it a map.
+
 ### Not yet delta'd
 
 ACK policy, pacing and congestion control, as below. Two smaller ones worth

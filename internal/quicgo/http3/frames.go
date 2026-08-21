@@ -167,6 +167,13 @@ const (
 )
 
 type settingsFrame struct {
+	// chrome makes the control stream carry this profile's SETTINGS, in this
+	// profile's order, followed by the frames Chrome sends after them.
+	//
+	// FORK DELTA. The fields below are still read on the receive side; this one
+	// only affects what is written, and only on the client. See chrome_h3.go.
+	chrome bool
+
 	MaxFieldSectionSize int64 // SETTINGS_MAX_FIELD_SECTION_SIZE, -1 if not set
 
 	Datagram        bool              // HTTP Datagrams, RFC 9297

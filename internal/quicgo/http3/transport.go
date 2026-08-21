@@ -64,6 +64,17 @@ func (r *roundTripperWithCount) Close() error {
 
 // Transport implements the http.RoundTripper interface
 type Transport struct {
+	// PseudoHeaderOrder and HeaderOrder specify the order a request's fields go
+	// out in.
+	//
+	// FORK DELTA. Header order is a fingerprint, and upstream's comes out of a
+	// Go map, so it is randomised per request. Leaving both empty gives the
+	// profile's order, which is Chrome's; setting them is for emulating
+	// something that is not a plain fetch. The names match internal/http2's
+	// fields of the same purpose.
+	PseudoHeaderOrder []string
+	HeaderOrder       []string
+
 	// TLSClientConfig specifies the TLS configuration to use with
 	// tls.Client. If nil, the default configuration is used.
 	TLSClientConfig *tls.Config
@@ -134,6 +145,8 @@ func (t *Transport) init() error {
 				t.MaxResponseHeaderBytes,
 				t.DisableCompression,
 				t.Logger,
+				t.PseudoHeaderOrder,
+				t.HeaderOrder,
 			)
 		}
 	}
@@ -439,6 +452,8 @@ func (t *Transport) NewClientConn(conn *quic.Conn) *ClientConn {
 		t.MaxResponseHeaderBytes,
 		t.DisableCompression,
 		t.Logger,
+		t.PseudoHeaderOrder,
+		t.HeaderOrder,
 	)
 	go func() {
 		for {
@@ -465,6 +480,8 @@ func (t *Transport) NewRawClientConn(conn *quic.Conn) *RawClientConn {
 			t.MaxResponseHeaderBytes,
 			t.DisableCompression,
 			t.Logger,
+			t.PseudoHeaderOrder,
+			t.HeaderOrder,
 		),
 	}
 }

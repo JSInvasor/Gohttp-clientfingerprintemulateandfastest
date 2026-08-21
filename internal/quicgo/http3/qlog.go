@@ -5,7 +5,7 @@ import (
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/http3/qlog"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/qlogwriter"
 
-	"github.com/quic-go/qpack"
+	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/qpack"
 )
 
 func maybeQlogInvalidHeadersFrame(qlogger qlogwriter.Recorder, streamID quic.StreamID, l uint64) {

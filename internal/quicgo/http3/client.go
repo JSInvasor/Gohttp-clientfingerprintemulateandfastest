@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/quic-go/qpack"
+	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/qpack"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/http3/qlog"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/qlogwriter"
@@ -53,6 +53,13 @@ type ClientConn struct {
 
 	decoder *qpack.Decoder
 
+	// FORK DELTA: the encoding half of QPACK, and the two streams that keep
+	// this endpoint's dynamic table in step with the peer's. See chrome_h3.go
+	// and internal/qpack/FORK.md.
+	qpackEncoder   *qpack.EncoderTable
+	qpackEncoderWr *uniStreamWriter
+	qpackDecoderWr *uniStreamWriter
+
 	// Additional HTTP/3 settings.
 	// It is invalid to specify any settings defined by RFC 9114 (HTTP/3) and RFC 9297 (HTTP Datagrams).
 	additionalSettings map[uint64]uint64
@@ -87,6 +94,10 @@ func newClientConn(
 	maxResponseHeaderBytes int,
 	disableCompression bool,
 	logger *slog.Logger,
+	// FORK DELTA: the field order for requests on this connection. Empty means
+	// the profile's. See Transport.HeaderOrder.
+	pseudoHeaderOrder []string,
+	headerOrder []string,
 ) *ClientConn {
 	var qlogger qlogwriter.Recorder
 	if qlogTrace := conn.QlogTrace(); qlogTrace != nil && qlogTrace.SupportsSchemas(qlog.EventSchema) {
@@ -100,14 +111,38 @@ func newClientConn(
 		lastStreamID:       invalidStreamID,
 		logger:             logger,
 		qlogger:            qlogger,
-		decoder:            qpack.NewDecoder(),
 	}
+	// FORK DELTA: QPACK gets a dynamic table.
+	//
+	// Not an optimisation. This profile's SETTINGS advertise a 64 KiB table and
+	// 100 blocked streams, and those are promises about what this decoder will
+	// accept: a server that believes them encodes against the table, and
+	// upstream's decoder answers that with an error. The two have to be the same
+	// number in both places, which is why the constants are named rather than
+	// written out here. See internal/qpack/FORK.md.
+	c.qpackEncoderWr = newUniStreamWriter(streamTypeQPACKEncoderStream)
+	c.qpackDecoderWr = newUniStreamWriter(streamTypeQPACKDecoderStream)
+	c.decoder = qpack.NewDecoderWithDynamicTable(qpack.DecoderConfig{
+		MaxTableCapacity:  chromeQPACKMaxTableCapacity,
+		MaxBlockedStreams: chromeQPACKBlockedStreams,
+		DecoderStream:     c.qpackDecoderWr,
+	})
+	// The peer's limits are not known yet — they arrive in its SETTINGS — so the
+	// encoder starts with a capacity of zero and is told in handleControlStream.
+	// Zero is correct rather than a placeholder: a peer that has said nothing has
+	// promised nothing.
+	c.qpackEncoder = qpack.NewEncoderTable(c.qpackEncoderWr, 0, 0)
 	if maxResponseHeaderBytes <= 0 {
 		c.maxResponseHeaderBytes = defaultMaxResponseHeaderBytes
 	} else {
 		c.maxResponseHeaderBytes = maxResponseHeaderBytes
 	}
 	c.requestWriter = newRequestWriter()
+	// FORK DELTA: requests are encoded against the connection's dynamic table,
+	// and their fields go out in the profile's order.
+	c.requestWriter.table = c.qpackEncoder
+	c.requestWriter.pseudoHeaderOrder = pseudoHeaderOrder
+	c.requestWriter.headerOrder = headerOrder
 	c.rawConn = newRawConn(
 		conn,
 		enableDatagrams,
@@ -116,9 +151,16 @@ func newClientConn(
 		qlogger,
 		c.logger,
 	)
+	// FORK DELTA: the peer's QPACK streams are fed into the two halves above.
+	c.rawConn.qpackEncoderSink = c.decoder.EncoderStream()
+	c.rawConn.qpackDecoderSink = c.qpackEncoder.DecoderStream()
+
 	// send the SETTINGs frame, using 0-RTT data, if possible
 	go func() {
 		_, err := c.rawConn.openControlStream(&settingsFrame{
+			// FORK DELTA: Chrome's SETTINGS, in Chrome's order, followed by the
+			// frames Chrome sends after them. See chrome_h3.go.
+			chrome:              true,
 			Datagram:            enableDatagrams,
 			Other:               additionalSettings,
 			MaxFieldSectionSize: int64(c.maxResponseHeaderBytes),
@@ -129,6 +171,21 @@ func newClientConn(
 			}
 			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeInternalError), "")
 			return
+		}
+		// FORK DELTA: and the two QPACK streams, right behind the control
+		// stream. Chrome opens all three at once; opening these lazily, only
+		// once there was something to insert, would announce when that was.
+		for _, w := range []*uniStreamWriter{c.qpackEncoderWr, c.qpackDecoderWr} {
+			str, err := c.conn.OpenUniStream()
+			if err != nil {
+				if c.logger != nil {
+					c.logger.Debug("opening a QPACK stream failed", "error", err)
+				}
+				return
+			}
+			if err := w.attach(str); err != nil && c.logger != nil {
+				c.logger.Debug("writing to a QPACK stream failed", "error", err)
+			}
 		}
 	}()
 	return c
@@ -188,7 +245,7 @@ func (c *ClientConn) openRequestStream(
 	trace := httptrace.ContextClientTrace(ctx)
 	return newRequestStream(
 		newStream(hstr, c.rawConn, trace, func(r io.Reader, hf *headersFrame) error {
-			hdr, err := decodeTrailers(r, hf, maxHeaderBytes, c.decoder, c.qlogger, str.StreamID())
+			hdr, err := decodeTrailers(str.Context(), r, hf, maxHeaderBytes, c.decoder, c.qlogger, str.StreamID())
 			if err != nil {
 				return err
 			}
@@ -209,6 +266,15 @@ func (c *ClientConn) handleUnidirectionalStream(str *quic.ReceiveStream) {
 }
 
 func (c *ClientConn) handleControlStream(str *quic.ReceiveStream, fp *frameParser) {
+	// FORK DELTA: this is called once the peer's SETTINGS have been parsed, so
+	// it is the first moment its QPACK limits are known. The encoder starts at
+	// zero and inserts nothing until told; without this it would stay that way
+	// and leave the encoder stream silent for the life of the connection.
+	if c.qpackEncoder != nil {
+		capacity, blocked := peerQPACKLimits(c.rawConn.Settings())
+		c.qpackEncoder.SetPeerLimits(capacity, blocked)
+	}
+
 	for {
 		f, err := fp.ParseNext(c.qlogger)
 		if err != nil {

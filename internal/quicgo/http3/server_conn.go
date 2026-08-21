@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/quic-go/qpack"
+	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/qpack"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/qlogwriter"
 )
@@ -175,7 +175,7 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 		contentLength = req.ContentLength
 	}
 	hstr := newStream(str, conn, nil, func(r io.Reader, hf *headersFrame) error {
-		trailers, err := decodeTrailers(r, hf, maxHeaderBytes, decoder, qlogger, str.StreamID())
+		trailers, err := decodeTrailers(str.Context(), r, hf, maxHeaderBytes, decoder, qlogger, str.StreamID())
 		if err != nil {
 			return err
 		}

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/quic-go/qpack"
+	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/qpack"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/http3/qlog"
 
 	"golang.org/x/net/http/httpguts"

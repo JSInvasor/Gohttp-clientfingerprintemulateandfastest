@@ -2,6 +2,7 @@ package http3
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +15,7 @@ import (
 
 	"golang.org/x/net/http/httpguts"
 
-	"github.com/quic-go/qpack"
+	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/qpack"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/http3/qlog"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/qlogwriter"
@@ -389,7 +390,9 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
 	return true, err
 }
 
-func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *qpack.Decoder, qlogger qlogwriter.Recorder, streamID quic.StreamID) (http.Header, error) {
+// FORK DELTA: takes a context, because decoding a block that references the
+// dynamic table can have to wait for an insertion that is still in flight.
+func decodeTrailers(ctx context.Context, r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *qpack.Decoder, qlogger qlogwriter.Recorder, streamID quic.StreamID) (http.Header, error) {
 	if hf.Length > uint64(maxHeaderBytes) {
 		maybeQlogInvalidHeadersFrame(qlogger, streamID, hf.Length)
 		return nil, fmt.Errorf("http3: HEADERS frame too large: %d bytes (max: %d)", hf.Length, maxHeaderBytes)
@@ -399,7 +402,11 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
 	if _, err := io.ReadFull(r, b); err != nil {
 		return nil, err
 	}
-	decodeFn := decoder.Decode(b)
+	decodeFn, err := decodeBlock(ctx, decoder, uint64(streamID), b)
+	if err != nil {
+		maybeQlogInvalidHeadersFrame(qlogger, streamID, hf.Length)
+		return nil, err
+	}
 	var fields []qpack.HeaderField
 	var headerFields *[]qpack.HeaderField
 	if qlogger != nil {
