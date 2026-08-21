@@ -190,6 +190,8 @@ type options struct {
 	writeTimeout  time.Duration
 	dnsTTL        time.Duration
 	forceH1       bool
+	forceH3       bool
+	noH3          bool
 	insecure      bool
 	noRedirect    bool
 	maxRedirects  int
@@ -490,6 +492,8 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.DurationVar(&o.writeTimeout, "write-timeout", 0, "")
 	fs.DurationVar(&o.dnsTTL, "dns-ttl", 0, "")
 	fs.BoolVar(&o.forceH1, "http1", false, "")
+	fs.BoolVar(&o.forceH3, "http3", false, "")
+	fs.BoolVar(&o.noH3, "no-http3", false, "")
 	fs.BoolVar(&o.insecure, "insecure", false, "")
 	fs.BoolVar(&o.noRedirect, "no-redirect", false, "")
 	fs.IntVar(&o.maxRedirects, "max-redirects", 0, "")

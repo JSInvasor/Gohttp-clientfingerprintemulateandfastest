@@ -229,6 +229,8 @@ func clientOptions(o *options, seed *solveSeed) []gofire.Option {
 	add(o.writeTimeout > 0, gofire.WithWriteByteTimeout(o.writeTimeout))
 	add(o.dnsTTL > 0, gofire.WithDNSCacheTTL(o.dnsTTL))
 	add(o.forceH1, gofire.WithForceHTTP1())
+	add(o.forceH3, gofire.WithForceHTTP3())
+	add(o.noH3, gofire.WithoutHTTP3())
 	add(o.insecure, gofire.WithInsecureSkipVerify())
 	add(o.noRedirect, gofire.WithDisableRedirects())
 	add(o.maxRedirects > 0, gofire.WithMaxRedirects(o.maxRedirects))

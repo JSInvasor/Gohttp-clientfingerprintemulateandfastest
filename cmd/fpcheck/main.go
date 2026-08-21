@@ -17,6 +17,7 @@
 //
 //	go run ./cmd/fpcheck                     # both profiles
 //	go run ./cmd/fpcheck -profile chrome
+//	go run ./cmd/fpcheck -h3 -profile chrome # the QUIC and HTTP/3 path
 //	go run ./cmd/fpcheck -proxy socks5://user:pass@host:1080
 //	go run ./cmd/fpcheck -save safari.json   # keep the raw capture
 //	go run ./cmd/fpcheck -compare device.json -profile safari
@@ -56,6 +57,11 @@ func main() {
 		timeout    = flag.Duration("timeout", 30*time.Second, "request timeout")
 		showFrames = flag.Bool("frames", false, "print the HTTP/2 frames the server recorded")
 
+		h3 = flag.Bool("h3", false,
+			"measure the HTTP/3 path instead: QUIC JA4, the SETTINGS frame, "+
+				"the frames after it, and the request header order")
+		h3URL = flag.String("h3-url", defaultH3URL, "QUIC fingerprinting endpoint returning JSON")
+
 		viaChromium = flag.Bool("via-chromium", false,
 			"also measure the real Chromium the solver drives, and diff this client against it")
 		chromePath = flag.String("chrome", "",
@@ -85,6 +91,23 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+
+	if *h3 {
+		// Only the Chrome profile has a measured HTTP/3 fingerprint, and the
+		// -profile flag is left alone rather than silently reinterpreted: a run
+		// that said safari and reported Chrome's QUIC would be worse than one
+		// that refused.
+		if len(profiles) != 1 || profiles[0] != gofire.Chrome151 {
+			fmt.Fprintln(os.Stderr, "fpcheck: -h3 requires -profile chrome "+
+				"(no HTTP/3 reference has been captured for Safari)")
+			os.Exit(2)
+		}
+		if err := runH3(ctx, *h3URL, *proxy, *save, *timeout); err != nil {
+			fmt.Fprintln(os.Stderr, "fpcheck:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *viaChromium {
 		if err := runViaChromium(ctx, profiles[0], *url, *proxy, *save, *chromePath, *timeout); err != nil {

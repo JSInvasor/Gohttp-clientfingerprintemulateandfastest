@@ -200,6 +200,11 @@ func printUsage(w io.Writer) {
 -retry int            retry on network errors and 429/502/503/504
 -insecure             skip TLS certificate verification
 -http1                force HTTP/1.1 instead of negotiating h2
+-http3                send over QUIC without waiting for the host to offer it.
+                      By default HTTP/3 is used only after an Alt-Svc header
+                      advertises it, which is how a browser gets there — a
+                      first packet that is a QUIC Initial is its own signal
+-no-http3             never use QUIC, even for a host that offered it
 -no-redirect          do not follow redirects
 -max-streams int      HTTP/2 streams per connection before it is cycled. A long
                       monotonic stream-id sequence is its own passive signal

@@ -199,3 +199,38 @@ func TestUsageIsPlainWhenNotATerminal(t *testing.T) {
 		t.Error("the usage carried ANSI escape codes into a non-terminal writer")
 	}
 }
+
+// TestHTTP3Flags covers the two new switches and, more usefully, the default
+// between them.
+//
+// Neither on is the interesting case: HTTP/3 off by default would leave the
+// QUIC work unreachable, and on by default would send a QUIC Initial to a host
+// that never offered one, which is a thing no browser does whatever the Initial
+// looks like. The default is discovery, and that is what the zero value has to
+// mean.
+func TestHTTP3Flags(t *testing.T) {
+	o, _, err := parseFlags([]string{"https://example.com"})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if o.forceH3 || o.noH3 {
+		t.Errorf("the default is neither forced nor disabled, got force=%v disable=%v",
+			o.forceH3, o.noH3)
+	}
+
+	o, _, err = parseFlags([]string{"-http3", "https://example.com"})
+	if err != nil {
+		t.Fatalf("parse -http3: %v", err)
+	}
+	if !o.forceH3 {
+		t.Error("-http3 did not set forceH3")
+	}
+
+	o, _, err = parseFlags([]string{"-no-http3", "https://example.com"})
+	if err != nil {
+		t.Fatalf("parse -no-http3: %v", err)
+	}
+	if !o.noH3 {
+		t.Error("-no-http3 did not set noH3")
+	}
+}
