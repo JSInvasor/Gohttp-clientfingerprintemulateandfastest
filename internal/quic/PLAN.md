@@ -25,12 +25,17 @@ comes back is in four places, and all four are ours to control byte for byte:
    key shares, extension set. This is `internal/ctls` again, with ALPN `h3`
    and one extension it has never had to emit: `quic_transport_parameters`
    (0x0039).
-3. **The transport parameters in that extension.** Order and values:
+3. **The transport parameters in that extension.** The set and the values:
    `initial_max_data`, the three `initial_max_stream_data_*`, the stream
-   limits, `max_udp_payload_size`, `ack_delay_exponent`, `max_ack_delay`,
-   `active_connection_id_limit`, `initial_source_connection_id`,
-   `version_information`, and Chrome's GREASE parameter. Order is not
-   normative, which is exactly why it fingerprints.
+   limits, `max_udp_payload_size`, `max_idle_timeout`,
+   `max_datagram_frame_size`, `initial_source_connection_id`,
+   `version_information`, Google's `0x3128`, and one GREASE parameter.
+
+   Their **order is not part of it**, and that correction is a measurement
+   rather than a reading of the spec: this file first said the order was worth
+   pinning, and the capture disproved it. Chrome shuffles the parameters per
+   connection, exactly as it shuffles the ClientHello extensions. Emitting a
+   fixed order is the distinguishable behaviour. See `reference.go`.
 4. **HTTP/3 SETTINGS and QPACK.** The settings ids, their values, the order
    they are sent in, the GREASE setting, and the order the control and QPACK
    encoder/decoder streams are opened in. Then the request header order, and
