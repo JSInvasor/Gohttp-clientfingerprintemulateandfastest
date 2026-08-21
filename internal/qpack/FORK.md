@@ -44,8 +44,87 @@ Anything that prints is a delta, and every delta belongs in the list below.
 
 ## Deltas
 
-None yet. This commit is the unchanged copy, so that the diff which follows is
-readable as a diff.
+### 1. The decoding half of the dynamic table
+
+Three files added and one changed. `header_field.go`, `varint.go` and
+`static_table.go` are untouched.
+
+**`dynamic_table.go` (new).** The table itself and the index arithmetic. There
+are two tables on a connection and they are not the same table — one holds what
+the peer inserted and this endpoint reads, the other holds what this endpoint
+inserted and the peer reads — so the type is shared and the rules that differ
+live with the code that applies them.
+
+Also the Required Insert Count encoding (RFC 9204 sections 4.5.1.1 and
+4.5.1.2), which is the piece of QPACK that is easy to get subtly wrong: the
+count is sent modulo twice the table's maximum entry count so the prefix stays
+short, and recovering it needs the decoder's own progress to pick between
+candidates.
+
+**`instructions.go` (new).** The encoder and decoder streams (sections 4.3 and
+4.4). Upstream needs neither: with no dynamic table there is nothing to insert
+and nothing to acknowledge, so a header block is a pure function and the
+connection carries no QPACK state. Everything here separates "not enough bytes
+yet" from "these bytes are wrong", because a stream delivers instructions in
+arbitrary chunks and treating the first as the second closes working
+connections at packet boundaries.
+
+**`decoder_dynamic.go` (new).** The connection-level state: the peer's
+insertions, the waiting a blocked header block has to do, and the
+acknowledgements that go back. The acknowledgements are not optional
+bookkeeping — they are what lets the peer's encoder evict, and a decoder that
+never sends them stalls the peer rather than itself.
+
+**`decoder.go` (changed).** The prefix is decoded rather than required to be
+zero, and the four representations that can name a dynamic entry are
+implemented: indexed and literal with a name reference relative to Base, and
+the two post-base forms upstream rejects as an unexpected type byte.
+`readString`'s body moved to `instructions.go` so the encoder-stream parser and
+the header-block parser share one copy.
+
+`NewDecoder` still returns a decoder with no dynamic table, and every path
+above is guarded on that, so a caller that has not opted in gets upstream's
+behaviour including its errors.
+
+### Not yet delta'd
+
+The **encoding** half. This endpoint's own dynamic table, the insertions it
+writes on its encoder stream, and reading the peer's acknowledgements so it
+knows what it may evict.
+
+That half is about the fingerprint rather than about correctness, which is why
+it is second: an encoder that has a table and never uses it is interoperable
+with everything and leaves its encoder stream silent, and Chrome's is not.
+
+## How this is checked, and where the evidence is weakest
+
+Three ways, in descending order of how much they are worth:
+
+1. **Interop with upstream** (`interop_test.go`). `github.com/quic-go/qpack` is
+   still a dependency of this module, so the fork and the original can be
+   imported side by side and made to read each other. This pins the static
+   table, the literal representations, Huffman coding, the varint prefixes and
+   the zero-dynamic prefix against an implementation nobody here wrote. One of
+   those tests is stricter than a round trip: the two encoders have to produce
+   the same bytes, because a fork that encoded differently but validly would
+   pass a round trip and still be a different fingerprint.
+2. **Arithmetic invariants** (`dynamic_table_test.go`). Absolute indices
+   surviving eviction, the three kinds of relative index, and the Required
+   Insert Count walked through several full wraparound cycles against every
+   decoder position in the recoverable window.
+3. **Wire-level decoding** (`decoder_dynamic_test.go`). Header blocks written
+   out byte by byte with each byte decomposed in a comment, rather than
+   produced by this package's own encoder, so that at least the bit layouts get
+   a second look.
+
+The gap is that (3) is not interop. **RFC 9204's Appendix B carries worked
+examples with exact bytes**, and they would be a better check than anything
+above, because they are an outside party's account of the same wire format.
+They are not here: the RFC could not be fetched from the environment this was
+written in, and transcribing hex from memory into a test would enshrine a
+misremembering as a pinned constant. Adding them is the outstanding piece of
+evidence for this package, in the same way `cmd/fpcheck -h3` is the outstanding
+piece for `internal/quic/http3.go`.
 
 ## Why it is forked
 
