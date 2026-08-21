@@ -122,6 +122,21 @@ const (
 // And SETTINGS is not the last thing on that stream. Chrome follows it with
 // the reserved frame and then a PRIORITY_UPDATE, so a control stream that goes
 // quiet after SETTINGS is its own signal.
+//
+// A third thing is not a mistake to avoid but a bill to pay, and it is recorded
+// here because it decides how the HTTP/3 layer gets built rather than how it is
+// checked. SETTINGS_QPACK_MAX_TABLE_CAPACITY and SETTINGS_QPACK_BLOCKED_STREAMS
+// are promises to the server about what this client's *decoder* will accept: 64
+// KiB of dynamic table, and up to 100 streams blocked waiting on it. A server
+// that takes them at face value may encode a response against the dynamic table,
+// and github.com/quic-go/qpack — which quic-go's own http3 uses — has no dynamic
+// table at all. Its decoder rejects a non-zero Required Insert Count outright.
+//
+// So these two numbers cannot be sent by an implementation that has not
+// implemented QPACK's dynamic table. Sending zeroes instead is coherent and
+// safe, and is a different fingerprint on the first frame of the control
+// stream — 1:0;6:262144;7:0 rather than what is pinned above. That is the
+// trade, and it is not one that can be split.
 var Chrome151H3 = HTTP3Reference{
 	Device: "Chrome 151.0.7922.77, Windows 10 (19045), AMD64",
 	Source: "https://quic.browserleaks.com/, 2026-08-21",

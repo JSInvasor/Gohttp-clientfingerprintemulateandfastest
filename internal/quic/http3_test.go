@@ -83,6 +83,55 @@ func TestH3FingerprintMatchesSettings(t *testing.T) {
 	}
 }
 
+// TestSettingsFrameLengthImpliesAnEightByteGrease turns a pinned number into a
+// derived one, and gets a fact out of it that nothing else in the profile
+// records.
+//
+// The browserleaks report gave the SETTINGS entries and the frame's body length
+// separately. The entries only account for part of that length; what is left has
+// to be the reserved entry, whose id and value the report could not print
+// because both are random. Sixteen bytes left over is an eight-byte varint id
+// and an eight-byte varint value — the largest encoding QUIC has, and not what a
+// small random number would produce on its own.
+//
+// That matters for the encoder rather than for the reference: a GREASE entry
+// drawn as a small id with a short value would be a different frame length, and
+// therefore visible, however random it looked.
+func TestSettingsFrameLengthImpliesAnEightByteGrease(t *testing.T) {
+	// RFC 9000 section 16: a varint is 1, 2, 4 or 8 bytes by magnitude.
+	varintLen := func(v uint64) int {
+		switch {
+		case v < 1<<6:
+			return 1
+		case v < 1<<14:
+			return 2
+		case v < 1<<30:
+			return 4
+		default:
+			return 8
+		}
+	}
+
+	known := 0
+	for _, s := range Chrome151H3.Settings {
+		known += varintLen(s.ID) + varintLen(s.Value)
+	}
+
+	rest := Chrome151H3.SettingsFrameLen - known
+	if !Chrome151H3.GreaseSetting {
+		if rest != 0 {
+			t.Errorf("the pinned settings encode to %d bytes but the frame body is "+
+				"%d; %d bytes are unaccounted for", known, Chrome151H3.SettingsFrameLen, rest)
+		}
+		return
+	}
+	if rest != 16 {
+		t.Errorf("the reserved setting takes %d bytes (%d of body %d used by the "+
+			"four pinned entries); an eight-byte id and an eight-byte value is 16",
+			rest, known, Chrome151H3.SettingsFrameLen)
+	}
+}
+
 // TestH3SettingsAreCoherentWithTransportParameters checks the one cross-layer
 // claim in the profile. SETTINGS_H3_DATAGRAM and the transport parameter
 // max_datagram_frame_size are two halves of the same capability, announced at
