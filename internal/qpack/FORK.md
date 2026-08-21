@@ -86,15 +86,39 @@ the header-block parser share one copy.
 above is guarded on that, so a caller that has not opted in gets upstream's
 behaviour including its errors.
 
+### 2. The encoding half
+
+**`encoder_dynamic.go` (new).** This endpoint's own table, the insertions it
+announces on its encoder stream, and the peer's acknowledgements that say what
+may be evicted. `encoder.go` is untouched.
+
+It is a whole-block API — `EncoderTable.EncodeHeaderBlock` — rather than an
+extension of upstream's field-at-a-time `Encoder`, and that is forced rather
+than chosen: a header block's prefix carries the Required Insert Count and Base,
+and neither is known until every field has been encoded and it is settled which
+entries were referenced. Upstream can write its prefix first because for a
+static-only encoder both are always zero. The side effect is worth having on its
+own — `encoder.go` stays byte-identical to upstream.
+
+Two rules constrain what may enter the table, and both are enforced by declining
+rather than failing, because an encoder is always free to spell a field out:
+
+- An entry may not be evicted while a header block that referenced it is
+  unacknowledged, or the peer resolves an index against something that is gone.
+- Referencing an entry the peer has not inserted yet blocks that stream, and
+  `SETTINGS_QPACK_BLOCKED_STREAMS` caps how many may be blocked at once.
+
+Locking is split — `writeMu` around a whole encoding including the write to the
+encoder stream, `mu` only while the table is touched. That is not tidiness: the
+peer answers an insertion on its decoder stream, which comes straight back into
+this type, so a lock held across the write deadlocks a caller that wires the two
+streams together. The first version did exactly that.
+
 ### Not yet delta'd
 
-The **encoding** half. This endpoint's own dynamic table, the insertions it
-writes on its encoder stream, and reading the peer's acknowledgements so it
-knows what it may evict.
-
-That half is about the fingerprint rather than about correctness, which is why
-it is second: an encoder that has a table and never uses it is interoperable
-with everything and leaves its encoder stream silent, and Chrome's is not.
+Nothing in QPACK itself. What remains is above this package: `internal/http3`
+has to open the two unidirectional streams, hand them to the types here, and
+send SETTINGS that match what they were configured with.
 
 ## How this is checked, and where the evidence is weakest
 
@@ -116,6 +140,27 @@ Three ways, in descending order of how much they are worth:
    out byte by byte with each byte decomposed in a comment, rather than
    produced by this package's own encoder, so that at least the bit layouts get
    a second look.
+4. **Churn** (`encoder_dynamic_test.go`). A few thousand requests over small
+   tables with values that change, streams that are cancelled, and
+   acknowledgements that sometimes never come. State bugs here surface hundreds
+   of requests after the mistake, which is why the scripted tests above cannot
+   find them and this one did — twice.
+
+Every rule in this package was checked by deliberately breaking it and
+confirming a test noticed. Three did not, first time round, and each gap was
+worth the trouble:
+
+- The post-base arithmetic was duplicated in `decoder.go` instead of calling the
+  table, so breaking the table failed only the table's own test. It calls the
+  table now.
+- The "do not evict what an unacknowledged block referenced" rule was masked in
+  every test, because repeating header names meant each new block re-protected
+  the entries it looked up. `TestEntriesSurviveUntilTheirBlockIsDecoded` uses
+  header names that are disjoint between requests, which is the only shape where
+  the rule is the thing standing in the way.
+- Cleaning up the encoder's index maps on eviction is not a correctness rule at
+  all — every lookup re-checks the table — so no round trip could fail without
+  it. It is a leak, and `encoder_internal_test.go` measures it as one.
 
 The gap is that (3) is not interop. **RFC 9204's Appendix B carries worked
 examples with exact bytes**, and they would be a better check than anything
