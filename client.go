@@ -391,7 +391,7 @@ func (c *Client) NewPipelineWithConfig(cfg PipelineConfig) *Pipeline {
 
 // Close releases all resources held by the client.
 func (c *Client) Close() {
-	c.transport.CloseIdleConnections()
+	c.transport.Close()
 	c.transport.dnscache.Close()
 }
 

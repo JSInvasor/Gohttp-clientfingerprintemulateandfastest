@@ -21,6 +21,7 @@ import (
 
 	ctls "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/ctls"
 	http2 "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/http2"
+	http3 "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/http3"
 )
 
 // Transport is a high-performance HTTP transport with browser fingerprint
@@ -45,6 +46,16 @@ import (
 type Transport struct {
 	h1Transport *http.Transport  // HTTP/1.1 fallback
 	h2Transport *http2.Transport // HTTP/2 with browser settings
+
+	// h3Transport is HTTP/3, and h3Cache is what decides when to use it.
+	//
+	// A browser does not open QUIC to a host it has never met: it connects over
+	// TCP and upgrades when the response offers h3 in Alt-Svc. That ordering is
+	// part of the fingerprint on its own, so discovery is the default and
+	// forceH3 is the opt-out. See http3.go.
+	h3Transport *http3.Transport
+	h3Cache     *h3Cache
+	forceH3     bool
 
 	h2Settings  H2Settings
 	headerOrder []string
@@ -93,14 +104,24 @@ var errAlpnHTTP1 = errors.New("ctls: server negotiated http/1.1, not h2")
 
 // TransportConfig holds configuration for creating a Transport.
 type TransportConfig struct {
-	MaxIdleConns          int
-	MaxIdleConnsPerHost   int
-	MaxConnsPerHost       int
-	IdleConnTimeout       time.Duration
-	TLSHandshakeTimeout   time.Duration
-	DisableKeepAlives     bool
-	DisableCompression    bool
-	ForceHTTP1            bool
+	MaxIdleConns        int
+	MaxIdleConnsPerHost int
+	MaxConnsPerHost     int
+	IdleConnTimeout     time.Duration
+	TLSHandshakeTimeout time.Duration
+	DisableKeepAlives   bool
+	DisableCompression  bool
+	ForceHTTP1          bool
+	// DisableHTTP3 stops this transport from ever using QUIC, even for a host
+	// that offered it. ForceHTTP3 goes the other way and sends the first request
+	// over QUIC without waiting for an offer.
+	//
+	// Neither is the default. Chrome discovers HTTP/3 from Alt-Svc and so does
+	// this: a client whose first packet to an unknown host is a QUIC Initial is
+	// doing something no browser does, whatever that Initial looks like. Forcing
+	// is for a host already known to speak it, and for fpcheck.
+	DisableHTTP3          bool
+	ForceHTTP3            bool
 	ProxyURL              string
 	RootCAs               *x509.CertPool
 	InsecureSkipVerify    bool
@@ -183,8 +204,17 @@ func newTransport(cfg TransportConfig, browser BrowserProfile) *Transport {
 		skipVerify: cfg.InsecureSkipVerify,
 		dnscache:   newDNSCache(cfg.DNSCacheTTL),
 		browser:    browser,
+		forceH3:    cfg.ForceHTTP3 && !cfg.ForceHTTP1,
 
 		handshakeTimeout: cfg.TLSHandshakeTimeout,
+	}
+	// HTTP/3 is off when HTTP/1.1 is forced: a caller that asked for h1 asked
+	// for TCP, and answering with QUIC would be a surprising reading of it.
+	if !cfg.DisableHTTP3 && !cfg.ForceHTTP1 {
+		t.h3Transport = newH3Transport(browser, cfg.RootCAs, cfg.InsecureSkipVerify)
+		if t.h3Transport != nil {
+			t.h3Cache = newH3Cache()
+		}
 	}
 
 	// One cache per transport, which is one per Client — so a session's tickets
@@ -323,6 +353,24 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return t.h1Transport.RoundTrip(req)
 	}
 
+	// HTTP/3, when this host has offered it or the caller insisted. See
+	// http3.go for why discovery rather than always.
+	if addr, ok := t.h3Target(req); ok {
+		resp, err := t.h3Transport.RoundTrip(h3Request(req, addr))
+		if err == nil {
+			return resp, nil
+		}
+		// A failed QUIC attempt falls back to TCP, which is what a browser does
+		// and what keeps a blocked UDP path from taking the client down with
+		// it. The offer is dropped so the next request does not pay for the
+		// same timeout: whatever advertised h3 is not reachable over it.
+		if !t.forceH3 {
+			t.h3Cache.clear(hostProtoKey(req.URL.Host, "443"))
+		} else {
+			return nil, err
+		}
+	}
+
 	if t.prefersHTTP1(hostProtoKey(req.URL.Host, "443")) {
 		return t.h1Transport.RoundTrip(req)
 	}
@@ -330,7 +378,12 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.h2Transport.RoundTrip(req)
 	if err != nil && errors.Is(err, errAlpnHTTP1) {
 		// dialTLSForH2 already cached host->http/1.1; retry on h1.
-		return t.h1Transport.RoundTrip(req)
+		resp, err = t.h1Transport.RoundTrip(req)
+	}
+	// Remember an Alt-Svc offer so the next request to this host goes over
+	// QUIC, which is the whole of how a browser gets onto HTTP/3.
+	if err == nil {
+		t.recordAltSvc(resp)
 	}
 	return resp, err
 }
@@ -1280,6 +1333,26 @@ func (t *Transport) CloseIdleConnections() {
 	t.h1Transport.CloseIdleConnections()
 	if t.h2Transport != nil {
 		t.h2Transport.CloseIdleConnections()
+	}
+}
+
+// Close releases everything this transport holds, including its QUIC
+// connections, and is not reusable afterwards.
+//
+// It exists separately from CloseIdleConnections because http3.Transport has no
+// idle sweep — only Close, which is final. Folding it into
+// CloseIdleConnections would have made a call that is supposed to free memory
+// and leave the transport working into one that permanently disabled HTTP/3,
+// and the symptom would have been a client that quietly fell back to TCP after
+// its first cleanup.
+//
+// A QUIC connection is a UDP socket and a goroutine and nothing else reclaims
+// either, so this has to be called: on the pipeline path that is one of each
+// per host per client.
+func (t *Transport) Close() {
+	t.CloseIdleConnections()
+	if t.h3Transport != nil {
+		_ = t.h3Transport.Close()
 	}
 }
 

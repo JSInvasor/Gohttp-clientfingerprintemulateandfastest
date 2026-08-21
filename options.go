@@ -111,6 +111,32 @@ func WithForceHTTP1() Option {
 	}
 }
 
+// WithForceHTTP3 sends the first request to a host over QUIC, without waiting
+// for it to advertise HTTP/3.
+//
+// Off by default, and that default is a fingerprint decision rather than a
+// conservative one. Chrome learns about HTTP/3 from an Alt-Svc header on a TCP
+// response and only then switches; a client whose first packet to an unknown
+// host is a QUIC Initial is doing something no browser does, however good that
+// Initial looks. Use this for a host already known to speak HTTP/3, and for
+// measuring the QUIC fingerprint directly.
+//
+// Only the Chrome profile has a measured HTTP/3 fingerprint, so this does
+// nothing under Safari — see newH3Transport.
+func WithForceHTTP3() Option {
+	return func(c *clientConfig) {
+		c.transport.ForceHTTP3 = true
+	}
+}
+
+// WithoutHTTP3 stops this client from using QUIC at all, even for a host that
+// offered it.
+func WithoutHTTP3() Option {
+	return func(c *clientConfig) {
+		c.transport.DisableHTTP3 = true
+	}
+}
+
 // WithDisableRedirects disables automatic redirect following.
 func WithDisableRedirects() Option {
 	return func(c *clientConfig) {
