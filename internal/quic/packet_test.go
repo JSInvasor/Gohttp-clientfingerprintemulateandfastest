@@ -210,6 +210,124 @@ func TestFlightDiffersEveryTime(t *testing.T) {
 	}
 }
 
+// TestSplitHandshakeShuffles covers the exported half of the splitter — the one
+// internal/quicgo calls, where a fragment's place in the slice is the order it
+// goes on the wire rather than an accident of how it was cut.
+func TestSplitHandshakeShuffles(t *testing.T) {
+	const streamLen = 1758
+
+	sorted := 0
+	for i := 0; i < 20; i++ {
+		frags, err := SplitHandshake(streamLen, 994)
+		if err != nil {
+			t.Fatalf("split: %v", err)
+		}
+		if len(frags) < defaultChaos.minFragments {
+			t.Fatalf("split into %d fragments, minimum is %d",
+				len(frags), defaultChaos.minFragments)
+		}
+
+		// Every byte exactly once: a fragment that overlapped another would
+		// still reassemble, because the later copy overwrites the earlier one,
+		// and a gap would hang the peer's handshake rather than fail it.
+		covered := make([]bool, streamLen)
+		for _, f := range frags {
+			if f.Length < 1 {
+				t.Fatalf("fragment at %d is %d bytes", f.Offset, f.Length)
+			}
+			for j := f.Offset; j < f.Offset+uint64(f.Length); j++ {
+				if j >= uint64(streamLen) {
+					t.Fatalf("fragment at %d runs %d bytes past the end", f.Offset, f.Length)
+				}
+				if covered[j] {
+					t.Fatalf("byte %d is in two fragments", j)
+				}
+				covered[j] = true
+			}
+		}
+		for j, ok := range covered {
+			if !ok {
+				t.Fatalf("byte %d is in no fragment", j)
+			}
+		}
+
+		if slices.IsSortedFunc(frags, func(a, b Fragment) int {
+			return int(a.Offset) - int(b.Offset)
+		}) {
+			sorted++
+		}
+	}
+	if sorted > 1 {
+		t.Errorf("%d of 20 splits came out in ascending offset order; the "+
+			"fragments are supposed to be shuffled", sorted)
+	}
+}
+
+// TestChaosPadRunsSpendEverything is the property the packer depends on: the
+// runs have to add up to exactly the padding it was given, or the packet comes
+// out the wrong length. That is a whole-flight failure rather than a fingerprint
+// one, which is why it is checked here rather than left to the wire tests.
+func TestChaosPadRunsSpendEverything(t *testing.T) {
+	multiRun := 0
+	for i := 0; i < 200; i++ {
+		const total, gaps = 400, 12
+		runs, err := ChaosPadRuns(total, gaps)
+		if err != nil {
+			t.Fatalf("pad runs: %v", err)
+		}
+		if len(runs) != gaps {
+			t.Fatalf("got %d runs for %d gaps", len(runs), gaps)
+		}
+		sum, nonEmpty := 0, 0
+		for j, r := range runs {
+			if r < 0 {
+				t.Fatalf("run %d is %d bytes", j, r)
+			}
+			if r > 0 {
+				nonEmpty++
+			}
+			if j < gaps-1 && r > defaultChaos.maxPadRun {
+				t.Errorf("interior run %d is %d bytes, over the %d cap",
+					j, r, defaultChaos.maxPadRun)
+			}
+			sum += r
+		}
+		if sum != total {
+			t.Fatalf("runs total %d bytes, want %d", sum, total)
+		}
+		if nonEmpty > 1 {
+			multiRun++
+		}
+	}
+	// Not every draw scatters — one gap in four carries padding, so all-tail is
+	// a legitimate outcome. Never scattering is not.
+	if multiRun < 100 {
+		t.Errorf("only %d of 200 draws produced more than one run of padding; "+
+			"Chrome's packets carry several", multiRun)
+	}
+}
+
+// TestChaosPadRunsWithNothingToSpend covers the case the packer hits on a full
+// packet: a payload with no room left to pad still has to come back with a run
+// for every gap, all of them empty.
+func TestChaosPadRunsWithNothingToSpend(t *testing.T) {
+	runs, err := ChaosPadRuns(0, 5)
+	if err != nil {
+		t.Fatalf("pad runs: %v", err)
+	}
+	if len(runs) != 5 {
+		t.Fatalf("got %d runs, want 5", len(runs))
+	}
+	for i, r := range runs {
+		if r != 0 {
+			t.Errorf("run %d is %d bytes with nothing to pad", i, r)
+		}
+	}
+	if _, err := ChaosPadRuns(100, 0); err == nil {
+		t.Error("padding into zero gaps was accepted; the bytes would vanish")
+	}
+}
+
 // TestBuildInitialRejectsAWrongPayload guards the arithmetic that ties the
 // payload size to the datagram size. Getting it wrong produces a packet that is
 // the wrong length rather than one that fails to parse, which is the kind of

@@ -146,18 +146,37 @@ part of the fingerprint, so it has to be ours to pin.
    rather than stable, `0x3127` is `initial_rtt` and therefore a path
    measurement that must never be pinned, and `google_connection_options` is
    per-origin rather than per-client.
-2. `internal/ctls` QUIC handshake mode, tested offline against the captured
-   ClientHello bytes before anything is dialled.
-3. Vendor quic-go + qpack, wire in `ctls`, get one handshake to complete
-   against `cloudflare-quic.com`.
-4. `internal/http3` and one GET.
+2. ~~`internal/ctls` QUIC handshake mode, tested offline against the captured
+   ClientHello bytes before anything is dialled.~~ Done: `quic_hello.go` and
+   `quic_handshake.go`, with the six differences from the TCP hello written
+   down where they are made. Two things the offline tests could not have found
+   turned up as soon as a socket was involved — a server sends its session
+   tickets immediately, and our hello does not fit in one datagram.
+3. ~~Vendor quic-go + qpack, wire in `ctls`, get one handshake to complete.~~
+   Done for quic-go: `internal/quicgo`, four deltas over 173 files, all of them
+   listed in `FORK.md`. A whole connection now completes over a real UDP socket
+   against an upstream quic-go server, and the datagrams that leave the socket
+   are decoded by this package and held to `reference.go` — the hello's JA4, the
+   transport parameters and their moving order, the datagram size, the
+   connection ID lengths, and the fragment/PING/PADDING shape of the flight.
+   qpack is still to vendor, with step 4.
+4. `internal/http3` and one GET. The control stream, the QPACK streams, and
+   SETTINGS **plus the reserved frame and the PRIORITY_UPDATE that follow it** —
+   `http3.go` pins all three from the browserleaks report, and that report is
+   still the only evidence for them.
 5. `cmd/fpcheck -h3` — the same PASS/FAIL-per-layer report the TCP path gets,
    against a live server, so drift fails CI rather than going unnoticed.
 6. `send -h3` / Alt-Svc discovery, then the load path.
 
 ## Not first
 
-0-RTT, connection migration, datagram support, and matching Chrome's ACK and
-pacing behaviour. Each is real; none blocks a correct first handshake, and
-taking them early would mean debugging them through a stack that does not yet
-work at all.
+0-RTT, connection migration, HelloRetryRequest over QUIC, and matching Chrome's
+ACK and pacing behaviour. Each is real; none blocks a correct first handshake,
+and taking them early would mean debugging them through a stack that does not
+yet work at all.
+
+Datagram support was on this list and came off it early, because it turned out
+not to be a feature at all: `max_datagram_frame_size` is one of the transport
+parameters Chrome sends, and its HTTP/3 SETTINGS carry `H3_DATAGRAM=1`.
+Advertising one without the other announces a capability at one layer and denies
+it at the next, which is more distinctive than either.

@@ -63,6 +63,106 @@ func ChaosProtect(crypto []byte, payloadSize int) ([][]byte, error) {
 	return chaosProtect(crypto, payloadSize, defaultChaos)
 }
 
+// The three functions below exist so that a packet builder which is not this
+// one can produce the same shape.
+//
+// internal/quicgo owns packet numbers, loss recovery and coalescing, so it
+// cannot hand its first flight to ChaosProtect and take datagrams back — a
+// CRYPTO frame it did not create is a frame it cannot retransmit. What it needs
+// instead are the three decisions this file makes: where to cut, how many PINGs
+// to scatter, and how to break up the padding. Exporting them keeps one copy of
+// a distribution that took four corrections to get right, and keeps the tests
+// that measure it pointed at the code both callers run.
+
+// Fragment is one slice of the handshake stream: where it starts, and how long
+// it is.
+//
+// Nothing here holds the bytes. A fragment's offset travels with it in the
+// CRYPTO frame, which is what lets the pieces be sent in any order, and it is
+// also what lets a caller with its own copy of the handshake slice it without
+// this package having one.
+type Fragment struct {
+	Offset uint64
+	Length int
+}
+
+// SplitHandshake cuts a handshake stream of n bytes into the shuffled fragments
+// Chrome's chaos protector emits, none of them longer than maxFragment.
+//
+// The order is the order to send in. See splitCrypto for why the cuts are made
+// the way they are, and what the two obvious alternatives got wrong.
+func SplitHandshake(n, maxFragment int) ([]Fragment, error) {
+	frags, err := splitCrypto(n, defaultChaos, maxFragment)
+	if err != nil {
+		return nil, err
+	}
+	if err := shuffle(len(frags), func(i, j int) { frags[i], frags[j] = frags[j], frags[i] }); err != nil {
+		return nil, err
+	}
+	return frags, nil
+}
+
+// ChaosPings returns how many PING frames belong in one Initial packet.
+//
+// The captures count PINGs per flight — 3, 7, 14 and 17 across two datagrams —
+// and chaosProtect draws once against those bounds because it builds a whole
+// flight at a time. A packer that emits one datagram at a time cannot know how
+// many are still to come, so this halves the range and draws per packet, which
+// puts a two-packet flight back where the captures are.
+func ChaosPings() (int, error) {
+	lo := defaultChaos.minPings / 2
+	if lo < 1 {
+		lo = 1
+	}
+	return randInt(lo, defaultChaos.maxPings/2)
+}
+
+// ChaosPadRuns splits total bytes of padding into gaps runs.
+//
+// Run i goes before frame i, and the last one is the tail of the packet, which
+// is why a caller passes one more gap than it has frames. Interior runs are
+// short and sparse, matching the captures — one gap in four carries padding, of
+// at most a few dozen bytes — and whatever is left over lands in the tail,
+// because a flight's last Initial is mostly padding however it is arranged.
+//
+// The runs are what makes several PADDING stretches per packet rather than one
+// at the end, which is what Chrome's packets show and what ParseFrames counts.
+func ChaosPadRuns(total, gaps int) ([]int, error) {
+	return chaosPadRuns(total, gaps, defaultChaos)
+}
+
+func chaosPadRuns(total, gaps int, p chaosParams) ([]int, error) {
+	if gaps <= 0 {
+		return nil, fmt.Errorf("quic: %d gaps to pad", gaps)
+	}
+	out := make([]int, gaps)
+	if total <= 0 {
+		return out, nil
+	}
+	left := total
+	for i := 0; i < gaps-1 && left > 0; i++ {
+		pick, err := randInt(0, p.padChance-1)
+		if err != nil {
+			return nil, err
+		}
+		if pick != 0 {
+			continue
+		}
+		hi := p.maxPadRun
+		if hi > left {
+			hi = left
+		}
+		run, err := randInt(1, hi)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = run
+		left -= run
+	}
+	out[gaps-1] = left
+	return out, nil
+}
+
 func chaosProtect(crypto []byte, payloadSize int, p chaosParams) ([][]byte, error) {
 	if len(crypto) == 0 {
 		return nil, errors.New("quic: nothing to protect")
@@ -84,7 +184,7 @@ func chaosProtect(crypto []byte, payloadSize int, p chaosParams) ([][]byte, erro
 		return nil, fmt.Errorf("quic: payload size %d is too small to fragment", payloadSize)
 	}
 
-	frags, err := splitCrypto(crypto, p, maxFragment)
+	frags, err := splitCrypto(len(crypto), p, maxFragment)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +195,7 @@ func chaosProtect(crypto []byte, payloadSize int, p chaosParams) ([][]byte, erro
 	// so the receiver reassembles regardless.
 	frames := make([][]byte, 0, len(frags)+p.maxPings)
 	for _, f := range frags {
-		frames = append(frames, encodeCrypto(f.offset, crypto[f.offset:f.offset+uint64(f.length)]))
+		frames = append(frames, encodeCrypto(f.Offset, crypto[f.Offset:f.Offset+uint64(f.Length)]))
 	}
 	pings, err := randInt(p.minPings, p.maxPings)
 	if err != nil {
@@ -111,13 +211,11 @@ func chaosProtect(crypto []byte, payloadSize int, p chaosParams) ([][]byte, erro
 	return pack(frames, payloadSize, p)
 }
 
-// fragment is one slice of the handshake stream.
-type fragment struct {
-	offset uint64
-	length int
-}
-
-// splitCrypto cuts the stream by repeatedly splitting a piece it already has.
+// splitCrypto cuts a stream of n bytes by repeatedly splitting a piece it
+// already has.
+//
+// It takes a length rather than the bytes because it never looks at them: what
+// comes back is offsets and lengths, which the caller uses against its own copy.
 //
 // The obvious implementation — draw N cut points uniformly across the stream
 // and sort them — was written first and was wrong, and the test that caught it
@@ -133,16 +231,16 @@ type fragment struct {
 // over bytes, a large piece is no likelier to be chosen than a one-byte one, so
 // large pieces survive while the ones already small get cut again — which is
 // the shape the captures show.
-func splitCrypto(crypto []byte, p chaosParams, maxFragment int) ([]fragment, error) {
+func splitCrypto(streamLen int, p chaosParams, maxFragment int) ([]Fragment, error) {
 	n, err := randInt(p.minFragments, p.maxFragments)
 	if err != nil {
 		return nil, err
 	}
-	if n > len(crypto) {
-		n = len(crypto)
+	if n > streamLen {
+		n = streamLen
 	}
 
-	out := []fragment{{offset: 0, length: len(crypto)}}
+	out := []Fragment{{Offset: 0, Length: streamLen}}
 	// Bound the attempts: once most fragments are a single byte there may be
 	// nothing left to split, and looping forever waiting for a splittable pick
 	// would hang rather than fail.
@@ -151,7 +249,7 @@ func splitCrypto(crypto []byte, p chaosParams, maxFragment int) ([]fragment, err
 		if err != nil {
 			return nil, err
 		}
-		if out[i].length < 2 {
+		if out[i].Length < 2 {
 			continue
 		}
 		// The cut point is drawn log-uniformly rather than uniformly, and that
@@ -167,12 +265,12 @@ func splitCrypto(crypto []byte, p chaosParams, maxFragment int) ([]fragment, err
 		// Drawing the octave first and the value inside it second gives every
 		// power-of-two band equal weight, so single-digit cuts are as likely as
 		// three-digit ones and the large remainder survives.
-		at, err := cutPoint(out[i].length)
+		at, err := cutPoint(out[i].Length)
 		if err != nil {
 			return nil, err
 		}
-		left := fragment{offset: out[i].offset, length: at}
-		right := fragment{offset: out[i].offset + uint64(at), length: out[i].length - at}
+		left := Fragment{Offset: out[i].Offset, Length: at}
+		right := Fragment{Offset: out[i].Offset + uint64(at), Length: out[i].Length - at}
 		out[i] = left
 		out = append(out, right)
 	}
@@ -187,16 +285,16 @@ func splitCrypto(crypto []byte, p chaosParams, maxFragment int) ([]fragment, err
 	// repeats byte for byte across connections appeared in perhaps one flight in
 	// a hundred — rare enough to survive a green test run and just as usable to
 	// anyone collecting samples.
-	var capped []fragment
+	var capped []Fragment
 	for _, f := range out {
-		for f.length > maxFragment {
+		for f.Length > maxFragment {
 			n, err := randInt(maxFragment/2, maxFragment)
 			if err != nil {
 				return nil, err
 			}
-			capped = append(capped, fragment{offset: f.offset, length: n})
-			f.offset += uint64(n)
-			f.length -= n
+			capped = append(capped, Fragment{Offset: f.Offset, Length: n})
+			f.Offset += uint64(n)
+			f.Length -= n
 		}
 		capped = append(capped, f)
 	}

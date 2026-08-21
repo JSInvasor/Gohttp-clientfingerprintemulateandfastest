@@ -5,12 +5,13 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
-
-	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/internal/protocol"
 )
 
 // make it possible to mock connection ID for initial generation in the tests
-var generateConnectionIDForInitial = protocol.GenerateConnectionIDForInitial
+//
+// FORK DELTA: upstream's is protocol.GenerateConnectionIDForInitial, which
+// draws a random length. Chrome's is always eight bytes. See chrome_initial.go.
+var generateConnectionIDForInitial = chromeConnectionIDForInitial
 
 // DialAddr establishes a new QUIC connection to a server.
 // It resolves the address, and then creates a new UDP connection to dial the QUIC server.

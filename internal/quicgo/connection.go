@@ -42,7 +42,6 @@ const (
 	chromeMaxIdleTimeout                 = 30 * time.Second
 )
 
-
 type unpacker interface {
 	UnpackLongHeader(hdr *wire.Header, data []byte) (*unpackedPacket, error)
 	UnpackShortHeader(rcvTime monotime.Time, data []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error)
@@ -454,6 +453,21 @@ var newClientConnection = func(
 		connIDGenerator,
 	)
 	s.ctx, s.ctxCancel = context.WithCancelCause(ctx)
+	// FORK DELTA: the client's datagrams start at Chrome's size, not quic-go's.
+	//
+	// Every capture under internal/quic/testdata puts the first flight in
+	// 1250-byte datagrams; upstream's default is 1280 and the RFC's floor is
+	// 1200. The size shows on the one packet of a connection that anyone on the
+	// path can read, so it belongs with the rest of the first flight's shape —
+	// see chrome_initial.go, which holds the rest of it.
+	//
+	// Only the default is replaced. A caller that set InitialPacketSize asked for
+	// a size, and path MTU is a reason to override this that has nothing to do
+	// with fingerprints. populateConfig hands out a fresh Config per dial, so
+	// writing to it here touches this connection and no other.
+	if conf.InitialPacketSize == protocol.InitialPacketSize {
+		conf.InitialPacketSize = chromeInitialPacketSize
+	}
 	s.preSetup()
 	s.sentPacketHandler = ackhandler.NewSentPacketHandler(
 		initialPacketNumber,

@@ -145,15 +145,64 @@ this endpoint then treats as a protocol violation. The send side is bounded
 separately by the peer's own advertised limit and the path MTU, so this does not
 make the client send larger datagrams than a peer asked for.
 
+### 4. The shape of the first flight
+
+Everything a QUIC client sends before the handshake completes is readable to
+anyone on the path: an Initial packet is protected under keys derived from a
+salt published in RFC 9001. So the arrangement of the first flight is a
+fingerprint in its own right, separate from the ClientHello inside it, and it is
+one two stacks can differ on while agreeing on every byte of the hello.
+
+**`chrome_initial.go` (new).** All of it, so that the four files it changes
+carry a few lines each. The distribution is not here either: cutting well took
+four corrections against the captures, so there is one copy of it, in
+`internal/quic/chaos.go`, and both this and the standalone builder call it.
+
+What differs from upstream, all measured off the socket by
+`ctls_adapter_test.go` rather than asserted:
+
+- **Datagram size.** 1250 bytes, Chrome's, against upstream's 1280 and the RFC's
+  floor of 1200. `connection.go` replaces the default only — a caller that set
+  `InitialPacketSize` asked for a size, and path MTU is a reason to override this
+  that has nothing to do with fingerprints.
+- **The Destination Connection ID.** Eight bytes. Upstream draws the length
+  uniformly from 8 to 20, which is legal and which nothing else does; only the
+  length is pinned, since the value is what the Initial keys come from.
+- **The ClientHello's framing.** Cut into eight to twenty pieces, shuffled, with
+  PING frames among them and padding in several runs rather than one stretch
+  before the frames.
+
+The last of those replaces something, rather than adding to nothing. quic-go
+v0.59 has its own ClientHello scrambling — `crypto_stream.go` cuts the hello in
+at most two places, at the SNI and at the ECH extension. That is a smaller and
+far more regular signature than Chrome's, and being the only stack that produces
+it is worse than sending one plain CRYPTO frame.
+`QUIC_GO_DISABLE_CLIENTHELLO_SCRAMBLING` still turns the whole thing off, which
+is worth keeping: a way to send the flight plainly is how you tell a transport
+bug from a fingerprint one.
+
+The four changed files: `crypto_stream.go` routes the client's initial stream
+through it, `packet_packer.go` counts the PINGs against the same budget as the
+fragments and breaks up the padding after the frames are shuffled, `client.go`
+generates the connection ID, and `connection.go` sets the datagram size.
+
+Loss recovery is untouched, and that is why this is wired in rather than handed
+over: `internal/quic/packet.go` builds whole datagrams, but a CRYPTO frame
+quic-go did not create is one it cannot retransmit. The fragments are real
+`wire.CryptoFrame`s with the packer's own handler, so a lost Initial is
+recovered the way upstream recovers it.
+
 ### Not yet delta'd
 
-quic-go still builds the Initial packets: it pads to the RFC's 1200 bytes and
-sends the ClientHello as a single CRYPTO frame. Chrome pads to 1250 and cuts the
-message into shuffled fragments interleaved with PING and PADDING.
-`internal/quic/packet.go` and `internal/quic/chaos.go` produce that shape
-already and are tested against the captures; wiring them in is the next delta.
-`ctls_adapter_test.go` says so where it asserts the JA4 and stops short of the
-datagram shape.
+ACK policy, pacing and congestion control, as below. Two smaller ones worth
+naming because they are visible and currently upstream's:
+
+- 0-RTT. The shape is pinned in `internal/quic/reference.go`
+  (`Chrome151QUICResumed`) but `internal/ctls` has no QUIC ticket store, so
+  `ctls_adapter.go`'s `StoreSession` refuses rather than pretending.
+- HelloRetryRequest over QUIC. `internal/ctls` returns a named error instead of
+  half an implementation. The chaos protector already falls back to plain
+  framing for a second flight, so this is the TLS side only.
 
 ## Why it is forked
 
@@ -178,9 +227,11 @@ What the fork is for, in the order the work goes:
   visible — see `internal/ctls/quic_hello.go` for the six differences and
   `internal/quic/reference.go` for what they are checked against.
 - **Initial packet construction.** Chrome pads to 1250 bytes where the RFC
-  requires 1200, and it does not send its ClientHello as one CRYPTO frame:
-  Google's chaos protector cuts it into shuffled fragments interleaved with
-  PING and PADDING. `internal/quic/chaos.go` reproduces that shape.
+  requires 1200, uses an eight-byte connection ID where upstream draws a random
+  length, and does not send its ClientHello as one CRYPTO frame: Google's chaos
+  protector cuts it into shuffled fragments interleaved with PING and PADDING.
+  `internal/quic/chaos.go` decides the shape; delta 4 above puts quic-go's own
+  packets in it.
 - **Transport parameter encoding.** The set, the values, the reserved
   parameter, and the fact that the order is shuffled per connection.
   `internal/quic/transportparams.go`.

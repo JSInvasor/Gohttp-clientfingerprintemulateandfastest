@@ -109,6 +109,10 @@ type initialCryptoStream struct {
 	scramble bool
 	end      protocol.ByteCount
 	cuts     [2]clientHelloCut
+
+	// FORK DELTA: on the client, Chrome's chaos protector replaces the
+	// scrambling above. See chrome_initial.go, which holds all of it.
+	chaos *chromeChaos
 }
 
 func newInitialCryptoStream(isClient bool) *initialCryptoStream {
@@ -125,10 +129,21 @@ func newInitialCryptoStream(isClient bool) *initialCryptoStream {
 		s.cuts[i].start = protocol.InvalidByteCount
 		s.cuts[i].end = protocol.InvalidByteCount
 	}
+	// FORK DELTA: the client's first flight takes Chrome's shape instead of
+	// quic-go's. The env var above still turns the whole thing off, because a
+	// way to send the flight plainly is worth keeping for debugging.
+	if scramble {
+		s.scramble = false
+		s.chaos = &chromeChaos{}
+	}
 	return s
 }
 
 func (s *initialCryptoStream) HasData() bool {
+	// FORK DELTA
+	if s.chaos != nil {
+		return s.chaos.hasData(&s.baseCryptoStream)
+	}
 	// The ClientHello might be written in multiple parts.
 	// In order to correctly split the ClientHello, we need the entire ClientHello has been queued.
 	if s.scramble && s.writeOffset == 0 && s.cuts[0].start == protocol.InvalidByteCount {
@@ -137,7 +152,24 @@ func (s *initialCryptoStream) HasData() bool {
 	return s.baseCryptoStream.HasData()
 }
 
+// ChaosPings reports how many PING frames belong in the Initial packet being
+// built, and whether the chaos-protected flight is still going out.
+//
+// FORK DELTA. The packer asks before it packs the fragments, because the PINGs
+// have to be counted against the space the fragments will use.
+func (s *initialCryptoStream) ChaosPings(room protocol.ByteCount) (int, bool) {
+	if s.chaos == nil {
+		return 0, false
+	}
+	return s.chaos.pings(room)
+}
+
 func (s *initialCryptoStream) Write(p []byte) (int, error) {
+	// FORK DELTA
+	if s.chaos != nil {
+		s.chaos.write(&s.baseCryptoStream, p)
+		return len(p), nil
+	}
 	s.writeBuf = append(s.writeBuf, p...)
 	if !s.scramble {
 		return len(p), nil
@@ -180,6 +212,10 @@ func (s *initialCryptoStream) Write(p []byte) (int, error) {
 }
 
 func (s *initialCryptoStream) PopCryptoFrame(maxLen protocol.ByteCount) *wire.CryptoFrame {
+	// FORK DELTA
+	if s.chaos != nil && !s.chaos.done {
+		return s.chaos.popCryptoFrame(&s.baseCryptoStream, maxLen)
+	}
 	if !s.scramble {
 		return s.baseCryptoStream.PopCryptoFrame(maxLen)
 	}

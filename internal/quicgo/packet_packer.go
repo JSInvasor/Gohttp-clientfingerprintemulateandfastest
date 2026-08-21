@@ -13,6 +13,8 @@ import (
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/internal/protocol"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/internal/qerr"
 	"github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quicgo/internal/wire"
+
+	quicprofile "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quic"
 )
 
 var errNothingToPack = errors.New("nothing to pack")
@@ -39,6 +41,13 @@ type payload struct {
 	frames       []ackhandler.Frame
 	ack          *wire.AckFrame
 	length       protocol.ByteCount
+
+	// scatterPadding spreads this packet's padding into several runs between the
+	// frames instead of one run before them.
+	//
+	// FORK DELTA: set only on the client's chaos-protected Initials. See
+	// chrome_initial.go.
+	scatterPadding bool
 }
 
 type longHeaderPacket struct {
@@ -546,6 +555,30 @@ func (p *packetPacker) maybeGetCryptoPacket(
 		pl.length = ack.Length(v)
 		maxPacketSize -= pl.length
 	}
+
+	// FORK DELTA: PING frames and scattered padding, on the client's Initials.
+	//
+	// The PINGs are counted here, before the CRYPTO frames, because they have to
+	// come out of the same budget: reserving space after the fragments are
+	// packed would mean there is none. They are ack-eliciting and carry no
+	// state, so emptyHandler is the right handler — there is nothing to
+	// retransmit if one is lost, and the packet is ack-eliciting regardless
+	// because it carries handshake data.
+	//
+	// appendPacketPayload shuffles pl.frames before writing them, which is what
+	// mixes the PINGs in among the fragments rather than grouping them.
+	if encLevel == protocol.EncryptionInitial && p.perspective == protocol.PerspectiveClient {
+		if n, active := p.initialStream.ChaosPings(maxPacketSize); active {
+			pl.scatterPadding = true
+			for range n {
+				ping := &wire.PingFrame{}
+				pl.frames = append(pl.frames, ackhandler.Frame{Frame: ping, Handler: emptyHandler{}})
+				pl.length += ping.Length(v)
+				maxPacketSize -= ping.Length(v)
+			}
+		}
+	}
+
 	if hasRetransmission {
 		for {
 			frame := p.retransmissionQueue.GetFrame(encLevel, maxPacketSize, v)
@@ -959,19 +992,48 @@ func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen pr
 			return nil, err
 		}
 	}
-	if paddingLen > 0 {
-		raw = append(raw, make([]byte, paddingLen)...)
-	}
 	// Randomize the order of the control frames.
 	// This makes sure that the receiver doesn't rely on the order in which frames are packed.
 	if len(pl.frames) > 1 {
 		p.rand.Shuffle(len(pl.frames), func(i, j int) { pl.frames[i], pl.frames[j] = pl.frames[j], pl.frames[i] })
 	}
-	for _, f := range pl.frames {
+
+	// FORK DELTA: the padding is broken into runs between the frames, on the
+	// client's chaos-protected Initials only.
+	//
+	// Upstream writes it as one run, here, before the frames. Chrome's Initials
+	// carry several separate runs — seven across the first captured flight — and
+	// one long stretch of zeroes in a fixed place is exactly the byte pattern
+	// the chaos protector exists to deny. It is computed after the shuffle
+	// because the runs go between the frames in their final order.
+	//
+	// The total is unchanged either way, which is what keeps the size check at
+	// the bottom of this function honest.
+	// Drawing the runs can only fail if crypto/rand does, and a packet is not
+	// the place to start returning errors upstream never returns: one run of
+	// padding is a worse fingerprint than several, and a connection that does
+	// not happen is worse than either.
+	var padRuns []int
+	if pl.scatterPadding && paddingLen > 0 {
+		padRuns, _ = quicprofile.ChaosPadRuns(int(paddingLen), len(pl.frames)+1)
+	}
+	if padRuns == nil && paddingLen > 0 {
+		raw = append(raw, make([]byte, paddingLen)...)
+	}
+
+	for i, f := range pl.frames {
+		if padRuns != nil && padRuns[i] > 0 {
+			raw = append(raw, make([]byte, padRuns[i])...)
+		}
 		var err error
 		raw, err = f.Frame.Append(raw, v)
 		if err != nil {
 			return nil, err
+		}
+	}
+	if padRuns != nil {
+		if tail := padRuns[len(pl.frames)]; tail > 0 {
+			raw = append(raw, make([]byte, tail)...)
 		}
 	}
 	for _, f := range pl.streamFrames {
