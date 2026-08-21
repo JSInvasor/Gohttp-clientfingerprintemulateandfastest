@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -114,10 +115,47 @@ func runH3(ctx context.Context, url, proxy, save string, timeout time.Duration) 
 	fmt.Println(strings.Repeat("=", len(header)))
 	fmt.Printf("reference device: %s\n\n", quicprofile.Chrome151QUIC.Device)
 
-	if failed := report(checkH3(got)); failed > 0 {
+	checks := checkH3(got)
+	failed := report(checks)
+
+	// A skipped check means a field this command expected was not in the
+	// response, and the field names here have never been checked against a live
+	// service — see defaultH3URL. So print what did arrive: without it a run
+	// that skipped everything says only that nobody looked, and gives no way to
+	// find out what to look at instead.
+	if skipped(checks) > 0 {
+		fmt.Println()
+		fmt.Printf("%d check(s) were skipped, which means this command did not find\n"+
+			"the fields it expected. The raw response follows so the names can be\n"+
+			"corrected — see the note on defaultH3URL in cmd/fpcheck/h3.go.\n\n", skipped(checks))
+		fmt.Println(prettyJSON(raw))
+	}
+
+	if failed > 0 {
 		return fmt.Errorf("%d check(s) failed", failed)
 	}
 	return nil
+}
+
+func skipped(checks []check) int {
+	var n int
+	for _, c := range checks {
+		if c.skipped {
+			n++
+		}
+	}
+	return n
+}
+
+// prettyJSON re-indents a response for reading, and falls back to the bytes as
+// they came if that fails — an unparseable body is exactly the case where
+// seeing it verbatim matters most.
+func prettyJSON(raw []byte) string {
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, raw, "", "  "); err != nil {
+		return string(raw)
+	}
+	return buf.String()
 }
 
 // checkH3 diffs a QUIC capture against the pinned profile, layer by layer.
