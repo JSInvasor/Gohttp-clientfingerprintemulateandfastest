@@ -199,10 +199,15 @@ type options struct {
 	idleConns     int
 	idlePerHost   int
 	connsPerHost  int
-	sockBuf       int
-	fastOpen      bool
-	tlsResume     bool
-	maxBody       int64
+	// tlsConns is the connection count as its own dial: how many TLS
+	// connections each session stands up to the target, apart from -c (how many
+	// requests are in flight). It pre-opens that many and holds the pool to
+	// them — see run and clientOptions. 0 leaves the library's own pooling.
+	tlsConns  int
+	sockBuf   int
+	fastOpen  bool
+	tlsResume bool
+	maxBody   int64
 
 	// Output
 	showHeaders bool
@@ -301,8 +306,8 @@ func run() error {
 	}
 	defer pool.Close()
 
-	if o.warmup > 0 {
-		pool.warm(ctx, target, o.warmup)
+	if warm := o.warmConns(); warm > 0 {
+		pool.warm(ctx, target, warm)
 	}
 
 	if o.singleShot() {
@@ -315,6 +320,16 @@ func run() error {
 // prints the response instead of a summary.
 func (o *options) singleShot() bool {
 	return o.count == 1 && o.duration == 0
+}
+
+// warmConns is how many TLS connections each session pre-opens before the run.
+//
+// Both -warmup and -tls stand up connections up front — -warmup so the numbers
+// measure throughput rather than handshakes, -tls because the connection count
+// is the dial the user is setting. They share the one PreConnect, so opening
+// the larger of the two gives each its count without warming twice.
+func (o *options) warmConns() int {
+	return max(o.warmup, o.tlsConns)
 }
 
 // newFlagSet declares every flag send accepts.
@@ -391,6 +406,7 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.IntVar(&o.idleConns, "idle-conns", 0, "")
 	fs.IntVar(&o.idlePerHost, "idle-per-host", 0, "")
 	fs.IntVar(&o.connsPerHost, "conns-per-host", 0, "")
+	fs.IntVar(&o.tlsConns, "tls", 0, "")
 	fs.IntVar(&o.sockBuf, "sockbuf", 0, "")
 	fs.BoolVar(&o.fastOpen, "tfo", false, "")
 	fs.BoolVar(&o.tlsResume, "tls-resume", false, "")
@@ -483,6 +499,9 @@ func (o *options) normalize() error {
 	}
 	if o.rate < 0 {
 		return fmt.Errorf("-rate cannot be negative, got %d", o.rate)
+	}
+	if o.tlsConns < 0 {
+		return fmt.Errorf("-tls cannot be negative, got %d", o.tlsConns)
 	}
 
 	// A list wins at dial time — setProxyRotator replaces the proxy function

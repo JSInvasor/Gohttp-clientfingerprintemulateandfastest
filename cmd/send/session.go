@@ -237,6 +237,12 @@ func clientOptions(o *options, seed *solveSeed) []gofire.Option {
 	add(o.idleConns > 0, gofire.WithMaxIdleConns(o.idleConns))
 	add(o.idlePerHost > 0, gofire.WithMaxIdleConnsPerHost(o.idlePerHost))
 	add(o.connsPerHost > 0, gofire.WithMaxConnsPerHost(o.connsPerHost))
+	// -tls is the connection count: run pre-opens that many per session, and
+	// this holds the pool there so the run reuses them rather than opening more.
+	// It comes after -conns-per-host so an explicit -tls wins if both are given.
+	// The cap binds on the HTTP/1.1 path; over HTTP/2 the pre-opened
+	// connections carry the run and -max-streams governs when one is cycled.
+	add(o.tlsConns > 0, gofire.WithMaxConnsPerHost(o.tlsConns))
 	add(o.sockBuf > 0, gofire.WithSocketBuffers(o.sockBuf, o.sockBuf))
 	add(o.fastOpen, gofire.WithTCPFastOpen())
 	add(o.tlsResume, gofire.WithTLSSessionResumption())
