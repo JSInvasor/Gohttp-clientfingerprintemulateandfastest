@@ -10,6 +10,7 @@ reference values are evidence rather than assertion.
 
 - **Safari TLS Fingerprint** — Exact JA3/JA4 via custom TLS 1.3 (cipher suites, GREASE at 6 positions, X25519MLKEM768 + X25519 key share, no padding)
 - **Chrome 151 TLS Fingerprint** — Per-connection extension shuffle, ALPS, ECH GREASE, ML-DSA signature algorithms
+- **HTTP/3 over QUIC (Chrome)** — QUIC JA4 `q13d0311h3`, Chrome's transport parameters and their per-connection shuffle, the chaos-protected first flight (1250-byte datagrams, shuffled CRYPTO fragments among PING and PADDING), HTTP/3 SETTINGS in Chrome's order with the reserved entry and the frames that follow, and QPACK with a real dynamic table. Reached the way a browser reaches it: over TCP first, then `Alt-Svc`
 - **Safari HTTP/2 Fingerprint** — SETTINGS (MAX_CONCURRENT_STREAMS=100, NO_RFC7540_PRIORITIES=1), WINDOW_UPDATE, pseudo-header order (m,s,a,p)
 - **Safari Headers** — Correct order, Sec-Fetch-* (no Sec-Fetch-User), Priority
 - **200-300k+ RPS** — Worker pool pipeline, connection pre-warming, DNS cache
