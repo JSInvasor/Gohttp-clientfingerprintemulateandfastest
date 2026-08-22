@@ -60,6 +60,14 @@ type ClientConn struct {
 	qpackEncoderWr *uniStreamWriter
 	qpackDecoderWr *uniStreamWriter
 
+	// controlWr is the control stream, buffered until it exists.
+	//
+	// FORK DELTA: upstream opens the control stream, writes SETTINGS and never
+	// touches it again, so it does not keep it. Chrome sends a PRIORITY_UPDATE
+	// there for every request, and the first request can beat the goroutine that
+	// opens the stream — hence pendingWriter rather than a bare stream.
+	controlWr *pendingWriter
+
 	// Additional HTTP/3 settings.
 	// It is invalid to specify any settings defined by RFC 9114 (HTTP/3) and RFC 9297 (HTTP Datagrams).
 	additionalSettings map[uint64]uint64
@@ -120,6 +128,7 @@ func newClientConn(
 	// upstream's decoder answers that with an error. The two have to be the same
 	// number in both places, which is why the constants are named rather than
 	// written out here. See internal/qpack/FORK.md.
+	c.controlWr = &pendingWriter{}
 	c.qpackEncoderWr = newUniStreamWriter(streamTypeQPACKEncoderStream)
 	c.qpackDecoderWr = newUniStreamWriter(streamTypeQPACKDecoderStream)
 	c.decoder = qpack.NewDecoderWithDynamicTable(qpack.DecoderConfig{
@@ -157,7 +166,7 @@ func newClientConn(
 
 	// send the SETTINGs frame, using 0-RTT data, if possible
 	go func() {
-		_, err := c.rawConn.openControlStream(&settingsFrame{
+		str, err := c.rawConn.openControlStream(&settingsFrame{
 			// FORK DELTA: Chrome's SETTINGS, in Chrome's order, followed by the
 			// frames Chrome sends after them. See chrome_h3.go.
 			chrome:              true,
@@ -172,6 +181,12 @@ func newClientConn(
 			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeInternalError), "")
 			return
 		}
+		// FORK DELTA: kept, because every request writes a PRIORITY_UPDATE here.
+		// Anything a request already queued goes out now, after SETTINGS.
+		if err := c.controlWr.attach(str); err != nil && c.logger != nil {
+			c.logger.Debug("flushing the control stream failed", "error", err)
+		}
+
 		// FORK DELTA: and the two QPACK streams, right behind the control
 		// stream. Chrome opens all three at once; opening these lazily, only
 		// once there was something to insert, would announce when that was.
@@ -189,6 +204,21 @@ func newClientConn(
 		}
 	}()
 	return c
+}
+
+// sendPriorityUpdate writes a PRIORITY_UPDATE for one request stream.
+//
+// FORK DELTA. A failure here is not a failure of the request: the frame is
+// advisory, a server that never sees it serves the response anyway, and taking
+// a connection down over it would trade a fingerprint difference for an outage.
+// A request that beats the goroutine opening the control stream is not a
+// failure either — the write is held and flushed behind SETTINGS.
+func (c *ClientConn) sendPriorityUpdate(streamID quic.StreamID) {
+	if _, err := c.controlWr.Write(appendPriorityUpdate(nil, uint64(streamID))); err != nil {
+		if c.logger != nil {
+			c.logger.Debug("writing PRIORITY_UPDATE failed", "stream ID", streamID, "error", err)
+		}
+	}
 }
 
 // OpenRequestStream opens a new request stream on the HTTP/3 connection.
@@ -239,6 +269,15 @@ func (c *ClientConn) openRequestStream(
 		str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestCanceled))
 		return nil, errGoAway
 	}
+
+	// FORK DELTA: a PRIORITY_UPDATE on the control stream naming this request's
+	// stream, which is what Chrome sends and where it sends it.
+	//
+	// The first version put one at connection setup naming element 0. The bytes
+	// were correct and a live fingerprinting service reported no PRIORITY_UPDATE
+	// at all, where real Chrome produces one — a frame about a stream that does
+	// not exist is not a frame anyone records. See appendPriorityUpdate.
+	c.sendPriorityUpdate(str.StreamID())
 
 	hstr := c.rawConn.TrackStream(str)
 	rsp := &http.Response{}

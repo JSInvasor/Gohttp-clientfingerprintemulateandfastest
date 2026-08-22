@@ -110,6 +110,58 @@ func (w *uniStreamWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// pendingWriter is a stream that can be written to before it exists.
+//
+// It is uniStreamWriter without the stream type, for the control stream: that
+// one is opened and its preamble written by openControlStream, so by the time
+// this is attached the type and SETTINGS have already gone out and anything
+// held here belongs after them.
+//
+// The buffering is what removes a race rather than a nicety. The control stream
+// is opened in a goroutine and the first request does not wait for it, so a
+// PRIORITY_UPDATE for that request can be written before there is anywhere to
+// put it. Dropping it would make the frame appear on some connections and not
+// others, which is the worst of both: not Chrome, and not reproducible either.
+type pendingWriter struct {
+	mu      sync.Mutex
+	w       io.Writer
+	pending []byte
+	err     error
+}
+
+func (p *pendingWriter) attach(w io.Writer) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.w = w
+	if len(p.pending) == 0 || p.err != nil {
+		return p.err
+	}
+	held := p.pending
+	p.pending = nil
+	_, err := w.Write(held)
+	if err != nil {
+		p.err = err
+	}
+	return err
+}
+
+func (p *pendingWriter) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.err != nil {
+		return 0, p.err
+	}
+	if p.w == nil {
+		p.pending = append(p.pending, b...)
+		return len(b), nil
+	}
+	n, err := p.w.Write(b)
+	if err != nil {
+		p.err = err
+	}
+	return n, err
+}
+
 // peerQPACKLimits reads the peer's QPACK settings out of the SETTINGS frame it
 // sent.
 //
@@ -214,39 +266,48 @@ func greaseSetting() (id, value uint64) {
 	return id, value
 }
 
-// appendControlStreamTail writes what Chrome sends after SETTINGS.
+// appendControlStreamTail writes the reserved frame Chrome sends after SETTINGS.
 //
 // A control stream that stops at SETTINGS is its own signal, and this is the
-// cheapest fingerprint in the whole profile to get wrong by omission: both
-// frames are ignorable by any peer, so nothing ever fails because they are
-// missing.
+// cheapest fingerprint in the whole profile to get wrong by omission: the frame
+// is ignorable by any peer, so nothing ever fails because it is missing.
+//
+// PRIORITY_UPDATE used to be written here too, at connection setup, naming
+// element 0. A live check disproved that: the server reported the reserved
+// frame and no PRIORITY_UPDATE, where real Chrome produces both. The frame is
+// per request and names the stream it is about — see appendPriorityUpdate.
 func appendControlStreamTail(b []byte) []byte {
-	ref := quicprofile.Chrome151H3
-
-	if ref.GreaseFrameAfterSettings {
-		// A reserved frame type (RFC 9114 section 7.2.8, 0x1f * N + 0x21) with a
-		// short random payload. Its whole purpose is to be ignored, which is how
-		// a peer that cannot ignore it gets found.
-		id, payload := greaseFrame()
-		b = quicvarint.Append(b, id)
-		b = quicvarint.Append(b, uint64(len(payload)))
-		b = append(b, payload...)
+	if !quicprofile.Chrome151H3.GreaseFrameAfterSettings {
+		return b
 	}
+	// A reserved frame type (RFC 9114 section 7.2.8, 0x1f * N + 0x21) with a
+	// short random payload. Its whole purpose is to be ignored, which is how a
+	// peer that cannot ignore it gets found.
+	id, payload := greaseFrame()
+	b = quicvarint.Append(b, id)
+	b = quicvarint.Append(b, uint64(len(payload)))
+	return append(b, payload...)
+}
 
-	for _, frameType := range ref.AfterSettings {
-		switch frameType {
-		case quicprofile.H3FramePriorityUpdate:
-			// PRIORITY_UPDATE for a request stream, sent before any request
-			// exists. The payload is the Priority Field Value of RFC 9218,
-			// which is what a fetch carries.
-			payload := append([]byte{}, quicvarint.Append(nil, 0)...) // Prioritized Element ID
-			payload = append(payload, ref.DefaultPriority...)
-			b = quicvarint.Append(b, frameType)
-			b = quicvarint.Append(b, uint64(len(payload)))
-			b = append(b, payload...)
-		}
-	}
-	return b
+// appendPriorityUpdate writes a PRIORITY_UPDATE for one request stream.
+//
+// RFC 9218 section 7.2: a varint Prioritized Element ID, then the Priority
+// Field Value — the same structured-field form the `priority` request header
+// carries, which for a fetch is what the profile pins.
+//
+// It goes on the control stream, once per request, naming that request's
+// stream. That placement is measured rather than assumed, and the first version
+// had it wrong: sending one at connection setup for element 0 produces
+// well-formed bytes that a fingerprinting service does not report, because the
+// frame refers to a stream that does not exist yet and never will be the only
+// one. Chrome sends one per request.
+func appendPriorityUpdate(b []byte, streamID uint64) []byte {
+	payload := quicvarint.Append(nil, streamID)
+	payload = append(payload, quicprofile.Chrome151H3.DefaultPriority...)
+
+	b = quicvarint.Append(b, quicprofile.H3FramePriorityUpdate)
+	b = quicvarint.Append(b, uint64(len(payload)))
+	return append(b, payload...)
 }
 
 func greaseFrame() (id uint64, payload []byte) {

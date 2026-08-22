@@ -57,10 +57,19 @@ type HTTP3Reference struct {
 	// AfterSettings is the frame sequence that follows SETTINGS on the control
 	// stream, by type, with the reserved frame above left out because its type
 	// is random. Listing it as 0x00 would name it DATA, which it is not.
+	//
+	// PRIORITY_UPDATE is per request and names the stream it is about, which is
+	// a correction a live check forced. The first implementation sent one at
+	// connection setup naming element 0: RFC-correct bytes, every offline test
+	// passing, and a fingerprinting service reporting no PRIORITY_UPDATE at all
+	// where Chrome produces one. A frame about a stream that does not exist is
+	// not a frame anyone records.
 	AfterSettings []uint64
 
-	// DefaultPriority is the PRIORITY_UPDATE payload for a fetch, in the RFC
-	// 9218 structured-field form that also appears in the priority header.
+	// DefaultPriority is the Priority Field Value a fetch's PRIORITY_UPDATE
+	// carries, in the RFC 9218 structured-field form that also appears in the
+	// priority header. The frame's other half is the stream id — see
+	// AfterSettings.
 	DefaultPriority string
 
 	// PseudoHeaderOrder is the order of the four pseudo-headers. Chrome uses
@@ -122,6 +131,11 @@ const (
 // And SETTINGS is not the last thing on that stream. Chrome follows it with
 // the reserved frame and then a PRIORITY_UPDATE, so a control stream that goes
 // quiet after SETTINGS is its own signal.
+//
+// The placement of PRIORITY_UPDATE is measured too, and was got wrong first.
+// See AfterSettings: it is sent per request, on the control stream, naming that
+// request's stream. Bytes that are correct in isolation are not the same thing
+// as bytes a server records.
 //
 // A third thing is not a mistake to avoid but a bill to pay, and it is recorded
 // here because it decides how the HTTP/3 layer gets built rather than how it is

@@ -473,16 +473,88 @@ func TestControlStreamCarriesChromesSettings(t *testing.T) {
 // make and cannot be caught by anything failing.
 func TestControlStreamDoesNotStopAtSettings(t *testing.T) {
 	b := appendControlStreamTail(nil)
-	ref := quicprofile.Chrome151H3
-
 	if len(b) == 0 {
-		t.Fatal("nothing follows SETTINGS on the control stream; Chrome sends two frames")
+		t.Fatal("nothing follows SETTINGS on the control stream; Chrome sends a reserved frame")
+	}
+	id, n, err := readVarintFrom(b)
+	if err != nil {
+		t.Fatalf("frame type: %v", err)
+	}
+	if (id-0x21)%0x1f != 0 {
+		t.Errorf("the frame after SETTINGS is %#x, want a reserved type of the "+
+			"form 0x1f*N+0x21", id)
+	}
+	length, m, err := readVarintFrom(b[n:])
+	if err != nil {
+		t.Fatalf("frame length: %v", err)
+	}
+	if n+m+int(length) != len(b) {
+		t.Errorf("the tail is %d bytes but the frame accounts for %d", len(b), n+m+int(length))
+	}
+}
+
+// TestPriorityUpdateNamesTheRequestStream is the correction a live check
+// forced, and it is the reason this file cannot be trusted on its own.
+//
+// The first version wrote PRIORITY_UPDATE at connection setup, naming element
+// 0, and every test here passed: the bytes were RFC-correct and this package's
+// own parser read them back. A fingerprinting service reported no
+// PRIORITY_UPDATE at all against real Chrome's one. A frame about a stream that
+// does not exist is not a frame anyone records.
+//
+// So what is pinned now is the tie between the frame and a request: the element
+// id has to be the stream the request went out on.
+func TestPriorityUpdateNamesTheRequestStream(t *testing.T) {
+	for _, streamID := range []uint64{0, 4, 8, 400} {
+		b := appendPriorityUpdate(nil, streamID)
+
+		frameType, n, err := readVarintFrom(b)
+		if err != nil {
+			t.Fatalf("frame type: %v", err)
+		}
+		if frameType != quicprofile.H3FramePriorityUpdate {
+			t.Fatalf("frame type = %#x, want %#x (PRIORITY_UPDATE for a request stream)",
+				frameType, quicprofile.H3FramePriorityUpdate)
+		}
+		length, m, err := readVarintFrom(b[n:])
+		if err != nil {
+			t.Fatalf("frame length: %v", err)
+		}
+		payload := b[n+m:]
+		if len(payload) != int(length) {
+			t.Fatalf("payload is %d bytes, the length says %d", len(payload), length)
+		}
+
+		gotID, k, err := readVarintFrom(payload)
+		if err != nil {
+			t.Fatalf("prioritized element id: %v", err)
+		}
+		if gotID != streamID {
+			t.Errorf("PRIORITY_UPDATE for stream %d names element %d", streamID, gotID)
+		}
+		if got := string(payload[k:]); got != quicprofile.Chrome151H3.DefaultPriority {
+			t.Errorf("priority field value = %q, Chrome sends %q",
+				got, quicprofile.Chrome151H3.DefaultPriority)
+		}
+	}
+}
+
+// TestEveryRequestCarriesAPriorityUpdate reads the control stream after a run
+// of requests, because one frame at setup was exactly the bug.
+func TestEveryRequestCarriesAPriorityUpdate(t *testing.T) {
+	var sink recordingWriter
+	c := &ClientConn{controlWr: &pendingWriter{}}
+	if err := c.controlWr.attach(&sink); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	for _, id := range []quic.StreamID{0, 4, 8} {
+		c.sendPriorityUpdate(id)
 	}
 
-	var types []uint64
-	rest := b
+	var ids []uint64
+	rest := sink.bytes()
 	for len(rest) > 0 {
-		id, n, err := readVarintFrom(rest)
+		frameType, n, err := readVarintFrom(rest)
 		if err != nil {
 			t.Fatalf("frame type: %v", err)
 		}
@@ -492,32 +564,66 @@ func TestControlStreamDoesNotStopAtSettings(t *testing.T) {
 			t.Fatalf("frame length: %v", err)
 		}
 		rest = rest[n:]
-		if uint64(len(rest)) < length {
-			t.Fatalf("frame %#x says %d bytes, %d are left", id, length, len(rest))
+		if frameType != quicprofile.H3FramePriorityUpdate {
+			t.Fatalf("unexpected frame %#x on the control stream", frameType)
 		}
-		if id == quicprofile.H3FramePriorityUpdate {
-			// The payload is a Prioritized Element ID and then the Priority
-			// Field Value of RFC 9218.
-			if got := string(rest[1:length]); got != ref.DefaultPriority {
-				t.Errorf("PRIORITY_UPDATE carries %q, Chrome sends %q", got, ref.DefaultPriority)
-			}
+		id, _, err := readVarintFrom(rest[:length])
+		if err != nil {
+			t.Fatalf("element id: %v", err)
 		}
+		ids = append(ids, id)
 		rest = rest[length:]
-		types = append(types, id)
+	}
+	if want := []uint64{0, 4, 8}; !slices.Equal(ids, want) {
+		t.Errorf("the control stream named streams %v, want one frame per request %v", ids, want)
+	}
+}
+
+// TestAPriorityUpdateWrittenBeforeTheStreamExistsIsNotLost covers the race the
+// buffering exists for: the control stream is opened in a goroutine and the
+// first request does not wait for it.
+//
+// Dropping the frame there would make it appear on some connections and not
+// others, which is worse than either always or never — not Chrome, and not
+// reproducible either.
+func TestAPriorityUpdateWrittenBeforeTheStreamExistsIsNotLost(t *testing.T) {
+	var sink recordingWriter
+	c := &ClientConn{controlWr: &pendingWriter{}}
+
+	c.sendPriorityUpdate(0) // before the stream exists
+	if len(sink.bytes()) != 0 {
+		t.Fatal("something reached the stream before it was attached")
+	}
+	if err := c.controlWr.attach(&sink); err != nil {
+		t.Fatalf("attach: %v", err)
 	}
 
-	if ref.GreaseFrameAfterSettings {
-		if len(types) < 1 || (types[0]-0x21)%0x1f != 0 {
-			t.Errorf("the first frame after SETTINGS is %#x, want a reserved type "+
-				"of the form 0x1f*N+0x21", types[0])
-		}
+	frameType, n, err := readVarintFrom(sink.bytes())
+	if err != nil {
+		t.Fatalf("frame type: %v", err)
 	}
-	for _, want := range ref.AfterSettings {
-		if !slices.Contains(types, want) {
-			t.Errorf("frame %#x is not on the control stream; Chrome sends it before "+
-				"any request", want)
-		}
+	if frameType != quicprofile.H3FramePriorityUpdate {
+		t.Errorf("the held frame came out as %#x", frameType)
 	}
+	_ = n
+}
+
+type recordingWriter struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (w *recordingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, p...)
+	return len(p), nil
+}
+
+func (w *recordingWriter) bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.buf)
 }
 
 // TestPeerQPACKLimitsAreReadFromSettings covers the wiring that decides whether
@@ -607,6 +713,12 @@ func TestReservedValuesMove(t *testing.T) {
 	}
 	if !moved {
 		t.Error("eight control stream tails came out identical; the reserved frame is not random")
+	}
+
+	// PRIORITY_UPDATE is the opposite: it must not move. Its type and payload
+	// are the profile's, and the only thing that varies is the stream it names.
+	if a, b := appendPriorityUpdate(nil, 4), appendPriorityUpdate(nil, 4); string(a) != string(b) {
+		t.Errorf("two PRIORITY_UPDATE frames for the same stream differ:\n  %x\n  %x", a, b)
 	}
 }
 

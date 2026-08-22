@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -33,41 +34,81 @@ import (
 // defaultH3URL reports the QUIC and HTTP/3 view of a request, the way
 // tls.peet.ws reports the TLS and HTTP/2 one.
 //
-// NOT YET RUN AGAINST A LIVE SERVICE. The reference in internal/quic/http3.go
-// came from a browserleaks report that a person read and pasted in; this code
-// has never made the request itself, because the environment it was written in
-// has no egress. So the JSON field names below are read off that report's shape
-// and are the least certain thing in this file.
+// The field names below are now the ones a live run returned, not a guess: the
+// first version nested them under "quic" and "http3" and every check skipped.
+// The response is flat, and the HTTP/3 fingerprint arrives as one string rather
+// than as a settings map.
 //
-// That is why every check skips rather than passes when a field is missing: a
-// service naming things differently reports as "nobody looked", which is true,
-// instead of as a row of green ticks, which would not be. Point -h3-url at
-// whatever service you have and read the skips first.
+// Checks still skip rather than pass when a field is missing, because that is
+// the honest reading for any other service: "nobody looked", not a green tick.
+// Point -h3-url elsewhere and read the skips first.
 const defaultH3URL = "https://quic.browserleaks.com/json"
 
 // h3Capture is the subset of a QUIC fingerprinting response fpcheck reads.
 //
-// The field names follow browserleaks, which is where internal/quic/http3.go's
-// reference came from. Unknown fields are ignored, so a service returning a
-// superset still works; a service using different names reports every field as
-// missing rather than as wrong, which is the safer failure.
+// Flat, because that is what the service returns. Unknown fields are ignored,
+// so one returning a superset still works, and one using different names
+// reports every field as missing rather than as wrong — the safer failure.
 type h3Capture struct {
 	UserAgent string `json:"user_agent"`
 
-	QUIC struct {
-		JA4  string `json:"ja4"`
-		JA4R string `json:"ja4_r"`
-	} `json:"quic"`
+	JA4  string `json:"ja4"`
+	JA4R string `json:"ja4_r"`
 
-	HTTP3 struct {
-		Fingerprint string            `json:"fingerprint"`
-		Settings    map[string]uint64 `json:"settings"`
-		Frames      []string          `json:"frames"`
-	} `json:"http3"`
+	// H3Text is the HTTP/3 fingerprint, pipe-separated:
+	//
+	//	settings | reserved frame | frames after it | pseudo-header order
+	//
+	// The third field is a frame type in decimal and is absent, not empty, when
+	// no such frame arrived — which is how the missing PRIORITY_UPDATE was
+	// found. See splitH3Text.
+	H3Text string `json:"h3_text"`
+	H3Hash string `json:"h3_hash"`
+}
 
-	// Headers is the request's field list in the order it arrived, which is the
-	// one thing a handler cannot recover: net/http gives it a map.
-	Headers []string `json:"headers"`
+// h3Fields is H3Text taken apart.
+type h3Fields struct {
+	settings string
+	reserved string
+	frames   []string
+	pseudo   string
+}
+
+// splitH3Text reads the fingerprint string without assuming how many fields it
+// has.
+//
+// It has four when everything the profile sends arrived, three when one of the
+// two frames after SETTINGS did not, and two when neither did: the middle
+// fields collapse rather than coming through empty. A parser that indexed them
+// positionally would read the pseudo-header order out of the frame slot and
+// report a difference in the wrong place — which is the failure that sends you
+// looking at the wrong layer.
+//
+// So the first field is the settings and the last is the pseudo-header order,
+// both always present. What is between them is the reserved frame, reported as
+// the literal "GREASE", and then the frame types in decimal.
+func splitH3Text(v string) (h3Fields, bool) {
+	parts := strings.Split(v, "|")
+	if len(parts) < 2 || !strings.Contains(parts[0], ":") {
+		return h3Fields{}, false
+	}
+	f := h3Fields{
+		settings: parts[0],
+		pseudo:   parts[len(parts)-1],
+	}
+	mid := parts[1 : len(parts)-1]
+	if len(mid) > 0 && mid[0] == "GREASE" {
+		f.reserved = "GREASE"
+		mid = mid[1:]
+	}
+	for _, p := range mid {
+		for _, one := range strings.Split(p, ",") {
+			if one = strings.TrimSpace(one); one != "" {
+				f.frames = append(f.frames, one)
+			}
+		}
+	}
+	return f, true
 }
 
 // runH3 makes one HTTP/3 request and diffs what the server saw against the
@@ -175,105 +216,74 @@ func checkH3(got h3Capture) []check {
 	// agreed with once, offline, in internal/quic/http3_test.go — so a
 	// disagreement here is this client drifting rather than the reference being
 	// wrong.
-	if got.QUIC.JA4 == "" {
+	if got.JA4 == "" {
 		skip("quic.ja4", "endpoint did not report a QUIC ja4")
 	} else {
-		add("quic.ja4", ref.JA4, got.QUIC.JA4)
+		add("quic.ja4", ref.JA4, got.JA4)
 	}
 	switch {
 	case ref.JA4R == "":
 		skip("quic.ja4_r", "no device capture for this profile yet")
-	case got.QUIC.JA4R == "":
+	case got.JA4R == "":
 		skip("quic.ja4_r", "endpoint did not report ja4_r")
 	default:
-		add("quic.ja4_r", ref.JA4R, got.QUIC.JA4R)
+		add("quic.ja4_r", ref.JA4R, got.JA4R)
 	}
 
-	// The HTTP/3 layer. The fingerprint string folds the SETTINGS, the frames
-	// after them and the pseudo-header order into one value, which is why it is
-	// checked whole as well as in pieces: the pieces name what moved, the whole
-	// catches something moving that the pieces do not cover.
-	if got.HTTP3.Fingerprint == "" {
+	fields, ok := splitH3Text(got.H3Text)
+	if !ok {
 		skip("http3.fingerprint", "endpoint did not report an HTTP/3 fingerprint")
-	} else {
-		add("http3.fingerprint", h3.Fingerprint, got.HTTP3.Fingerprint)
+		return checks
 	}
 
-	if len(got.HTTP3.Settings) == 0 {
-		skip("http3.settings", "endpoint did not report the SETTINGS frame")
-	} else {
-		for _, s := range h3.Settings {
-			key := strconv.FormatUint(s.ID, 10)
-			v, ok := got.HTTP3.Settings[key]
-			if !ok {
-				add("http3.settings["+s.Name+"]", strconv.FormatUint(s.Value, 10), "(absent)")
-				continue
-			}
-			add("http3.settings["+s.Name+"]",
-				strconv.FormatUint(s.Value, 10), strconv.FormatUint(v, 10))
+	// The whole string as well as its parts. The parts name what moved; the
+	// whole catches something moving that the parts do not cover.
+	add("http3.fingerprint", h3.Fingerprint, got.H3Text)
+
+	var want []string
+	for _, s := range h3.Settings {
+		want = append(want, fmt.Sprintf("%d:%d", s.ID, s.Value))
+	}
+	if h3.GreaseSetting {
+		want = append(want, "GREASE")
+	}
+	add("http3.settings", strings.Join(want, ";"), fields.settings)
+
+	if h3.GreaseFrameAfterSettings {
+		got := fields.reserved
+		if got == "" {
+			got = "(absent)"
+		}
+		add("http3.reserved_frame", "GREASE", got)
+	}
+
+	// The frames after SETTINGS are the check only a live server can make. They
+	// are ignorable by any peer, so nothing fails when they stop being sent and
+	// no offline test can notice — this is where the missing PRIORITY_UPDATE
+	// turned up, against a client whose own tests all passed.
+	seen := "(none)"
+	if len(fields.frames) > 0 {
+		seen = strings.Join(fields.frames, ",")
+	}
+	for _, frameType := range h3.AfterSettings {
+		name := fmt.Sprintf("http3.frames[%#x]", frameType)
+		if containsFrame(fields.frames, frameType) {
+			add(name, "present", "present")
+		} else {
+			add(name, "present", "absent (saw "+seen+")")
 		}
 	}
 
-	// The frames after SETTINGS are the check that only a live server can make.
-	// Both exist to be ignored, so no test can fail for their absence, and
-	// nothing but a server that reports what it received will ever notice they
-	// stopped being sent.
-	if len(got.HTTP3.Frames) == 0 {
-		skip("http3.frames", "endpoint did not report the control stream frames")
-	} else {
-		seen := strings.Join(got.HTTP3.Frames, ",")
-		for _, want := range h3.AfterSettings {
-			name := fmt.Sprintf("http3.frames[%#x]", want)
-			if containsFrame(got.HTTP3.Frames, want) {
-				add(name, "present", "present")
-			} else {
-				add(name, "present", "absent (saw "+seen+")")
-			}
-		}
+	// And the pseudo-header order, which a handler cannot see.
+	var initials []string
+	for _, p := range h3.PseudoHeaderOrder {
+		initials = append(initials, string(p[1]))
 	}
-
-	// And the header order, which is the oldest fingerprint of the four and the
-	// one a handler cannot see.
-	if len(got.Headers) == 0 {
-		skip("http3.header_order", "endpoint did not report the request's field order")
-	} else {
-		var pseudo, regular []string
-		for _, h := range got.Headers {
-			// Each entry is "name: value". A pseudo-header starts with its own
-			// colon, so the split has to skip that one or every one of them
-			// comes back empty.
-			if strings.HasPrefix(h, ":") {
-				name, _, _ := strings.Cut(h[1:], ":")
-				pseudo = append(pseudo, ":"+strings.ToLower(strings.TrimSpace(name)))
-				continue
-			}
-			name, _, _ := strings.Cut(h, ":")
-			regular = append(regular, strings.ToLower(strings.TrimSpace(name)))
-		}
-		add("http3.pseudo_header_order",
-			strings.Join(h3.PseudoHeaderOrder, ","), strings.Join(pseudo, ","))
-
-		// Only the profile's own headers are compared, in their relative order:
-		// the request fpcheck sends is not a full fetch, and demanding every
-		// name would report a difference that is this command's doing.
-		var want, have []string
-		for _, name := range h3.FetchHeaderOrder {
-			if contains(regular, name) {
-				want = append(want, name)
-			}
-		}
-		for _, name := range regular {
-			if contains(h3.FetchHeaderOrder, name) {
-				have = append(have, name)
-			}
-		}
-		add("http3.header_order", strings.Join(want, ","), strings.Join(have, ","))
-	}
+	add("http3.pseudo_header_order", strings.Join(initials, ","), fields.pseudo)
 
 	if got.UserAgent != "" {
 		add("user-agent", gofire.ReferenceFor(gofire.Chrome151).UserAgent, got.UserAgent)
 	}
-
 	return checks
 }
 
@@ -290,10 +300,5 @@ func containsFrame(frames []string, want uint64) bool {
 }
 
 func contains(list []string, want string) bool {
-	for _, v := range list {
-		if v == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(list, want)
 }
