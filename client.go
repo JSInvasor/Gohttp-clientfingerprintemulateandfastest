@@ -368,8 +368,21 @@ func (c *Client) FastDo(ctx context.Context, template *http.Request) (*Response,
 
 // PreConnect pre-warms n TLS connections to the given URL.
 // Call this before sending requests for lowest latency on first requests.
+//
+// The connections are opened at the default pace — see PreConnectConfig, and
+// use PreConnectWithConfig to set it. At a large n the pace is the difference
+// between a warm-up and a burst the target reads as an attack.
 func (c *Client) PreConnect(ctx context.Context, rawURL string, n int) error {
 	return c.transport.PreConnect(ctx, rawURL, n)
+}
+
+// PreConnectWithConfig pre-warms n TLS connections at the given pace and
+// reports how many it opened.
+//
+//	opened, err := client.PreConnectWithConfig(ctx, url, 20000,
+//	    gofire.PreConnectConfig{Rate: 500})
+func (c *Client) PreConnectWithConfig(ctx context.Context, rawURL string, n int, cfg PreConnectConfig) (int, error) {
+	return c.transport.PreConnectWithConfig(ctx, rawURL, n, cfg)
 }
 
 // NewPipeline creates a new Pipeline with the specified worker count.

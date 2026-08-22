@@ -133,9 +133,70 @@ func TestTLSFlagPreopensConnections(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	pool.warm(ctx, srv.URL, o.warmConns())
+	pool.warm(ctx, srv.URL, o.warmConns(), o.tlsRate)
 
 	if got := pool.sessions[0].client.ActiveConnections(); got < want {
 		t.Errorf("-tls %d opened %d TLS connections, want at least %d", want, got, want)
+	}
+}
+
+// -tls-rate reaches the warm. A bare -tls resolves to a five-figure count on a
+// box with a raised fd limit, and every one of those used to be started at
+// once; the flag is how a run says how fast to get there instead. Parsing it
+// into a field nothing reads would leave the burst exactly as it was.
+func TestTLSRateFlagPacesTheWarm(t *testing.T) {
+	o, _, err := parseFlags([]string{"-tls=200", "-tls-rate", "500", "https://site.com", "30s"})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if o.tlsRate != 500 {
+		t.Fatalf("tlsRate = %d, want 500", o.tlsRate)
+	}
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	const (
+		want = 10
+		rate = 10
+	)
+	ro := &options{
+		sessions: 1, concurrency: 1, count: 1,
+		insecure: true, timeout: 10 * time.Second, maxBody: -1,
+		tlsConns: want, tlsRate: rate,
+	}
+	pool, err := newSessionPool(ro, gofire.Chrome151, srv.URL)
+	if err != nil {
+		t.Fatalf("newSessionPool: %v", err)
+	}
+	defer pool.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	pool.warm(ctx, srv.URL, ro.warmConns(), ro.tlsRate)
+	elapsed := time.Since(start)
+
+	if got := pool.sessions[0].client.ActiveConnections(); got < want {
+		t.Errorf("the paced warm opened %d connection(s), want %d", got, want)
+	}
+	// Ten at ten a second is a second's work against a loopback server that
+	// hands back a handshake in microseconds. Half of it is the tolerance.
+	if floor := 500 * time.Millisecond; elapsed < floor {
+		t.Errorf("-tls-rate %d opened %d connection(s) in %s, want at least %s — the pace is not reaching the warm",
+			rate, want, elapsed, floor)
+	}
+}
+
+// A negative pace is a typo, not a request, and it has to be refused where the
+// other dials are rather than becoming an unpaced warm three layers down.
+func TestNegativeTLSRateIsRefused(t *testing.T) {
+	if _, _, err := parseFlags([]string{"-tls-rate=-5", "https://site.com"}); err == nil {
+		t.Error("-tls-rate -5 was accepted")
+	} else if !strings.Contains(err.Error(), "-tls-rate") {
+		t.Errorf("the error does not name the flag: %v", err)
 	}
 }

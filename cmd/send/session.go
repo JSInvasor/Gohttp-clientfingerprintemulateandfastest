@@ -282,15 +282,70 @@ func clientOptions(o *options, seed *solveSeed) []gofire.Option {
 	return opts
 }
 
-// warm pre-opens connections on every session so the first measured requests
+// warm pre-opens n connections on every session so the first measured requests
 // are not paying for handshakes the run is not trying to measure.
-func (p *sessionPool) warm(ctx context.Context, target string, n int) {
+//
+// The sessions are warmed one after another and each warm is itself bounded, so
+// what is in flight at any moment is one session's burst rather than the whole
+// run's. That ordering is also what makes rate a run-wide figure: only one
+// session is opening connections at a time, so its per-second cap is the run's.
+//
+// rate is connections per second, 0 for as fast as the handshakes come back. It
+// also lifts the burst bound when it is the larger of the two, because a pace
+// nothing can reach is not a pace — asking for 5000/s through a 256-handshake
+// window would quietly deliver whatever that window allowed instead.
+func (p *sessionPool) warm(ctx context.Context, target string, n, rate int) {
+	var (
+		total   = n * len(p.sessions)
+		start   = time.Now()
+		done    int // opened by the sessions that have already finished
+		lastLog time.Time
+	)
+
+	// Progress calls are serialised — one session warms at a time, and each
+	// warm's callback comes from a single goroutine — so this closure needs no
+	// lock. It prints at most once a second, which the per-session final call
+	// would otherwise breach at the end of every session.
+	//
+	// A small warm says nothing: -warmup 20 is over before the first tick, and
+	// a line per session for it is noise. A five-figure -tls is the opposite —
+	// it runs for long enough that silence reads as a hang.
+	report := func(opened int, final bool) {
+		if total < warmProgressFloor || (!final && time.Since(lastLog) < time.Second) {
+			return
+		}
+		lastLog = time.Now()
+		verb := "open"
+		if final {
+			verb = "open in " + round(time.Since(start)).String()
+		}
+		fmt.Fprintf(os.Stderr, "warm: %d/%d connection(s) %s\n", done+opened, total, verb)
+	}
+
+	cfg := gofire.PreConnectConfig{
+		Rate:     rate,
+		Progress: func(opened, _ int) { report(opened, false) },
+	}
+	if rate > gofire.DefaultPreConnectConcurrency {
+		cfg.Concurrency = rate
+	}
+
 	for _, s := range p.sessions {
-		if err := s.client.PreConnect(ctx, target, n); err != nil {
+		opened, err := s.client.PreConnectWithConfig(ctx, target, n, cfg)
+		done += opened
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "session %d preconnect: %v\n", s.index, err)
 		}
+		if ctx.Err() != nil {
+			break
+		}
 	}
+	report(0, true)
 }
+
+// warmProgressFloor is how many connections a warm has to be standing up before
+// it reports progress. Below it the warm is over before anyone wonders.
+const warmProgressFloor = 500
 
 // closePipelines ends the pipelines and waits for their drain pools, so what the
 // run reports is what it finished rather than what it had got round to.

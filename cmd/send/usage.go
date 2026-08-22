@@ -226,6 +226,10 @@ func printUsage(w io.Writer) {
                       multiplexes across them; -http1 holds and reuses them.
                       Nothing here pre-warms QUIC, so with -http3 the
                       connections are opened and never used
+-tls-rate int         how many of those connections to open per second — -rps
+                      for the warm rather than for the requests. Off by default,
+                      which is still a slope and not a step: a warm opens a
+                      bounded number of handshakes at a time whatever the count
 -tls-resume           offer a cached TLS 1.3 ticket on repeat connections, as a
                       browser does. Off by default: the PSK moves JA4 to
                       t13d1517h2, so connections after the first differ`))

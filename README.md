@@ -179,6 +179,26 @@ SETTINGS, then parks the connections — the same thing a browser's
 `<link rel="preconnect">` does. It sends no HTTP request, so nothing appears in
 the target's logs until you make one.
 
+The handshakes are started a bounded number at a time
+(`DefaultPreConnectConcurrency`), so asking for a five-figure count is a slope
+rather than a step. To set the pace yourself — and to find out how many
+connections a large warm actually stood up:
+
+```go
+opened, err := client.PreConnectWithConfig(ctx, "https://target.com", 20000,
+    gofire.PreConnectConfig{
+        Rate:     500,                       // new connections per second
+        Progress: func(opened, total int) {  // called about once a second
+            log.Printf("warm: %d/%d", opened, total)
+        },
+    })
+```
+
+`Rate` is the knob for going easy on the target rather than on this process: an
+edge sees a connection arrival curve, and the curve is what separates a client
+warming up from one flooding. A partial warm is a normal outcome at these
+counts, which is why the count opened is returned alongside the error.
+
 ## Verifying the fingerprint
 
 The tests check the bytes this client emits against fingerprints captured from

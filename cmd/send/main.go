@@ -208,7 +208,11 @@ type options struct {
 	// requests are in flight). It pre-opens that many and holds the pool to
 	// them — see run and clientOptions. 0 leaves the library's own pooling;
 	// tlsConnsAuto (a bare -tls) means "as many as this machine allows".
-	tlsConns  int
+	tlsConns int
+	// tlsRate is the pace those connections are opened at, in new connections
+	// per second across the whole run — -rps for the warm phase rather than for
+	// the requests. 0 opens them as fast as the handshakes come back.
+	tlsRate   int
 	sockBuf   int
 	fastOpen  bool
 	tlsResume bool
@@ -318,8 +322,14 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "-tls: opening up to %d connection(s) per session (this machine's fd budget)\n",
 			o.autoTLSConns())
 	}
+	// A rate that is never reached is worse than no rate at all, so say when the
+	// count is small enough that the pace will not bind.
+	if o.tlsRate > 0 && o.warmConns()*o.sessions <= o.tlsRate {
+		fmt.Fprintf(os.Stderr, "-tls-rate %d: the whole warm is %d connection(s), so the pace never binds\n",
+			o.tlsRate, o.warmConns()*o.sessions)
+	}
 	if warm := o.warmConns(); warm > 0 {
-		pool.warm(ctx, target, warm)
+		pool.warm(ctx, target, warm, o.tlsRate)
 	}
 
 	if o.singleShot() {
@@ -506,6 +516,7 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs.IntVar(&o.idlePerHost, "idle-per-host", 0, "")
 	fs.IntVar(&o.connsPerHost, "conns-per-host", 0, "")
 	fs.Var(tlsConnsValue{n: &o.tlsConns}, "tls", "")
+	fs.IntVar(&o.tlsRate, "tls-rate", 0, "")
 	fs.IntVar(&o.sockBuf, "sockbuf", 0, "")
 	fs.BoolVar(&o.fastOpen, "tfo", false, "")
 	fs.BoolVar(&o.tlsResume, "tls-resume", false, "")
@@ -598,6 +609,9 @@ func (o *options) normalize() error {
 	}
 	if o.rate < 0 {
 		return fmt.Errorf("-rate cannot be negative, got %d", o.rate)
+	}
+	if o.tlsRate < 0 {
+		return fmt.Errorf("-tls-rate cannot be negative, got %d", o.tlsRate)
 	}
 
 	// A list wins at dial time — setProxyRotator replaces the proxy function
