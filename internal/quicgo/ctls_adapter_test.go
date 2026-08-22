@@ -229,13 +229,26 @@ func (c *recordingConn) datagrams() [][]byte {
 	return append([][]byte(nil), c.sent...)
 }
 
+// recordedInitial is one Initial datagram and what it decoded to.
+//
+// The two travel together on purpose. An earlier version kept the datagrams in
+// one slice and the decoded Initials in another and paired them by index, which
+// is only right while every datagram is an Initial — and a Handshake datagram
+// that lands among them makes the size check measure the wrong packet. It
+// failed about one run in ten, saying an Initial was 1266 bytes when the
+// datagram it had actually measured was not an Initial at all.
+type recordedInitial struct {
+	datagram []byte
+	frames   *quicprofile.Frames
+}
+
 // recordedFlight is one connection's first flight, as it left the socket and as
 // this repository's own decoder reads it back.
 type recordedFlight struct {
 	// datagrams is everything written, Initials and Handshake packets alike.
 	datagrams [][]byte
-	// initials is the frames of each Initial, in the order they were sent.
-	initials []*quicprofile.Frames
+	// initials is each Initial, in the order it was sent.
+	initials []recordedInitial
 	// hello is the ClientHello reassembled from every fragment in initials.
 	hello *quicprofile.ClientHello
 }
@@ -318,7 +331,7 @@ func dialAndRecordFlight(t *testing.T) *recordedFlight {
 		if err != nil {
 			continue
 		}
-		out.initials = append(out.initials, f)
+		out.initials = append(out.initials, recordedInitial{datagram: dg, frames: f})
 		for off, d := range f.Crypto {
 			frags[off] = d
 		}
@@ -489,12 +502,13 @@ func TestWireCarriesChromesInitialShape(t *testing.T) {
 			"not fit in one", len(flight.initials))
 	}
 
-	// Datagram size. Every Initial that carries handshake data is padded to the
-	// full size, which is what makes this checkable at all.
-	for i, dg := range flight.datagrams[:len(flight.initials)] {
-		if len(dg) != ref.DatagramSize {
-			t.Errorf("datagram %d is %d bytes, Chrome sends %d",
-				i, len(dg), ref.DatagramSize)
+	// Datagram size. A client must pad any datagram carrying an Initial (RFC
+	// 9000 section 14.1), and this profile pads to 1250 rather than to the
+	// minimum, so every one of them is checkable.
+	for i, in := range flight.initials {
+		if len(in.datagram) != ref.DatagramSize {
+			t.Errorf("Initial datagram %d is %d bytes, Chrome sends %d",
+				i, len(in.datagram), ref.DatagramSize)
 		}
 	}
 
@@ -521,9 +535,9 @@ func TestWireCarriesChromesInitialShape(t *testing.T) {
 
 	var pings int
 	var order []uint64
-	for _, f := range flight.initials {
-		order = append(order, f.CryptoOrder...)
-		pings += f.Pings
+	for _, in := range flight.initials {
+		order = append(order, in.frames.CryptoOrder...)
+		pings += in.frames.Pings
 	}
 
 	// The captures carry 9, 14, 15 and 18 fragments per flight. Two would mean
@@ -560,12 +574,12 @@ func TestWireCarriesChromesInitialShape(t *testing.T) {
 func TestWirePaddingComesInRuns(t *testing.T) {
 	best := 0
 	for i := 0; i < 5; i++ {
-		for _, f := range dialAndRecordFlight(t).initials {
-			if len(f.CryptoOrder) == 0 {
+		for _, in := range dialAndRecordFlight(t).initials {
+			if len(in.frames.CryptoOrder) == 0 {
 				continue // an ACK-only Initial has nothing to scatter between
 			}
-			if f.PadRuns > best {
-				best = f.PadRuns
+			if in.frames.PadRuns > best {
+				best = in.frames.PadRuns
 			}
 		}
 		if best > 1 {
@@ -593,7 +607,8 @@ func TestWireInitialShapeVaries(t *testing.T) {
 	shape := func() string {
 		flight := dialAndRecordFlight(t)
 		var b strings.Builder
-		for _, f := range flight.initials {
+		for _, in := range flight.initials {
+			f := in.frames
 			fmt.Fprintf(&b, "|%d,%d,%d:", f.Pings, f.PadRuns, len(f.CryptoOrder))
 			for _, off := range f.CryptoOrder {
 				fmt.Fprintf(&b, "%d/%d,", off, len(f.Crypto[off]))

@@ -126,6 +126,16 @@ func printUsage(w io.Writer) {
 	fmt.Fprint(w, p.example("send -assets https://site.com", "the page, not just the document"))
 	fmt.Fprint(w, p.example("send -fingerprint -p chrome", "the profile's reference values"))
 
+	fmt.Fprint(w, p.heading("over HTTP/3"))
+	fmt.Fprint(w, p.example("send https://site.com 30s 200 2", "h3 once the host offers it"))
+	fmt.Fprint(w, p.note("the default. Each session's first request goes over TCP, and moves to"))
+	fmt.Fprint(w, p.note("QUIC if that response carries Alt-Svc — which is how a browser gets there"))
+	fmt.Fprint(w, p.example("send -http3 https://site.com", "QUIC from the first packet"))
+	fmt.Fprint(w, p.note("for a host already known to speak it. No browser opens QUIC to a host it"))
+	fmt.Fprint(w, p.note("has never met, so this is a shortcut rather than a better default"))
+	fmt.Fprint(w, p.example("send -no-http3 https://site.com", "stay on TCP whatever is offered"))
+	fmt.Fprint(w, p.note("chrome profile only — no HTTP/3 reference has been captured for safari"))
+
 	fmt.Fprint(w, p.heading("load"))
 	fmt.Fprint(w, p.example("send https://site.com 30s 200 2", "30s, 200 threads, 2 clients"))
 	fmt.Fprint(w, p.example("send -mode fast https://site.com 30s 256 2", "the fastest path — measured"))
@@ -142,8 +152,9 @@ func printUsage(w io.Writer) {
 	fmt.Fprint(w, p.example(`     -d '{"a":1}' https://site.com/api`, ""))
 
 	fmt.Fprint(w, p.section("getting the rate up", `-mode fast    the shortest path: no jar, no redirects, no retries
--s 2          one session is one HTTP/2 connection behind one write lock,
-              and a second measured ~28% over the first
+-s 2          one session is one connection behind one write lock — HTTP/2
+              or, once the host has offered it, one QUIC connection — and a
+              second session measured ~28% over the first
 -c            about rate × round-trip time. More than that queues rather
               than flies, and costs throughput`))
 
@@ -208,11 +219,13 @@ func printUsage(w io.Writer) {
 -no-redirect          do not follow redirects
 -max-streams int      HTTP/2 streams per connection before it is cycled. A long
                       monotonic stream-id sequence is its own passive signal
--tls                  open as many TLS connections per session up front as this
+-tls                  open as many TCP+TLS connections per session up front as this
                       machine's fd limit allows (shared across -s sessions) and
                       run over them — the connection count as its own dial,
                       apart from -c threads. -tls=N pins an exact count. HTTP/2
-                      multiplexes across them; -http1 holds and reuses them
+                      multiplexes across them; -http1 holds and reuses them.
+                      Nothing here pre-warms QUIC, so with -http3 the
+                      connections are opened and never used
 -tls-resume           offer a cached TLS 1.3 ticket on repeat connections, as a
                       browser does. Off by default: the PSK moves JA4 to
                       t13d1517h2, so connections after the first differ`))

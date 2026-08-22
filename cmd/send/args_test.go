@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
+	quicprofile "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quic"
 )
 
 // The positional dials are the first thing anyone types, and the order is only
@@ -232,5 +235,65 @@ func TestHTTP3Flags(t *testing.T) {
 	}
 	if !o.noH3 {
 		t.Error("-no-http3 did not set noH3")
+	}
+}
+
+// TestUsageDocumentsHTTP3 guards the examples rather than the flags —
+// TestUsageDocumentsEveryFlag already covers the flags having a line each.
+//
+// The distinction that matters is the default, and it is the one an example is
+// for: HTTP/3 is used once a host has offered it, and -http3 skips the waiting
+// rather than turning something on. Someone reading only the flag list would
+// reasonably read -http3 as "enable HTTP/3" and conclude it is off by default.
+func TestUsageDocumentsHTTP3(t *testing.T) {
+	var sb strings.Builder
+	printUsage(&sb)
+	usage := sb.String()
+
+	for _, want := range []string{
+		"over HTTP/3",
+		"send -http3 https://site.com",
+		"send -no-http3 https://site.com",
+		"Alt-Svc", // says how a request comes to be on QUIC at all
+		"chrome profile only",
+	} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("usage does not mention %q", want)
+		}
+	}
+}
+
+// TestFingerprintReportCoversHTTP3 keeps the two halves of the identity in one
+// report.
+//
+// -fingerprint is what someone runs to see what this client claims to be. It
+// answered only for TCP for a while after the QUIC work landed, which is a
+// narrower answer than the question being asked, and nothing would have failed
+// if it had stayed that way.
+func TestFingerprintReportCoversHTTP3(t *testing.T) {
+	var chrome strings.Builder
+	printReference(&chrome, gofire.Chrome151)
+	got := chrome.String()
+
+	for _, want := range []string{
+		quicprofile.Chrome151QUIC.JA4,
+		quicprofile.Chrome151H3.Fingerprint,
+		"Alt-Svc",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the chrome fingerprint report does not mention %q:\n%s", want, got)
+		}
+	}
+
+	// Safari has no captured HTTP/3 reference, and the report has to say that
+	// rather than print Chrome's or print nothing.
+	var safari strings.Builder
+	printReference(&safari, gofire.SafariIOS18)
+	s := safari.String()
+	if strings.Contains(s, quicprofile.Chrome151QUIC.JA4) {
+		t.Error("the safari report printed Chrome's QUIC fingerprint")
+	}
+	if !strings.Contains(s, "no reference captured") {
+		t.Errorf("the safari report does not say why it has no HTTP/3 line:\n%s", s)
 	}
 }

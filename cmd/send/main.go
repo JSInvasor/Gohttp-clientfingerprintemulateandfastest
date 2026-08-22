@@ -55,6 +55,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"slices"
@@ -64,6 +65,7 @@ import (
 	"time"
 
 	gofire "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest"
+	quicprofile "github.com/JSInvasor/Gohttp-clientfingerprintemulateandfastest/internal/quic"
 )
 
 // headerList collects repeated -H flags.
@@ -239,7 +241,7 @@ func run() error {
 		return err
 	}
 	if o.fingerprint {
-		printReference(profile)
+		printReference(os.Stderr, profile)
 		if target == "" {
 			return nil
 		}
@@ -681,25 +683,60 @@ func (o *options) normalize() error {
 	return nil
 }
 
-func printReference(profile gofire.BrowserProfile) {
+// printReference writes the profile's pinned fingerprint values.
+//
+// It takes a writer rather than reaching for os.Stderr so a test can read what
+// it produced. This is the report someone runs to see what the client claims to
+// be, and it grew an HTTP/3 half that nothing else would notice going missing.
+func printReference(w io.Writer, profile gofire.BrowserProfile) {
 	ref := gofire.ReferenceFor(profile)
-	fmt.Fprintf(os.Stderr, "profile        %s\n", ref.Profile)
-	fmt.Fprintf(os.Stderr, "captured from  %s\n", ref.Device)
-	fmt.Fprintf(os.Stderr, "user-agent     %s\n", ref.UserAgent)
+	fmt.Fprintf(w, "profile        %s\n", ref.Profile)
+	fmt.Fprintf(w, "captured from  %s\n", ref.Device)
+	fmt.Fprintf(w, "user-agent     %s\n", ref.UserAgent)
 	if ref.JA3Hash != "" {
-		fmt.Fprintf(os.Stderr, "ja3            %s\n", ref.JA3Hash)
+		fmt.Fprintf(w, "ja3            %s\n", ref.JA3Hash)
 	} else {
 		// Chrome permutes its extension order per connection, so a JA3 is a
 		// different value every time by design and there is nothing to pin.
-		fmt.Fprintf(os.Stderr, "ja3            (per-connection, extension order is permuted)\n")
+		fmt.Fprintf(w, "ja3            (per-connection, extension order is permuted)\n")
 	}
-	fmt.Fprintf(os.Stderr, "ja4            %s\n", ref.JA4)
+	fmt.Fprintf(w, "ja4            %s\n", ref.JA4)
 	if ref.PeetPrintHash != "" {
-		fmt.Fprintf(os.Stderr, "peetprint      %s\n", ref.PeetPrintHash)
+		fmt.Fprintf(w, "peetprint      %s\n", ref.PeetPrintHash)
 	}
-	fmt.Fprintf(os.Stderr, "akamai h2      %s\n", ref.AkamaiHash)
-	fmt.Fprintf(os.Stderr, "pseudo-headers %s\n", strings.Join(ref.PseudoHeaderOrder, ","))
-	fmt.Fprintln(os.Stderr)
+	fmt.Fprintf(w, "akamai h2      %s\n", ref.AkamaiHash)
+	fmt.Fprintf(w, "pseudo-headers %s\n", strings.Join(ref.PseudoHeaderOrder, ","))
+
+	// The HTTP/3 half, for the one profile that has it. Printed here rather
+	// than left to cmd/fpcheck because -fingerprint is what someone runs to
+	// see what this client claims to be, and a client that speaks QUIC while
+	// this report only mentions TCP is answering a narrower question than the
+	// one being asked.
+	if profile == gofire.Chrome151 {
+		q := quicprofile.Chrome151QUIC
+		h3 := quicprofile.Chrome151H3
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "quic ja4       %s\n", q.JA4)
+		fmt.Fprintf(w, "http/3         %s\n", h3.Fingerprint)
+		fmt.Fprintf(w, "h3 settings    %s\n", settingsSummary(h3))
+		fmt.Fprintf(w, "               used once the host offers it in Alt-Svc; -http3 forces it\n")
+	} else {
+		fmt.Fprintf(w, "http/3         (no reference captured for this profile — TCP only)\n")
+	}
+	fmt.Fprintln(w)
+}
+
+// settingsSummary renders the SETTINGS frame in send order, which is the order
+// that is part of the fingerprint rather than an arbitrary one.
+func settingsSummary(h3 quicprofile.HTTP3Reference) string {
+	parts := make([]string, 0, len(h3.Settings)+1)
+	for _, s := range h3.Settings {
+		parts = append(parts, fmt.Sprintf("%d:%d", s.ID, s.Value))
+	}
+	if h3.GreaseSetting {
+		parts = append(parts, "GREASE")
+	}
+	return strings.Join(parts, ";")
 }
 
 func requestBody(spec string) ([]byte, error) {
