@@ -16,11 +16,24 @@ package quic
 // derives from the raw Initial bytes under testdata. Three separate paths to
 // the same string is the strongest evidence in this package.
 //
-// One caveat is recorded rather than smoothed over: unlike the values in
-// reference.go, these are not re-derived from bytes committed to this
-// repository, because the report is text rather than a capture. They are
-// evidence, but of a weaker kind, and they stay that way until cmd/fpcheck can
-// fetch an h3 endpoint and diff against them.
+// These were transcribed rather than decoded — the report is text, where
+// reference.go's values are re-derived from bytes committed to this repository
+// — so for a while they were the weakest evidence here. That has been settled:
+// `cmd/fpcheck -h3` has now been run against the same service from a live
+// connection, and it reported this client's SETTINGS, their order, the reserved
+// entry, the reserved frame, PRIORITY_UPDATE and the pseudo-header order as
+// matching, along with a QUIC JA4 identical to reference.go's.
+//
+// Two things that run did not cover, and they are the honest remainder:
+//
+//   - FetchHeaderOrder. The service reports the pseudo-header order inside the
+//     fingerprint string but not the regular header list, so the order below is
+//     still only the transcription. It is checked against nothing but itself.
+//   - The Initial datagram's shape — the 1250 bytes, the eight-byte connection
+//     ID, the shuffled CRYPTO fragments among PING and PADDING. A matching JA4
+//     proves the ClientHello inside the packet, not the packet. That shape is
+//     confirmed only by this repository's own decoder reading its own socket,
+//     in internal/quicgo/ctls_adapter_test.go.
 
 // HTTP3Reference is the HTTP/3 layer of a browser profile.
 type HTTP3Reference struct {

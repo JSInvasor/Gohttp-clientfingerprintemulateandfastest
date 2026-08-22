@@ -27,9 +27,14 @@ import (
 // Everything in internal/quic/http3.go came from one report of one Chrome
 // session, transcribed. The package's own tests prove this client emits those
 // values, which is circular: if the transcription were wrong, the tests and the
-// code would agree and both be wrong. A live check against the same kind of
-// service is the only thing in the tree that can contradict it, the way
-// browserleaks's JA4 already contradicts (and confirms) the decoder.
+// code would agree and both be wrong. A live check is the only thing in the tree
+// that can contradict it.
+//
+// It has been run, and it did contradict something. Eight checks pass now; the
+// first run found PRIORITY_UPDATE missing from a client that was sending
+// byte-correct PRIORITY_UPDATE frames, because they named a stream that did not
+// exist. That is the class of bug this command is for: nothing fails, no test
+// notices, and the frame is simply not there.
 
 // defaultH3URL reports the QUIC and HTTP/3 view of a request, the way
 // tls.peet.ws reports the TLS and HTTP/2 one.

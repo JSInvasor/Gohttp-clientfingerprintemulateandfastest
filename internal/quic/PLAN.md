@@ -222,18 +222,46 @@ its word.
    first packet to an unknown host is a QUIC Initial is doing something no
    browser does, whatever that Initial looks like.
 
-## What is still only text
+## What the live check settled, and what it did not
 
-`internal/quic/http3.go` is transcribed from one report of one Chrome session.
-Everything else in this package was decoded from captured bytes and, for the
-JA4, agreed with by a third party; the HTTP/3 half has this repository's tests
-proving the client emits those values, which is circular. `cmd/fpcheck -h3`
-against a live service is what breaks the circle, and it has not been run
-against one from here — this environment has no egress to reach it.
+`cmd/fpcheck -h3` has been run against a QUIC fingerprinting service from a real
+connection. Eight checks, all passing:
 
-The same applies, smaller, to `internal/qpack`: RFC 9204's Appendix B carries
-worked examples with exact bytes and they are the check that package is missing.
-See its `FORK.md`.
+```
+quic.ja4                   q13d0311h3_55b375c5d22e_653d80c3fe9d
+quic.ja4_r                 q13d0311h3_1301,1302,1303_000a,000d,...
+http3.fingerprint          1:65536;6:262144;7:100;51:1;GREASE|GREASE|984832|m,a,s,p
+http3.settings             1:65536;6:262144;7:100;51:1;GREASE
+http3.reserved_frame       GREASE
+http3.frames[0xf0700]      present
+http3.pseudo_header_order  m,a,s,p
+user-agent                 Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/151.0.0.0 ...
+```
+
+That is the circle broken. `http3.go` was transcribed from one report and this
+repository's tests only proved the client emits what was transcribed; a third
+party reading this client's own connection now agrees with both.
+
+It also cost one real bug, and the shape of it is the argument for having done
+this at all. PRIORITY_UPDATE was being sent at connection setup naming element
+0 — RFC-correct bytes, every offline test green — and the service reported no
+PRIORITY_UPDATE at all. A frame about a stream that does not exist is not a
+frame anyone records. It is per request now, naming that request's stream.
+
+**Two things the run did not cover**, and they stay on this list:
+
+- **`FetchHeaderOrder`.** The service reports the pseudo-header order inside
+  the fingerprint string but not the regular header list, so that order is
+  still only the transcription, checked against nothing but itself.
+- **The Initial datagram's shape** — 1250 bytes, the eight-byte connection ID,
+  the shuffled CRYPTO fragments among PING and PADDING. A matching JA4 proves
+  the ClientHello inside the packet, not the packet. That is confirmed only by
+  this repository's own decoder reading its own socket, in
+  `internal/quicgo/ctls_adapter_test.go`.
+
+And separately, `internal/qpack`: RFC 9204's Appendix B carries worked examples
+with exact bytes and they are the check that package is missing. See its
+`FORK.md`.
 
 ## Not first
 

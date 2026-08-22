@@ -6,6 +6,11 @@ Both profiles are verified against real devices via tls.peet.ws. The captures ar
 committed under `cmd/fpcheck/testdata` and re-checked on every `go test`, so the
 reference values are evidence rather than assertion.
 
+The HTTP/3 path is verified the same way, against a QUIC fingerprinting service
+that reports what it received: `go run ./cmd/fpcheck -h3 -profile chrome` diffs
+the QUIC JA4, the SETTINGS frame entry by entry, the frames after it and the
+pseudo-header order against `internal/quic`. All of it currently matches.
+
 ## Features
 
 - **Safari TLS Fingerprint** — Exact JA3/JA4 via custom TLS 1.3 (cipher suites, GREASE at 6 positions, X25519MLKEM768 + X25519 key share, no padding)
